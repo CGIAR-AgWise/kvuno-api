@@ -1,4 +1,4 @@
-"""add expires_at to user_tokens
+"""add expires_at to user_tokens table
 
 Revision ID: f0436b79c8b5
 Revises: 1cb31978bb89

@@ -30,6 +30,11 @@
                     <input type="password" id="password" class="form-control" required autocomplete="new-password"
                            minlength="8">
                 </div>
+                <div class="mb-3">
+                    <label for="confirm-password" class="form-label">Confirm password</label>
+                    <input type="password" id="confirm-password" class="form-control" required
+                           autocomplete="new-password" minlength="8">
+                </div>
                 <button type="submit" class="btn btn-primary w-100 mb-3" id="submit-btn">Register</button>
             </form>
 
@@ -55,27 +60,46 @@
         e.preventDefault();
         submitBtn.disabled = true;
 
-        const resp = await fetch('/api/v1/users/register', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                username: document.getElementById('username').value.trim(),
-                email: document.getElementById('email').value.trim(),
-                password: document.getElementById('password').value,
-            }),
-        });
-        const data = await resp.json();
-
-        if (!resp.ok) {
-            showAlert(data.msg || data.error || 'Registration failed', 'danger');
+        const password = document.getElementById('password').value;
+        const confirm = document.getElementById('confirm-password').value;
+        if (password !== confirm) {
+            showAlert('Passwords do not match', 'danger');
             submitBtn.disabled = false;
             return;
         }
 
-        showAlert('Account created successfully! Redirecting to login...', 'success');
-        setTimeout(function () {
+        const username = document.getElementById('username').value.trim();
+        const email = document.getElementById('email').value.trim();
+
+        const regResp = await fetch('/api/v1/users/register', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({username, email, password}),
+        });
+        const regData = await regResp.json();
+
+        if (!regResp.ok) {
+            showAlert(regData.msg || regData.error || 'Registration failed', 'danger');
+            submitBtn.disabled = false;
+            return;
+        }
+
+        const loginResp = await fetch('/api/v1/users/login', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({username, password}),
+        });
+        const loginData = await loginResp.json();
+
+        if (!loginResp.ok) {
             window.location.href = '/ui/login';
-        }, 1500);
+            return;
+        }
+
+        localStorage.setItem('token', loginData.access_token);
+        document.cookie = 'token=' + loginData.access_token
+            + '; path=/; max-age=' + (30 * 24 * 60 * 60) + '; SameSite=Lax';
+        window.location.href = '/ui/jobs';
     });
 </script>
 </body>

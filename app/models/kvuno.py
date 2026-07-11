@@ -108,6 +108,6 @@ class UserToken(Base):
     token: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
     expires_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
-    last_used_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
+    last_used_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 
     user: Mapped['User'] = relationship('User', back_populates='user_tokens')

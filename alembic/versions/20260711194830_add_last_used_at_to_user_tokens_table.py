@@ -1,4 +1,4 @@
-"""add last used at to user tokens table
+"""add last_used_at to user_tokens table
 
 Revision ID: 022ecd9e3632
 Revises: f0436b79c8b5
