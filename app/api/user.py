@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_REGISTER, RATE_LIMIT_LOGIN, TOKEN_TTL_DAYS
-from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse
+from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, CreateTokenRequest
 from app.models.database_conn import MyDb
 from app.models.kvuno import User, UserToken
 from app.rate_limit import limiter
@@ -183,17 +183,18 @@ def list_tokens():
           summary="Create a new API token",
           description="Generate a new token for the authenticated user.",
           security=[{"jwt": []}])
-def create_token():
+def create_token(body: CreateTokenRequest):
     user = get_current_user()
     if not user:
         return {"msg": "authentication required"}, 401
     _db = MyDb.get_db()
     secret = secrets.token_hex(32)
+    ttl = body.expires_in_days if body.expires_in_days is not None else TOKEN_TTL_DAYS
     token_id = _db.session.execute(
         text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
              "VALUES (:uid, '', :exp, now()) RETURNING id"),
-        {"uid": user.id, "exp": None if TOKEN_TTL_DAYS <= 0
-         else datetime.now(timezone.utc) + timedelta(days=TOKEN_TTL_DAYS)},
+        {"uid": user.id, "exp": None if ttl <= 0
+         else datetime.now(timezone.utc) + timedelta(days=ttl)},
     ).scalar()
     token_hash = _hash_token(token_id, secret)
     _db.session.execute(

@@ -2,10 +2,20 @@
 {% block title %}kvuno — Tokens{% endblock %}
 {% block content %}
 <div class="px-3 px-xl-5">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-        <h2 class="mb-0">Active Tokens</h2>
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0">Active Tokens</h2>
+    <div>
+        <select id="expiry-select" class="form-select form-select-sm d-inline-block w-auto me-2">
+            <option value="1">1 day</option>
+            <option value="7">7 days</option>
+            <option value="30" selected>30 days</option>
+            <option value="90">90 days</option>
+            <option value="365">1 year</option>
+            <option value="0">No expiry</option>
+        </select>
         <button class="btn btn-primary" onclick="createToken()">+ New Token</button>
     </div>
+</div>
     <p class="text-muted">Tokens let you authenticate API requests. Revoke any you don't recognise.</p>
 
     <div id="new-token-card" class="card d-none mb-3">
@@ -81,9 +91,12 @@
     async function createToken() {
         const t = getToken();
         if (!t) return;
+        const expiresIn = parseInt(document.getElementById('expiry-select').value, 10);
+        const body = expiresIn ? {expires_in_days: expiresIn} : {};
         const resp = await fetch('/api/v1/users/tokens', {
             method: 'POST',
-            headers: {'Authorization': 'Bearer ' + t},
+            headers: {'Authorization': 'Bearer ' + t, 'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
         });
         const data = await resp.json();
         if (!resp.ok) {

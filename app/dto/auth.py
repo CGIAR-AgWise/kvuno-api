@@ -1,4 +1,5 @@
 
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -15,6 +16,10 @@ class RegisterResponse(BaseModel):
 class LoginRequest(BaseModel):
     username: str = Field(..., description="Username", examples=["johndoe"])
     password: str = Field(..., description="Password", examples=["securePass123"])
+
+
+class CreateTokenRequest(BaseModel):
+    expires_in_days: Optional[int] = Field(default=None, description="Token TTL in days. Defaults to server's TOKEN_TTL_DAYS.", examples=[30])
 
 
 class LoginResponse(BaseModel):
