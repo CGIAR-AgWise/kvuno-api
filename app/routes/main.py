@@ -289,7 +289,7 @@ def register_app_routes(app):
         if invalid:
             return jsonify(error=f"Invalid target columns: {invalid}"), 400
 
-        mapping_path = file_path + '.map.json'
+        mapping_path = str(file_path) + '.map.json'
         with open(mapping_path, 'w') as f:
             json.dump(column_map, f)
 
