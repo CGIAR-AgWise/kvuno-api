@@ -428,7 +428,7 @@ class TestCookieAuth:
 
         app = Flask(__name__)
         with (
-            app.test_request_context(headers={}, cookies={"token": token_str}),
+            app.test_request_context(headers={"Cookie": f"token={token_str}"}),
             patch("app.api.user.MyDb.get_db", return_value=MagicMock(session=mock_session)),
         ):
             user = get_current_user()

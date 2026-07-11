@@ -27,7 +27,8 @@
             headers: {'Authorization': 'Bearer ' + t},
         });
         if (!resp.ok) { window.location.href = '/ui/login'; return; }
-        const tokens = await resp.json();
+        const data = await resp.json();
+        const tokens = Array.isArray(data) ? data : (data.tokens || []);
         const tbody = document.getElementById('token-body');
         const none = document.getElementById('no-tokens');
         tbody.innerHTML = '';

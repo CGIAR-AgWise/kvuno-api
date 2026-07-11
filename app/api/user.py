@@ -6,6 +6,7 @@ from urllib.parse import unquote
 import bcrypt
 from flask import request
 from flask_openapi3 import Tag, APIBlueprint
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_REGISTER, RATE_LIMIT_LOGIN, TOKEN_TTL_DAYS
@@ -146,8 +147,12 @@ class TokenInfoResponse(BaseModel):
     expires_at: str | None = Field(None, description="Expiration timestamp")
 
 
+class TokenListResponse(BaseModel):
+    tokens: list[TokenInfoResponse] = Field(default=[], description="Active tokens")
+
+
 @api.get('/tokens',
-         responses={200: list[TokenInfoResponse], 401: {"description": "Authentication required"}},
+         responses={200: TokenListResponse, 401: {"description": "Authentication required"}},
          summary="List active tokens for the current user",
          description="Return all non-expired tokens belonging to the authenticated user.",
          security=[{"jwt": []}])
@@ -161,18 +166,20 @@ def list_tokens():
         UserToken.user_id == user.id,
         (UserToken.expires_at.is_(None)) | (UserToken.expires_at > now),
     ).all()
-    return [
-        {
-            "id": t.id,
-            "created_at": t.created_at.isoformat() if t.created_at else "",
-            "expires_at": t.expires_at.isoformat() if t.expires_at else None,
-        }
-        for t in tokens
-    ], 200
+    return TokenListResponse(
+        tokens=[
+            TokenInfoResponse(
+                id=t.id,
+                created_at=t.created_at.isoformat() if t.created_at else "",
+                expires_at=t.expires_at.isoformat() if t.expires_at else None,
+            )
+            for t in tokens
+        ]
+    ).model_dump(), 200
 
 
 @api.delete('/tokens/<int:token_id>',
-            responses={200: {"description": "Token revoked"}, 401: {"description": "Authentication required"},
+            responses={200: {"description": "Token revoked", "content": {"application/json": {"schema": {"type": "object", "properties": {"msg": {"type": "string"}}}}}}, 401: {"description": "Authentication required"},
                        404: {"description": "Token not found"}},
             summary="Revoke a specific token by ID",
             description="Delete a token belonging to the current user.",
