@@ -178,6 +178,32 @@ def list_tokens():
     ).model_dump(), 200
 
 
+@api.post('/tokens',
+          responses={201: LoginResponse, 401: {"description": "Authentication required"}},
+          summary="Create a new API token",
+          description="Generate a new token for the authenticated user.",
+          security=[{"jwt": []}])
+def create_token():
+    user = get_current_user()
+    if not user:
+        return {"msg": "authentication required"}, 401
+    _db = MyDb.get_db()
+    secret = secrets.token_hex(32)
+    token_id = _db.session.execute(
+        text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
+             "VALUES (:uid, '', :exp, now()) RETURNING id"),
+        {"uid": user.id, "exp": None if TOKEN_TTL_DAYS <= 0
+         else datetime.now(timezone.utc) + timedelta(days=TOKEN_TTL_DAYS)},
+    ).scalar()
+    token_hash = _hash_token(token_id, secret)
+    _db.session.execute(
+        text("UPDATE user_tokens SET token = :hash WHERE id = :id"),
+        {"hash": token_hash, "id": token_id},
+    )
+    _db.session.commit()
+    return {"msg": "token created", "access_token": _format_token(token_id, secret)}, 201
+
+
 @api.delete('/tokens/<int:token_id>',
             responses={200: {"description": "Token revoked", "content": {"application/json": {"schema": {"type": "object", "properties": {"msg": {"type": "string"}}}}}}, 401: {"description": "Authentication required"},
                        404: {"description": "Token not found"}},
