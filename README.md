@@ -319,6 +319,7 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `POST` | `/api/v1/users/register` | — | Register a new account |
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
+| `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
 | `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
