@@ -43,6 +43,12 @@ def _hash_token(token_id: int, secret: str) -> str:
     return hashlib.sha256(f"{token_id}|{secret}".encode()).hexdigest()
 
 
+def _z(ts):
+    """Append Z to a naive UTC ISO string so JS parses it as UTC."""
+    s = ts.isoformat()
+    return s + "Z" if not s.endswith("+00:00") and not s.endswith("Z") else s
+
+
 @api.post('/register',
           responses={201: RegisterResponse, 409: {"description": "Username or email already exists"}},
           summary="Register a new user account",
@@ -174,9 +180,9 @@ def list_tokens():
         tokens=[
             TokenInfoResponse(
                 id=t.id,
-                created_at=t.created_at.isoformat() if t.created_at else "",
-                expires_at=t.expires_at.isoformat() if t.expires_at else None,
-                last_used_at=t.last_used_at.isoformat() if t.last_used_at else None,
+                created_at=_z(t.created_at) if t.created_at else "",
+                expires_at=_z(t.expires_at) if t.expires_at else None,
+                last_used_at=_z(t.last_used_at) if t.last_used_at else None,
             )
             for t in tokens
         ]

@@ -45,6 +45,17 @@
 {% endblock %}
 {% block scripts %}
 <script>
+    function fmtDate(iso) {
+        if (!iso) return 'Never';
+        const d = new Date(iso);
+        if (isNaN(d)) return iso;
+        return d.toLocaleString(undefined, {
+            year: 'numeric', month: 'short', day: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+            timeZoneName: 'short'
+        });
+    }
+
     async function loadTokens() {
         const t = getToken();
         if (!t) { window.location.href = '/ui/login'; return; }
@@ -66,9 +77,9 @@
             const row = document.createElement('tr');
             row.innerHTML = `
                 <td>${tk.id}</td>
-                <td>${tk.created_at ? new Date(tk.created_at).toLocaleString() : '-'}</td>
-                <td>${tk.expires_at ? new Date(tk.expires_at).toLocaleString() : 'Never'}</td>
-                <td>${tk.last_used_at ? new Date(tk.last_used_at).toLocaleString() : 'Never'}</td>
+                <td>${fmtDate(tk.created_at)}</td>
+                <td>${fmtDate(tk.expires_at)}</td>
+                <td>${fmtDate(tk.last_used_at)}</td>
                 <td><button class="btn btn-sm btn-outline-danger" onclick="revoke(${tk.id})">Revoke</button></td>
             `;
             tbody.appendChild(row);
