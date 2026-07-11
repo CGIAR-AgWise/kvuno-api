@@ -140,6 +140,58 @@ def get_current_user():
           summary="Revoke the current token",
           description="Delete the current Bearer token from the database. Caller should also clear the client-side token cookie.",
           security=[{"jwt": []}])
+class TokenInfoResponse(BaseModel):
+    id: int = Field(..., description="Token ID")
+    created_at: str = Field(..., description="Creation timestamp")
+    expires_at: str | None = Field(None, description="Expiration timestamp")
+
+
+@api.get('/tokens',
+         responses={200: list[TokenInfoResponse], 401: {"description": "Authentication required"}},
+         summary="List active tokens for the current user",
+         description="Return all non-expired tokens belonging to the authenticated user.",
+         security=[{"jwt": []}])
+def list_tokens():
+    user = get_current_user()
+    if not user:
+        return {"msg": "authentication required"}, 401
+    db = MyDb.get_db()
+    now = datetime.now(timezone.utc)
+    tokens = db.session.query(UserToken).filter(
+        UserToken.user_id == user.id,
+        (UserToken.expires_at.is_(None)) | (UserToken.expires_at > now),
+    ).all()
+    return [
+        {
+            "id": t.id,
+            "created_at": t.created_at.isoformat() if t.created_at else "",
+            "expires_at": t.expires_at.isoformat() if t.expires_at else None,
+        }
+        for t in tokens
+    ], 200
+
+
+@api.delete('/tokens/<int:token_id>',
+            responses={200: {"description": "Token revoked"}, 401: {"description": "Authentication required"},
+                       404: {"description": "Token not found"}},
+            summary="Revoke a specific token by ID",
+            description="Delete a token belonging to the current user.",
+            security=[{"jwt": []}])
+def revoke_token(token_id: int):
+    user = get_current_user()
+    if not user:
+        return {"msg": "authentication required"}, 401
+    db = MyDb.get_db()
+    token = db.session.query(UserToken).filter(
+        UserToken.id == token_id, UserToken.user_id == user.id
+    ).first()
+    if not token:
+        return {"msg": "token not found"}, 404
+    db.session.delete(token)
+    db.session.commit()
+    return {"msg": "token revoked"}, 200
+
+
 def logout():
     """Revoke the current token by deleting it from user_tokens."""
     auth_header = request.headers.get('Authorization', '')

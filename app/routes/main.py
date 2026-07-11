@@ -322,6 +322,11 @@ def register_app_routes(app):
     def ui_explore():
         return render_template('explore.html', active_nav='explore')
 
+    @app.route('/ui/tokens', methods=['GET'])
+    @require_auth
+    def ui_tokens():
+        return render_template('tokens.html', active_nav='tokens')
+
     @app.route('/ui/quality', methods=['GET'])
     @require_auth
     def ui_quality():
