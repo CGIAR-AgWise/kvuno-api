@@ -163,9 +163,13 @@ def register_app_routes(app):
     def health_check():
         db_connected = MyDb.check_db_connection()
 
+        from app.config import APP_NAME, APP_VERSION
+
         health_status = {
             "status": "healthy" if db_connected else "unhealthy",
-            "database": "UP" if db_connected else "DOWN"
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "database": "UP" if db_connected else "DOWN",
         }
         return jsonify(health_status), 200 if db_connected else 500
 
