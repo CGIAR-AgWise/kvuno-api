@@ -107,6 +107,9 @@ def _resolve_token(raw: str):
         return None
     if token_record.expires_at is not None and token_record.expires_at < datetime.now(timezone.utc):
         return None
+    # Track last usage
+    token_record.last_used_at = datetime.now(timezone.utc)
+    db.session.commit()
     return db.session.query(User).filter(User.id == token_record.user_id).first()
 
 
@@ -145,6 +148,7 @@ class TokenInfoResponse(BaseModel):
     id: int = Field(..., description="Token ID")
     created_at: str = Field(..., description="Creation timestamp")
     expires_at: str | None = Field(None, description="Expiration timestamp")
+    last_used_at: str | None = Field(None, description="Last usage timestamp")
 
 
 class TokenListResponse(BaseModel):
@@ -172,6 +176,7 @@ def list_tokens():
                 id=t.id,
                 created_at=t.created_at.isoformat() if t.created_at else "",
                 expires_at=t.expires_at.isoformat() if t.expires_at else None,
+                last_used_at=t.last_used_at.isoformat() if t.last_used_at else None,
             )
             for t in tokens
         ]

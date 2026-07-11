@@ -34,6 +34,7 @@
                 <th>ID</th>
                 <th>Created</th>
                 <th>Expires</th>
+                <th>Last Used</th>
                 <th>Action</th>
             </tr>
         </thead>
@@ -67,6 +68,7 @@
                 <td>${tk.id}</td>
                 <td>${tk.created_at ? new Date(tk.created_at).toLocaleString() : '-'}</td>
                 <td>${tk.expires_at ? new Date(tk.expires_at).toLocaleString() : 'Never'}</td>
+                <td>${tk.last_used_at ? new Date(tk.last_used_at).toLocaleString() : 'Never'}</td>
                 <td><button class="btn btn-sm btn-outline-danger" onclick="revoke(${tk.id})">Revoke</button></td>
             `;
             tbody.appendChild(row);
