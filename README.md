@@ -16,6 +16,9 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Health Check** — `GET /health` endpoint with database connectivity status
 - **Dockerized** — Dev and production Dockerfiles with docker-compose (PostgreSQL, Redis, Celery worker)
 - **Database Migrations** — Alembic-managed schema evolution
+- **JWT Authentication** — Sanctum-style `{id}|{secret}` tokens with BCrypt password hashing
+- **Login & Registration UI** — Web forms at `/ui/login` and `/ui/register`
+- **Token Management** — List and revoke tokens at `/ui/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
 
@@ -29,6 +32,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | Migrations | Alembic |
 | Spatial | GeoAlchemy2 / PostGIS |
 | RDS Parsing | pyreadr + pandas |
+| Authentication | JWT (HS256) + bcrypt |
 | Background Tasks | Celery + Redis (Kombu transport) |
 | Logging | loguru |
 | Serving | Waitress (dev) / Gunicorn (prod) |
@@ -45,10 +49,12 @@ kvuno/
 │   ├── config.py             # App constants and configuration
 │   ├── gunicorn_config.py    # Gunicorn server configuration
 │   ├── tasks.py              # Celery task definitions
+│   ├── auth.py               # require_auth decorator
 │   ├── api/
 │   │   ├── planting_data.py  # Planting data API blueprint
+│   │   ├── quality.py        # Data quality endpoints
 │   │   ├── upload.py         # File upload API blueprint
-│   │   └── user.py           # User auth API blueprint (stubs)
+│   │   └── user.py           # User auth API blueprint
 │   ├── dto/
 │   │   ├── auth.py           # Auth request/response DTOs
 │   │   ├── planting_recommendation.py # Response DTOs (Pydantic models)
@@ -106,19 +112,22 @@ poetry install
 cp .env.example .env
 ```
 
-Edit `.env` with your database connection. You can either set a full `DB_URL` or individual parts:
+Edit `.env` with your database connection and a random JWT secret:
 
 ```env
-# Full URL (takes priority)
+# Required
+JWT_SECRET=your-random-secret-here
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_NAME=agwise_api
+
+# Full URL takes priority over individual parts
 # DB_URL="postgresql://user:pass@host:5432/kvuno"
 
 # Individual parts
 DB_DRIVER=postgresql
 DB_HOST=127.0.0.1
 DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=agwise_api
 
 # For SQLite:
 # DB_DRIVER=sqlite
@@ -147,7 +156,7 @@ python run.py
 celery -A app.celery_app worker --loglevel=info  # separate terminal
 ```
 
-The API will be available at `http://localhost:5000` and the OpenAPI docs at `http://localhost:5000/openapi`.
+The API will be available at `http://localhost:5000` and the Swagger UI at `http://localhost:5000/api-docs`.
 
 Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Celery worker.
 
@@ -274,16 +283,52 @@ Convert large `.RDS` files to `.parquet` for faster processing:
 python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('static/data/')"
 ```
 
+### Authentication
+
+All UI routes (`/ui/*`) and most API routes require authentication. Obtain a token via:
+
+```bash
+curl -X POST http://localhost:5000/api/v1/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "johndoe", "password": "securePass123"}'
+# Returns: {"msg": "login success", "access_token": "1|a1b2c3d4e5f6..."}
+```
+
+Use the token in subsequent requests:
+
+```bash
+curl http://localhost:5000/api/v1/planting-data/ \
+  -H "Authorization: Bearer 1|a1b2c3d4e5f6..."
+```
+
+Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie for browser navigation.
+
 ### API Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Redirects to `/openapi` (Swagger UI) |
-| `GET` | `/health` | Health check with database status |
-| `GET` | `/api/v1/planting-data/` | Paginated, filterable crop data |
-| `POST` | `/api/v1/upload/` | Upload an RDS/parquet file for processing |
-| `POST` | `/api/v1/users/register` | User registration (stub) |
-| `POST` | `/api/v1/users/login` | User login (stub) |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/` | — | Redirects to `/api-docs` (Swagger UI) |
+| `GET` | `/health` | — | Health check with database status |
+| `GET` | `/ui/login` | — | Login page |
+| `GET` | `/ui/register` | — | Registration page |
+| `GET` | `/ui/jobs` | Required | Job list |
+| `GET` | `/ui/upload` | Required | File upload UI |
+| `GET` | `/ui/explore` | Required | Map explorer |
+| `GET` | `/ui/quality` | Required | Data quality dashboard |
+| `GET` | `/ui/tokens` | Required | Token management |
+| `POST` | `/api/v1/users/register` | — | Register a new account |
+| `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
+| `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
+| `GET` | `/api/v1/users/tokens` | Required | List active tokens |
+| `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
+| `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
+| `GET` | `/api/v1/planting-data/` | Required | Paginated, filterable crop data |
+| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values |
+| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates |
+| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON) |
+| `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
+| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts |
 
 ### Query Parameters for `/api/v1/planting-data/`
 
@@ -330,31 +375,39 @@ python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('st
 
 Key environment variables (see `.env.example`):
 
-| Variable | Description | Default |
-|---|---|---|
-| `DB_URL` | Full database connection string (overrides DB_*) | — |
-| `DB_DRIVER` | Database driver | `postgresql` |
-| `DB_HOST` | Database host | `127.0.0.1` |
-| `DB_PORT` | Database port | `5432` |
-| `DB_USER` | Database user | `postgres` |
-| `DB_PASSWORD` | Database password | `postgres` |
-| `DB_NAME` | Database name | `agwise_api` |
-| `FLASK_DEBUG` | Enable debug mode | `false` |
-| `SERVER_HOST` | Bind address | `0.0.0.0` |
-| `SERVER_PORT` | Bind port | `5000` |
-| `LOG_LEVEL` | Logging level | `DEBUG` |
-| `SERVER_URL_PROD` | Production server URL | — |
-| `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` |
-| `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` |
-| `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` |
-| `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` |
-| `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` |
-| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `3` |
-| `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` |
-| `REMOTE_RDS_URLS` | Semicol.-delimited remote file URLs | — |
-| `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — |
-| `REMOTE_RDS_COOKIES` | Cookie header for remote downloads | — |
-| `REMOTE_RDS_HEADERS` | Custom headers (key:value; key:value) | — |
+| Variable | Description | Default | Required |
+|---|---|---|---|
+| `DB_URL` | Full database connection string (overrides DB_*) | — | |
+| `DB_DRIVER` | Database driver | `postgresql` | |
+| `DB_HOST` | Database host | `127.0.0.1` | |
+| `DB_PORT` | Database port | `5432` | |
+| `DB_USER` | Database user | — | **Yes** |
+| `DB_PASSWORD` | Database password | — | **Yes** |
+| `DB_NAME` | Database name | — | **Yes** |
+| `JWT_SECRET` | Secret key for JWT signing | — | **Yes** |
+| `TOKEN_TTL_DAYS` | Token expiration in days | `30` | |
+| `RATE_LIMIT_REGISTER` | Registers per minute per IP | `5` | |
+| `RATE_LIMIT_LOGIN` | Login attempts per minute per IP | `10` | |
+| `RATE_LIMIT_UPLOAD` | Uploads per minute per IP | `6` | |
+| `RATE_LIMIT_DATA` | Data queries per minute per IP | `60` | |
+| `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
+| `CORS_ORIGINS` | Allowed CORS origins | `http://127.0.0.1:5000` | |
+| `FLASK_DEBUG` | Enable debug mode | `false` | |
+| `SERVER_HOST` | Bind address | `0.0.0.0` | |
+| `SERVER_PORT` | Bind port | `5000` | |
+| `LOG_LEVEL` | Logging level | `DEBUG` | |
+| `SERVER_URL_PROD` | Production server URL | — | |
+| `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` | |
+| `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` | |
+| `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` | |
+| `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` | |
+| `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` | |
+| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `3` | |
+| `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` | |
+| `REMOTE_RDS_URLS` | Semicol.-delimited remote file URLs | — | |
+| `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — | |
+| `REMOTE_RDS_COOKIES` | Cookie header for remote downloads | — | |
+| `REMOTE_RDS_HEADERS` | Custom headers (key:value; key:value) | — | |
 
 ## CI/CD
 
