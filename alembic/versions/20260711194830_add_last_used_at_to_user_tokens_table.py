@@ -1,8 +1,8 @@
-"""Add last_used_at to user_tokens
+"""add last used at to user tokens table
 
-Revision ID: 20260711120000
-Revises: 20260710111125_add_expires_at_to_user_tokens
-Create Date: 2026-07-11 12:00:00.000000
+Revision ID: 022ecd9e3632
+Revises: f0436b79c8b5
+Create Date: 2026-07-11 19:48:30.733065
 
 """
 from typing import Sequence, Union
@@ -11,9 +11,11 @@ from alembic import op
 import sqlalchemy as sa
 
 
+
+
 # revision identifiers, used by Alembic.
-revision: str = '20260711120000'
-down_revision: Union[str, None] = '20260710111125_add_expires_at_to_user_tokens'
+revision: str = '022ecd9e3632'
+down_revision: Union[str, None] = 'f0436b79c8b5'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
