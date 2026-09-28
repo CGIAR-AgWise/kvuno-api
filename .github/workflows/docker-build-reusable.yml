@@ -19,11 +19,7 @@ on:
         required: false
         type: string
         default: ''
-      build_args:
-        required: false
-        type: string
-        default: ''
-        description: Space-separated build args, e.g. "WITH_DEV=false APP_MODE=prod"
+
 
 jobs:
   build:
@@ -65,7 +61,6 @@ jobs:
         with:
           context: .
           file: ${{ inputs.dockerfile }}
-          build-args: ${{ inputs.build_args }}
           push: true
           provenance: false
           tags: ${{ steps.docker_tags.outputs.tags }}

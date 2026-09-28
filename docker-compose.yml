@@ -30,12 +30,6 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-      # WITH_DEV is fixed at build time (whether dev deps exist).
-      # APP_MODE picks the server and can also be overridden at run time with
-      # -e APP_MODE=prod.
-      args:
-        WITH_DEV: ${WITH_DEV:-true}
-        APP_MODE: ${APP_MODE:-dev}
     env_file:
       - .env
     environment:

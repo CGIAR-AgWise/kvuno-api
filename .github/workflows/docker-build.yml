@@ -27,7 +27,6 @@ jobs:
     with:
       dockerfile: docker/Dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      build_args: WITH_DEV=true APP_MODE=dev
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
@@ -56,9 +55,8 @@ jobs:
       contents: read
       packages: write
     with:
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.prod.dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      build_args: WITH_DEV=false APP_MODE=prod
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
