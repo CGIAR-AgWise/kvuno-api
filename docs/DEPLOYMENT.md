@@ -162,7 +162,7 @@ docker compose logs -f worker
 
 ## 5. Image Variants
 
-All four Dockerfiles live in `docker/`. The three application images share a builder base; none of them install Poetry themselves. The build context is still the **repo root** — only the Dockerfile paths changed — so `docker-compose.yml` and `.dockerignore` remain at the root, and `COPY` paths inside the Dockerfiles are unchanged.
+Three Dockerfiles live in `docker/`. The three application images share a builder base; none of them install Poetry themselves. The build context is still the **repo root** — only the Dockerfile paths changed — so `docker-compose.yml` and `.dockerignore` remain at the root, and `COPY` paths inside the Dockerfiles are unchanged.
 
 The base installs Poetry with the official installer
 (`https://install.python-poetry.org`), pinned to `ARG POETRY_VERSION`, and
@@ -174,9 +174,34 @@ that step and purged again in the same layer.
 | Dockerfile | Output | Notes |
 |---|---|---|
 | `docker/Dockerfile.base` | `ghcr.io/masgeek/python-3.14-poetry:<poetry-version>` | `python:3.14-slim` + Poetry via the official installer into `POETRY_HOME=/opt/poetry`. **Not built by CI** — build locally. |
-| `docker/Dockerfile` | `ghcr.io/cgiar-agwise/kvuno-api` (dev) | All dependencies; runs `python run.py` |
-| `docker/Dockerfile.prod.dockerfile` | same image, prod build | `--without dev`; runs Gunicorn |
-| `docker/Dockerfile.worker` | `ghcr.io/cgiar-agwise/kvuno-worker` | `--without dev`; runs the Celery worker |
+| `docker/Dockerfile` | `ghcr.io/cgiar-agwise/kvuno-api` | One image, two modes via `APP_MODE` — see below |
+| `docker/Dockerfile.worker` | `ghcr.io/cgiar-agwise/kvuno-worker` | Runs the Celery worker |
+
+### Dev and prod from one Dockerfile
+
+`docker/Dockerfile` builds both, via two independent switches:
+
+| Switch | Kind | Values | Effect |
+|---|---|---|---|
+| `WITH_DEV` | build arg | `true` / `false` | `true` includes the dev group (ruff, pytest, pip-audit); `false` installs `--only main` |
+| `APP_MODE` | env, baked from a build arg, overridable with `-e` | `dev` / `prod` | `dev` runs `python3 run.py`; `prod` runs Gunicorn |
+
+They are separate because dependency sets are fixed when the image is built, while the server is a runtime concern. `APP_MODE` can be flipped on any image, but `WITH_DEV` cannot — packages cannot be added at run time. An image built with `WITH_DEV=false` has no test tooling, which is what you want for anything published.
+
+```bash
+# dev image: test tooling + Flask dev server
+docker build -f docker/Dockerfile --build-arg WITH_DEV=true  --build-arg APP_MODE=dev  -t kvuno:dev .
+
+# prod image: runtime deps only + Gunicorn
+docker build -f docker/Dockerfile --build-arg WITH_DEV=false --build-arg APP_MODE=prod -t kvuno:prod .
+
+# flip the server on an existing image without rebuilding
+docker run -e APP_MODE=prod kvuno:dev
+```
+
+`docker/entrypoint.sh` reads `APP_MODE` after applying migrations: `prod` execs `gunicorn --bind 0.0.0.0:${SERVER_PORT:-5000} --workers ${WEB_CONCURRENCY:-4} --timeout ${GUNICORN_TIMEOUT:-60} wsgi:app`, otherwise it execs the image `CMD` (`python3 run.py`).
+
+The `HEALTHCHECK` is unconditional because `/health` answers in both modes.
 
 Each application image starts with:
 
@@ -205,13 +230,12 @@ The tag in the `base` service of `docker-compose.yml` must exactly match the `${
 
 > ⚠️ `poetry.lock` is only valid for the Poetry release that generated it. Different 2.x releases compute a different `content-hash` for `pyproject.toml`, and `poetry install` aborts with *"pyproject.toml changed significantly since poetry.lock was last generated"*.
 
-There is no automated check for this, so a bump means editing **five** places in one commit:
+There is no automated check for this, so a bump means editing **four** places in one commit:
 
 1. `docker/Dockerfile.base` — `ARG POETRY_VERSION`
 2. `docker/Dockerfile` — `ARG POETRY_VERSION`
-3. `docker/Dockerfile.prod.dockerfile` — `ARG POETRY_VERSION`
-4. `docker/Dockerfile.worker` — `ARG POETRY_VERSION`
-5. `docker-compose.yml` — `base` service `image:` tag **and** `POETRY_VERSION:` build arg
+3. `docker/Dockerfile.worker` — `ARG POETRY_VERSION`
+4. `docker-compose.yml` — `base` service `image:` tag **and** `POETRY_VERSION:` build arg
 
 Then regenerate the lock using that same Poetry, and rebuild the base image. Missing any one of them produces an error that looks nothing like a Poetry problem.
 
@@ -235,15 +259,11 @@ The builder copies `pyproject.toml`, `poetry.lock`, and `README.md`:
 
 All application images use `python:3.14-slim` for the runtime stage and run as a non-root `app` user.
 
-**Dev (`docker/Dockerfile`)**
-- Installs **all** dependencies (including dev group)
-- Mounts `${DATA_DIR}` at `/app/static/data`
-
-**Production (`docker/Dockerfile.prod.dockerfile`)**
-- Installs **only** production dependencies (`poetry install --no-root --without dev`)
+**API (`docker/Dockerfile`)**
+- Installs dev deps only when built with `WITH_DEV=true`; otherwise `poetry install --only main`
 - `HEALTHCHECK` polls `http://localhost:5000/health`
-- Runs Gunicorn: `gunicorn -b 0.0.0.0:5000 -w 4 --timeout 60 wsgi:app`
-  (overridable via `app/gunicorn_config.py` env vars: `bind_ip`, `bind_port`, `workers`)
+- `APP_MODE=dev` runs `python3 run.py`; `APP_MODE=prod` runs Gunicorn
+- Mounts `${DATA_DIR}` at `/app/static/data` in compose
 
 **Worker (`docker/Dockerfile.worker`)**
 - `celery -A app.celery_app worker --loglevel=info --concurrency=1`
@@ -252,7 +272,7 @@ All application images use `python:3.14-slim` for the runtime stage and run as a
 To build and run the production image standalone (base image must already be built):
 
 ```bash
-docker build -f docker/Dockerfile.prod.dockerfile -t kvuno-api:latest .
+docker build -f docker/Dockerfile --build-arg WITH_DEV=false --build-arg APP_MODE=prod -t kvuno-api:latest .
 docker run -p 5000:5000 --env-file .env kvuno-api:latest
 ```
 
@@ -294,10 +314,10 @@ Images are published to **GitHub Container Registry**, not Docker Hub:
 
 | Trigger | Image | Source Dockerfile | Tags |
 |---|---|---|---|
-| `develop` | `kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
+| `develop` | `kvuno-api` | `docker/Dockerfile` (`WITH_DEV=true APP_MODE=dev`) | `:latest`, `:develop` |
 | `develop` | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:develop` |
-| `main` | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
-| any tag | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` | `:latest`, `:<tag>`, `:production` |
+| `main` | `kvuno-api` | `docker/Dockerfile` (`APP_MODE=prod`) | `:latest`, `:production` |
+| any tag | `kvuno-api` | `docker/Dockerfile` (`APP_MODE=prod`) | `:latest`, `:<tag>`, `:production` |
 | any tag | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
 
 ### Build workflows
