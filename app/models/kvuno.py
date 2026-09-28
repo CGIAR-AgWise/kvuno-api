@@ -9,6 +9,18 @@ class Base(DeclarativeBase):
     pass
 
 
+class JobProgress(Base):
+    __tablename__ = 'job_progress'
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default='unknown')
+    current_row: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_rows: Mapped[int] = mapped_column(BigInteger, default=0)
+    message: Mapped[Optional[str]] = mapped_column(String(500))
+    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+
+
 class FileImport(Base):
     __tablename__ = 'file_imports'
     __table_args__ = (
