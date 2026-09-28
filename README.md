@@ -9,10 +9,10 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **RDS File Ingestion** — Reads `.RDS` files using `pyreadr`, processes data in chunks with batch inserts
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
 - **Background Processing** — Celery + Redis worker for async file ingestion; separately deployable
-- **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/openapi`
+- **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering
-- **Multi-Database** — SQLite, MySQL, PostgreSQL compatible
+- **Multi-Database** — SQLite and PostgreSQL/PostGIS (the spatial features require PostGIS)
 - **Health Check** — `GET /health` endpoint with database connectivity status
 - **Dockerized** — Dev and production Dockerfiles with docker-compose (PostgreSQL, Redis, Celery worker)
 - **Database Migrations** — Alembic-managed schema evolution
@@ -51,10 +51,12 @@ kvuno/
 │   ├── tasks.py              # Celery task definitions
 │   ├── auth.py               # require_auth decorator
 │   ├── api/
-│   │   ├── planting_data.py  # Planting data API blueprint
+│   │   ├── planting_data.py  # Planting data API (public_api + protected_api)
 │   │   ├── quality.py        # Data quality endpoints
 │   │   ├── upload.py         # File upload API blueprint
 │   │   └── user.py           # User auth API blueprint
+│   ├── cache.py              # Redis-backed @api_cache / invalidate_cache
+│   ├── rate_limit.py         # Flask-Limiter instance (shared)
 │   ├── dto/
 │   │   ├── auth.py           # Auth request/response DTOs
 │   │   ├── planting_recommendation.py # Response DTOs (Pydantic models)
@@ -65,26 +67,37 @@ kvuno/
 │   │   └── kvuno.py          # SQLAlchemy ORM models
 │   ├── repo/
 │   │   ├── planting_recommendation.py # PlantingRecommendation repo
-│   │   └── file_import.py    # FileImport repository
+│   │   ├── file_import.py    # FileImport repository
+│   │   └── import_conflict.py# ImportConflict repository
 │   ├── routes/
-│   │   └── main.py           # App routes (/, /health)
+│   │   └── main.py           # HTML /ui/* routes, resumable upload, /health
+│   ├── services/
+│   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
+│   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
+│   │   └── watch_handler.py  # watchdog directory watcher
+│   ├── templates/            # Jinja pages (base, jobs, upload, explore, quality, login…)
+│   ├── static/               # css/ js/ favicon served by Flask
 │   └── utils/
 │       ├── logging.py        # SharedLogger (loguru wrapper)
+│       ├── downloader.py     # RDSDownloader (auth, SSRF guards)
+│       ├── rds_to_parquet.py # RDS → Parquet batch converter
 │       └── migration_utils.py# Dialect-aware column utilities
 │
 ├── alembic/                  # Database migration scripts
 │   └── versions/             # Migration versions
+├── scripts/
+│   └── run_migrations.py     # Standalone migration runner (deploy step)
 │
 ├── logs/                     # Log output directory
-├── static/data/              # RDS data files for ingestion
+├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup
+├── docker-compose.yml        # Multi-service Docker setup (dev, prod, worker, migrate, redis, db)
 ├── Dockerfile                # Dev Docker image
 ├── Dockerfile.prod.dockerfile# Production Docker image
 ├── Dockerfile.worker         # Celery worker Docker image
-├── dev.bat                   # Windows dev launcher
-├── housekeeping.py           # RDS file processing ETL script
+├── dev_worker.py             # Dev Celery worker launcher (auto solo pool on Windows)
+├── housekeeping.py           # Thin CLI wrapper over app/services/housekeeper.py
 ├── model-generator.py        # ORM model code generator
 ├── pyproject.toml            # Project metadata and dependencies
 ├── run.py                    # Dev server entry point
@@ -136,9 +149,14 @@ DB_PORT=5432
 
 ### Database Migrations
 
+Migrations are **not** run automatically at app startup. Run them explicitly:
+
 ```bash
 # Apply migrations
 alembic upgrade head
+
+# Or use the standalone runner (same thing, builds a minimal app context)
+python scripts/run_migrations.py
 
 # Create a new migration (after model changes)
 alembic revision --autogenerate -m "description"
@@ -148,12 +166,12 @@ alembic revision --autogenerate -m "description"
 
 ```bash
 # API server only (no background processing)
-python run.py
+python run.py            # or: poetry run dev
 ```
 
 ```bash
 # With background processing (requires Redis + Celery worker)
-celery -A app.celery_app worker --loglevel=info  # separate terminal
+python dev_worker.py     # auto-selects --pool solo on Windows, prefork elsewhere
 ```
 
 The API will be available at `http://localhost:5000` and the Swagger UI at `http://localhost:5000/api-docs`.
@@ -170,15 +188,17 @@ A `docker-compose.yml` runs the Flask API alongside PostgreSQL, Redis, and the C
 # Build and start all services
 docker compose up --build -d
 
-# Run database migrations
-docker compose exec kvuno alembic upgrade head
+# Apply migrations (the `migrate` service does this for you on `up`)
+docker compose run --rm migrate
 
 # Verify
 curl http://localhost:5000/health
 ```
 
+Six services are defined: `dev` (Flask dev server, port 5000), `prod` (Gunicorn, port 5001), `worker` (Celery), `migrate` (one-shot migration runner), `redis`, and `db` (PostGIS).
+
 Three image variants are provided:
-- **`Dockerfile`** — dev image with Flask dev server
+- **`Dockerfile`** — dev image with Flask dev server (Python 3.14)
 - **`Dockerfile.prod.dockerfile`** — production image with Gunicorn
 - **`Dockerfile.worker`** — standalone Celery worker image
 
@@ -188,7 +208,7 @@ Start only specific services:
 
 ```bash
 # API + Postgres (no background processing)
-docker compose up -d kvuno db
+docker compose up -d dev db
 
 # Just Redis (for local Celery worker)
 docker compose up -d redis
@@ -307,14 +327,22 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | — | Redirects to `/api-docs` (Swagger UI) |
+| `GET` | `/` | — | Redirects to `/ui/jobs` |
 | `GET` | `/health` | — | Health check with database status |
 | `GET` | `/ui/login` | — | Login page |
 | `GET` | `/ui/register` | — | Registration page |
 | `GET` | `/ui/jobs` | Required | Job list |
-| `GET` | `/ui/upload` | Required | File upload UI |
+| `GET` | `/ui/jobs/data` | Required | JSON: job list |
+| `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
+| `GET` | `/ui/upload` | Required | File upload UI (resumable.js) |
+| `POST` | `/ui/upload/resumable` | Required | Receive one upload chunk (resumable.js) |
+| `GET` | `/ui/upload/resumable` | Required | Chunk probe — 200 if exists, 204 otherwise |
+| `POST` | `/ui/upload/complete` | Required | Merge chunks, return columns + sample rows |
+| `POST` | `/ui/process` | Required | Save column mapping and start ingestion |
+| `GET` | `/ui/progress/<file_name>` | Required | Per-file progress JSON |
 | `GET` | `/ui/explore` | Required | Map explorer |
 | `GET` | `/ui/quality` | Required | Data quality dashboard |
+| `GET` | `/ui/columns` | Required | Mappable DB columns + aliases |
 | `GET` | `/ui/tokens` | Required | Token management |
 | `POST` | `/api/v1/users/register` | — | Register a new account |
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
@@ -323,7 +351,7 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
 | `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
-| `GET` | `/api/v1/planting-data/` | Required | Paginated, filterable crop data |
+| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
 | `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values |
 | `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates |
 | `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters |
@@ -331,12 +359,14 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
 | `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts |
 
+> `GET /api/v1/planting-data/` is intentionally **public** (rate-limited via `RATE_LIMIT_DATA`); the supporting endpoints under the same prefix require a token.
+
 ### Query Parameters for `/api/v1/planting-data/`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `page` | int | Page number (default: 1) |
-| `per_page` | int | Items per page (default: 10) |
+| `per_page` | int | Items per page (default: 50, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
 | `radius` | float | Search radius in meters (requires `coordinates`) |
 | `country` | string | Country name (partial ILIKE match) |
@@ -345,6 +375,7 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `season_type` | string | Season type exact match |
 | `opt_date` | string | Optimal sowing date (`YYYY-MM-DD`) |
 | `planting_option` | string | Planting option exact match |
+| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI |
 
 ### Response Format
 
@@ -382,42 +413,55 @@ Key environment variables (see `.env.example`):
 | `DB_DRIVER` | Database driver | `postgresql` | |
 | `DB_HOST` | Database host | `127.0.0.1` | |
 | `DB_PORT` | Database port | `5432` | |
-| `DB_USER` | Database user | — | **Yes** |
-| `DB_PASSWORD` | Database password | — | **Yes** |
-| `DB_NAME` | Database name | — | **Yes** |
+| `DB_USER` | Database user | — | **Yes** (unless `DB_URL`) |
+| `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
+| `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
 | `JWT_SECRET` | Secret key for JWT signing | — | **Yes** |
-| `TOKEN_TTL_DAYS` | Token expiration in days | `30` | |
-| `RATE_LIMIT_REGISTER` | Registers per minute per IP | `5` | |
-| `RATE_LIMIT_LOGIN` | Login attempts per minute per IP | `10` | |
-| `RATE_LIMIT_UPLOAD` | Uploads per minute per IP | `6` | |
-| `RATE_LIMIT_DATA` | Data queries per minute per IP | `60` | |
+| `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
+| `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
+| `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
+| `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
+| `RATE_LIMIT_DATA` | flask-limiter limit string | `120 per minute` | |
 | `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
-| `CORS_ORIGINS` | Allowed CORS origins | `http://127.0.0.1:5000` | |
+| `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000` | |
 | `FLASK_DEBUG` | Enable debug mode | `false` | |
 | `SERVER_HOST` | Bind address | `0.0.0.0` | |
-| `SERVER_PORT` | Bind port | `5000` | |
+| `SERVER_PORT` | Bind port | `5000` (`run.py` falls back to `80`) | |
 | `LOG_LEVEL` | Logging level | `DEBUG` | |
-| `SERVER_URL_PROD` | Production server URL | — | |
+| `DEBUG_DB` | Echo SQL statements | `false` | |
+| `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |
+| `MAX_FILE_SIZE_MB` | Upload size cap (API-enforced) | `20` | |
+| `CLEANUP_AGE` | Age of completed files purged at startup (`1d`, `12h`, …) | `1d` | |
 | `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` | |
+| `HOUSEKEEPING_DATA_DIR` | Directory watched for uploads | `static/data` | |
+| `HOUSEKEEPING_BATCH_SIZE` | Rows per batch insert | `2000` | |
+| `HOUSEKEEPING_CHUNK_SIZE` | Rows per in-memory chunk | `5000` | |
+| `HOUSEKEEPING_CHECKPOINT_INTERVAL` | Batches between offset commits | `50` | |
 | `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` | |
+| `RDS_COLUMN_MAP` | JSON map of RDS column → ORM field | built-in defaults | |
 | `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` | |
 | `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` | |
 | `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` | |
-| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `3` | |
+| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `10` | |
 | `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` | |
-| `REMOTE_RDS_URLS` | Semicol.-delimited remote file URLs | — | |
+| `REMOTE_RDS_URLS` | Semicolon-delimited remote file URLs | — | |
 | `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — | |
-| `REMOTE_RDS_COOKIES` | Cookie header for remote downloads | — | |
-| `REMOTE_RDS_HEADERS` | Custom headers (key:value; key:value) | — | |
+| `REMOTE_RDS_COOKIES` | Cookie header (comma-separated `k=v` pairs) | — | |
+| `REMOTE_RDS_HEADERS` | Custom headers (`key: value; key2: value2`) | — | |
+| `REMOTE_RDS_ALLOW_HTTP` | Permit non-HTTPS remote URLs | `false` | |
+| `REMOTE_RDS_ALLOWED_DOMAINS` | Comma-separated domain allow-list | — (any) | |
 
 ## CI/CD
 
 GitHub Actions workflows:
 
-- **PR Checks** — Runs Ruff linting and pytest on pull requests
+- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, then `pytest` on Python 3.13 and 3.14 (test job depends on lint)
 - **Version Bumping** — Automated version tags on main
 - **Auto PR** — Creates release PRs from version bumps
 - **TODO Scanner** — Scans codebase for TODO/FIXME markers
+- **Docker Build** — Builds and pushes dev/worker images on version
+
+> `pyproject.toml` pins Python `>=3.13,<4.0`; the Docker images use `python:3.14-slim`.
 
 ## License
 
