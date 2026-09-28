@@ -4,7 +4,7 @@ description: Block until a named workflow finishes for this commit, and report w
 inputs:
   workflow:
     required: true
-    description: Workflow name to wait for, e.g. "PR Checks"
+    description: Workflow name to wait for, e.g. "UnitTests"
   timeout:
     required: false
     description: Seconds to wait before giving up

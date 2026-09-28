@@ -2,7 +2,7 @@ name: Docker Release
 
 # Release builds, triggered by any tag push.
 #
-# This is a separate workflow from docker-build.yml on purpose: PR Checks only
+# This is a separate workflow from docker-build.yml on purpose: UnitTests only
 # runs on pull_request and workflow_dispatch, so its `workflow_run` trigger can
 # never fire for a tag push. A `push: tags` trigger is required, and keeping it
 # in its own file means neither workflow needs compound branching.
@@ -23,11 +23,11 @@ on:
       - '*'
 
 jobs:
-  # A tag is usually cut from an already-tested commit, but PR Checks also runs
+  # A tag is usually cut from an already-tested commit, but UnitTests also runs
   # on the tag push itself. Gate on its conclusion so a release never
   # publishes from a commit whose checks failed.
   gate:
-    name: Wait for PR Checks
+    name: Wait for UnitTests
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -40,13 +40,13 @@ jobs:
       - id: gate
         uses: ./.github/actions/wait-for-checks
         with:
-          workflow: PR Checks
+          workflow: UnitTests
           timeout: '1800'
 
       - name: Fail if checks did not pass
         if: steps.gate.outputs.passed != 'true'
         run: |
-          echo "::error::PR Checks did not pass for ${{ github.sha }} — refusing to build images"
+          echo "::error::UnitTests did not pass for ${{ github.sha }} — refusing to build images"
           echo "::error::conclusion: ${{ steps.gate.outputs.conclusion }}"
           echo "::error::run: ${{ steps.gate.outputs.url }}"
           exit 1

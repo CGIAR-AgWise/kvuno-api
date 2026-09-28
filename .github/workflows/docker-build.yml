@@ -5,11 +5,11 @@ name: Docker Build (branches)
 #   develop -> api (dev server) + worker, tagged :develop
 #   main    -> api (gunicorn production image) ONLY
 #
-# Triggered by `push`, not by `workflow_run` of PR Checks. A workflow_run that
+# Triggered by `push`, not by `workflow_run` of UnitTests. A workflow_run that
 # fires from a forked pull request gets a read-only GITHUB_TOKEN, and the push
 # then fails with "denied: permission_denied: read_package". A push to these
 # branches cannot come from a fork, so the token keeps packages: write.
-# Trade-off: images build on the push itself, not after PR Checks reports green.
+# Trade-off: images build on the push itself, not after UnitTests reports green.
 # main is protected, so it only advances through a reviewed PR anyway.
 
 on:
@@ -27,11 +27,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # PR Checks runs on the same push, so the two workflows start together and
-  # the build has to wait rather than depend. This blocks until PR Checks
+  # UnitTests runs on the same push, so the two workflows start together and
+  # the build has to wait rather than depend. This blocks until UnitTests
   # reports a conclusion for this exact commit, then gates the image jobs.
   gate:
-    name: Wait for PR Checks
+    name: Wait for UnitTests
     if: >-
       github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
@@ -43,13 +43,13 @@ jobs:
       - id: gate
         uses: ./.github/actions/wait-for-checks
         with:
-          workflow: PR Checks
+          workflow: UnitTests
           timeout: '1800'
 
       - name: Fail if checks did not pass
         if: steps.gate.outputs.passed != 'true'
         run: |
-          echo "::error::PR Checks did not pass for ${{ github.sha }} — refusing to build images"
+          echo "::error::UnitTests did not pass for ${{ github.sha }} — refusing to build images"
           echo "::error::conclusion: ${{ steps.gate.outputs.conclusion }}"
           echo "::error::run: ${{ steps.gate.outputs.url }}"
           exit 1
