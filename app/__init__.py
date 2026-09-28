@@ -163,8 +163,9 @@ def create_app():
             "jwt": {
                 "type": "http",
                 "scheme": "bearer",
-                "bearerFormat": "JWT",
+                "bearerFormat": "OpaqueToken",
                 "description": "Access token returned by POST /api/v1/users/login in the format {id}|{secret}. "
+                               "It is an opaque Sanctum-style token (SHA-256 hashed at rest), not a signed JWT. "
                                "Include as: Authorization: Bearer {token}"
             },
         }

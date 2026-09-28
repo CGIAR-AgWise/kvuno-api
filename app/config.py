@@ -80,12 +80,10 @@ RATE_LIMIT_DATA = os.getenv('RATE_LIMIT_DATA', '120 per minute')
 RATE_LIMIT_STORAGE = os.getenv('RATE_LIMIT_STORAGE', 'memory://')
 
 # ── Token / auth ───────────────────────────────────────────────
-JWT_SECRET = os.getenv('JWT_SECRET')
-if not JWT_SECRET:
-    raise RuntimeError(
-        "JWT_SECRET environment variable is required. "
-        "Set it in your .env file or environment before starting the app."
-    )
+#
+# Tokens are opaque Sanctum-style `{id}|{secret}` values: the secret is
+# generated per token and only its SHA-256 hash is stored in `user_tokens`.
+# There is no signing key and no JWT — revoking a row revokes the token.
 TOKEN_TTL_DAYS = int(os.getenv('TOKEN_TTL_DAYS', '0'))
 # Set to 0 for no expiry, or a positive number of days.
 
