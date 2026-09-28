@@ -1,4 +1,4 @@
-name: PR Checks
+name: "UnitTests"
 
 on:
   push:

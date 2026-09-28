@@ -13,10 +13,10 @@ name: Docker Build (branches)
 # main is protected, so it only advances through a reviewed PR anyway.
 
 on:
-  push:
-    branches:
-      - develop
-      - main
+  workflow_run:
+    workflows: ["UnitTests"]
+    types: [completed]
+
 
 permissions:
   contents: read
