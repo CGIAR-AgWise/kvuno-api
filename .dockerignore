@@ -1,1 +1,24 @@
-static/data/*.RDS
+.git
+.gitignore
+.github
+.venv
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.example
+docker-compose.yml
+Dockerfile*
+README.md
+tests/
+docs/
+model-generator.py
+.idea
+.vscode
+*.md
+
+# Exceptions: the `*.md` rule above would otherwise strip README.md from the
+# build context, but pyproject.toml declares `readme = "README.md"` and Poetry
+# validates that file exists during `poetry install`. Negations must come after
+# the rule they override.
+!README.md

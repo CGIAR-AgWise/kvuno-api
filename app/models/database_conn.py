@@ -12,7 +12,7 @@ load_dotenv(verbose=True)
 class MyDb:
     db = None
     db_url: str = os.getenv("DB_URL")
-    debug_db = os.getenv('DEBUG_DB') == '1'
+    debug_db = os.getenv('DEBUG_DB', 'false').lower() == 'true'
 
     @classmethod
     def init_app(cls, app: Flask):

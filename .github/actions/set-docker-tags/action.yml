@@ -1,0 +1,40 @@
+name: Set Docker Tags
+description: Set Docker image tags based on git ref
+
+inputs:
+  image_name:
+    required: true
+    description: Base image name
+  ref:
+    required: true
+    description: Git ref
+  ref_name:
+    required: true
+    description: Git ref name
+
+outputs:
+  tags:
+    description: Generated Docker tags
+    value: ${{ steps.set_tags.outputs.tags }}
+
+runs:
+  using: composite
+  steps:
+      - id: set_tags
+        shell: bash
+        run: |
+          TAGS="${{ inputs.image_name }}:latest"
+
+          if [[ "${{ inputs.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ inputs.ref_name }}"
+            TAGS="$TAGS,${{ inputs.image_name }}:${VERSION},${{ inputs.image_name }}:production"
+          elif [[ "${{ inputs.ref }}" == "refs/heads/main" ]]; then
+            TAGS="$TAGS,${{ inputs.image_name }}:production"
+          elif [[ "${{ inputs.ref }}" == "refs/heads/develop" ]]; then
+            TAGS="$TAGS,${{ inputs.image_name }}:develop"
+          elif [[ "${{ inputs.ref }}" != "refs/heads/develop" && "${{ inputs.ref }}" != "refs/heads/main" ]]; then
+            SAFE_REF_NAME=$(echo "${{ inputs.ref_name }}" | sed 's/[\/]/-/g')
+            TAGS="$TAGS,${{ inputs.image_name }}:${SAFE_REF_NAME}"
+          fi
+
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT

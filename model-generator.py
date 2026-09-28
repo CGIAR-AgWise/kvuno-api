@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from loguru import logger
 from sqlalchemy import create_engine, MetaData
 
+from app.config import build_db_url
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -63,7 +65,7 @@ def run_sqlacodegen():
     executes the `sqlacodegen` command, and handles any errors that occur.
 
     Environment Variables:
-        - DB_URL: The database connection URL.
+        - DB_URL / DB_*: The database connection URL (see app.config.build_db_url).
         - OUTFILE_PATH: The path where the generated model file will be saved (default: 'app/models/kvuno.py').
         - EXCLUDED_TABLES: Comma-separated names of tables to exclude from generation.
 
@@ -71,10 +73,7 @@ def run_sqlacodegen():
         RuntimeError: If the sqlacodegen command fails.
     """
     # Read environment variables
-    db_url = os.getenv('DB_URL')
-    if not db_url:
-        logger.error("DB_URL environment variable is not set")
-        raise ValueError("DB_URL environment variable is not set")
+    db_url = build_db_url()
 
     outfile_path = os.getenv('OUTFILE_PATH', 'app/models/kvuno.py')
     excluded_tables = os.getenv('EXCLUDED_TABLES', 'spatial_ref_sys,alembic_version').split(',')
@@ -102,13 +101,16 @@ def run_sqlacodegen():
             '--outfile',
             outfile_path,
             '--tables',
-            ','.join(included_tables)
+            ','.join(included_tables),
+            '--options',
+            'use_inflect'
         ]
 
         result = subprocess.run(command, check=True, capture_output=True, text=True)
         logger.info("Output:\n" + result.stdout)
         if result.stderr:
             logger.error("Errors:\n" + result.stderr)
+
     except subprocess.CalledProcessError as e:
         logger.error(f"sqlacodegen failed with error: {e}")
         raise RuntimeError(f"sqlacodegen failed: {e}") from e

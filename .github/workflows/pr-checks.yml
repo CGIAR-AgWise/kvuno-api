@@ -1,0 +1,133 @@
+name: "UnitTests"
+
+on:
+  push:
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    concurrency:
+      group: lint-${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-in-project: true
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Cache Poetry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Cache virtualenv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-lint-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Lint with ruff
+        run: poetry run ruff check .
+
+      - name: Audit Python dependencies
+        run: poetry run pip-audit --strict --progress-spinner off
+
+      - name: Audit JavaScript dependencies
+        shell: bash
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            pnpm audit --audit-level=high || echo "pnpm audit found issues (non-blocking)"
+          else
+            echo "No pnpm lock file found, skipping JS audit"
+          fi
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    needs: [ lint ]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.13", "3.14" ]
+    concurrency:
+      group: test-py${{ matrix.python-version }}-${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-in-project: true
+
+      - name: Cache pip
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Cache Poetry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Cache virtualenv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Run tests
+        run: poetry run pytest -v --tb=short --junitxml=test-results.xml
+
+      # app/config.py raises at import if the DB env vars are missing, and
+      # pytest-env only injects them for pytest runs — a bare `python -c` gets
+      # nothing. Mirrors [tool.pytest.ini_options] env so both paths agree.
+      - name: Smoke-test app import
+        env:
+          DB_URL: "sqlite:///:memory:"
+          DB_DRIVER: "sqlite"
+          DB_NAME: ":memory:"
+        run: poetry run python -c "from app.config import build_db_url; print('import OK:', build_db_url())"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: test-results.xml
+          retention-days: 1

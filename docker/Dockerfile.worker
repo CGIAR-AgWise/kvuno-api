@@ -1,0 +1,30 @@
+ARG POETRY_VERSION=2.3.2
+FROM ghcr.io/masgeek/python-3.14-poetry:${POETRY_VERSION} AS builder
+
+WORKDIR /app
+
+# poetry.lock pins the dependency set; without it the build re-resolves on every
+# image and drifts from CI. README.md is required because pyproject.toml declares
+# `readme = "README.md"`, and Poetry validates that at install time.
+COPY pyproject.toml poetry.lock README.md ./
+
+RUN poetry install --no-root --without dev --no-ansi
+
+FROM python:3.14-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:$PATH" \
+    HOME=/app
+
+RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+
+WORKDIR /app
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --chown=app:app . .
+RUN chown app:app /app
+
+USER app
+
+CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]

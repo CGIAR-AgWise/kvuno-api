@@ -1,0 +1,88 @@
+name: Docker Build (branches)
+
+# Branch builds. Releases are handled by docker-release.yml.
+#
+#   develop -> api (dev server) + worker, tagged :develop
+#   main    -> api (gunicorn production image) ONLY
+#
+# Triggered by `push`, not by `workflow_run` of UnitTests. A workflow_run that
+# fires from a forked pull request gets a read-only GITHUB_TOKEN, and the push
+# then fails with "denied: permission_denied: read_package". A push to these
+# branches cannot come from a fork, so the token keeps packages: write.
+# Trade-off: images build on the push itself, not after UnitTests reports green.
+# main is protected, so it only advances through a reviewed PR anyway.
+
+on:
+  workflow_run:
+    workflows: ["UnitTests"]
+    types: [completed]
+
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: kvuno-${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # UnitTests runs on the same push, so the two workflows start together and
+  # the build has to wait rather than depend. This blocks until UnitTests
+  # reports a conclusion for this exact commit, then gates the image jobs.
+  gate:
+    name: Wait for UnitTests
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: gate
+        uses: ./.github/actions/wait-for-checks
+        with:
+          workflow: UnitTests
+          timeout: '1800'
+
+      - name: Fail if checks did not pass
+        if: steps.gate.outputs.passed != 'true'
+        run: |
+          echo "::error::UnitTests did not pass for ${{ github.sha }} — refusing to build images"
+          echo "::error::conclusion: ${{ steps.gate.outputs.conclusion }}"
+          echo "::error::run: ${{ steps.gate.outputs.url }}"
+          exit 1
+
+  build-api-dev:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      dockerfile: docker/Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-api
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+
+  build-worker-dev:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      dockerfile: docker/Dockerfile.worker
+      image_name: ghcr.io/cgiar-agwise/kvuno-worker
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+
+  build-api-prod:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      dockerfile: docker/Dockerfile.prod.dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-api
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}

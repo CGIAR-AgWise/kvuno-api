@@ -17,12 +17,14 @@ def calculate_file_checksum(file_path, logger, algorithm='sha256') -> str | None
     """
     hash_func = hashlib.new(algorithm)
     logger.debug(f'Calculating checksum for {file_path} using [{algorithm}] algorithm.')
+    checksum = None
     try:
         with open(file_path, 'rb') as f:
             for chunk in iter(lambda: f.read(4096), b''):
                 hash_func.update(chunk)
-        return hash_func.hexdigest()
+        checksum = hash_func.hexdigest()
     except FileNotFoundError:
         logger.error(f"File not found: {file_path}")
     except Exception as e:
         logger.error(f"An error occurred: {e}", exc_info=True)
+    return checksum
