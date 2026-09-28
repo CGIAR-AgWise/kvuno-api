@@ -95,9 +95,10 @@ kvuno/
 ├── docker-compose.yml        # Multi-service Docker setup (base, api, worker)
 ├── docker/
 │   ├── Dockerfile.base           # Shared builder base: Python 3.14 + pinned Poetry
-│   ├── Dockerfile                # API image — APP_MODE=dev|prod
+│   ├── Dockerfile                # Dev API image (python3 run.py)
+│   ├── Dockerfile.prod.dockerfile# Production API image (Gunicorn)
 │   ├── Dockerfile.worker         # Celery worker Docker image
-│   └── entrypoint.sh             # Migrations, then server dispatch by APP_MODE
+│   └── entrypoint.sh             # Migrations, then exec the image CMD
 ├── dev_worker.py             # Dev Celery worker launcher (auto solo pool on Windows)
 ├── housekeeping.py           # Thin CLI wrapper over app/services/housekeeper.py
 ├── model-generator.py        # ORM model code generator
@@ -219,10 +220,10 @@ Images are published to GitHub Container Registry, not Docker Hub:
 
 | Trigger | Image | Dockerfile | Tags pushed |
 |---|---|---|---|
-| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=true APP_MODE=dev`) | `:latest`, `:develop` |
+| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
 | `develop` | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `:latest`, `:develop` |
-| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=false APP_MODE=prod`) | `:latest`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=false APP_MODE=prod`) | `:latest`, `:<tag>`, `:production` |
+| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
 | any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
 
 Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
