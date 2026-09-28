@@ -33,9 +33,6 @@ jobs:
   gate:
     name: Wait for PR Checks
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
