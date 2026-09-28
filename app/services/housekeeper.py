@@ -155,13 +155,8 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
 
 
 def _write_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
-    """Write processing progress to a JSON file alongside the data file."""
-    try:
-        payload = {"status": status, "current": current, "total": total, "message": message}
-        with open(file_path + '.progress.json', 'w') as f:
-            json.dump(payload, f)
-    except OSError as e:
-        logger.warning(f"Failed to write progress file: {e}")
+    from app.services.progress_store import save_progress
+    save_progress(file_path, status, current, total, message)
 
 
 # ── DB helpers ─────────────────────────────────────────────────
@@ -525,7 +520,7 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
     file_paths = [
         os.path.join(data_folder, f)
         for f in os.listdir(data_folder)
-        if f.endswith('.RDS') or f.endswith('.parquet')
+        if f.lower().endswith(('.rds', '.parquet'))
     ]
 
     logger.info(f"Starting to process {len(file_paths)} file(s) from {data_folder}")
