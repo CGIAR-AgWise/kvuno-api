@@ -8,7 +8,6 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 
 from pathlib import Path
-import json
 import shutil
 
 from app.models.database_conn import MyDb
@@ -39,18 +38,14 @@ def _cleanup_temp_files():
     multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
     cutoff = time.time() - value * multipliers.get(unit, 86400)
 
-    for p in data_dir.glob('*.progress.json'):
-        try:
-            with open(p) as f:
-                job = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
+    from app.services.progress_store import load_all_jobs, delete_job
+    for job in load_all_jobs():
         if job.get('status') != 'completed':
             continue
-        if p.stat().st_mtime > cutoff:
+        if job.get('mtime', 0) > cutoff:
             continue
-        stem = p.stem.replace('.progress', '')
-        for suffix in ('.rds', '.parquet', '.progress.json', '.meta.json', '.map.json'):
+        stem = job['file']
+        for suffix in ('.rds', '.parquet', '.meta.json', '.map.json'):
             target = data_dir / f"{stem}{suffix}"
             try:
                 if target.is_file():
@@ -58,6 +53,7 @@ def _cleanup_temp_files():
                     log.info("Removed processed file: %s", target.name)
             except OSError:
                 pass
+        delete_job(stem)
 
 
 # API contact information
