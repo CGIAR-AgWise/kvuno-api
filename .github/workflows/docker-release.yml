@@ -23,7 +23,29 @@ on:
       - '*'
 
 jobs:
+  # A tag is usually cut from an already-tested commit, but PR Checks also runs
+  # on the tag push itself. Gate on its conclusion so a release never
+  # publishes from a commit whose checks failed.
+  gate:
+    name: Wait for PR Checks
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: gate
+        uses: ./.github/actions/wait-for-checks
+        with:
+          workflow: PR Checks
+          timeout: '1800'
+
   build-api-release:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -36,6 +58,8 @@ jobs:
       commit_sha: ${{ github.sha }}
 
   build-worker-release:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read

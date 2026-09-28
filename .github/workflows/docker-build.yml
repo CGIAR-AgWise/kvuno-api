@@ -19,8 +19,29 @@ on:
       - main
 
 jobs:
+  # PR Checks runs on the same push, so the two workflows start together and
+  # the build has to wait rather than depend. This blocks until PR Checks
+  # reports a conclusion for this exact commit, then gates the image jobs.
+  gate:
+    name: Wait for PR Checks
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: gate
+        uses: ./.github/actions/wait-for-checks
+        with:
+          workflow: PR Checks
+          timeout: '1800'
+
   build-api-dev:
-    if: github.ref == 'refs/heads/develop'
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -33,7 +54,8 @@ jobs:
       commit_sha: ${{ github.sha }}
 
   build-worker-dev:
-    if: github.ref == 'refs/heads/develop'
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -46,7 +68,8 @@ jobs:
       commit_sha: ${{ github.sha }}
 
   build-api-prod:
-    if: github.ref == 'refs/heads/main'
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read

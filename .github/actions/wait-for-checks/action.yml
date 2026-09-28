@@ -1,0 +1,74 @@
+name: Wait For Checks
+description: Block until a named workflow finishes for this commit, and report whether it passed
+
+inputs:
+  workflow:
+    required: true
+    description: Workflow name to wait for, e.g. "PR Checks"
+  timeout:
+    required: false
+    description: Seconds to wait before giving up
+    default: '1800'
+  interval:
+    required: false
+    description: Seconds between polls
+    default: '20'
+
+outputs:
+  passed:
+    description: '"true" when the workflow concluded successfully'
+    value: ${{ steps.gate.outputs.passed }}
+  conclusion:
+    description: The workflow conclusion, or "missing" / "timeout"
+    value: ${{ steps.gate.outputs.conclusion }}
+  url:
+    description: Run URL, for the failure message
+    value: ${{ steps.gate.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: gate
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        SHA: ${{ github.sha }}
+        WORKFLOW: ${{ inputs.workflow }}
+        TIMEOUT: ${{ inputs.timeout }}
+        INTERVAL: ${{ inputs.interval }}
+      run: |
+        set -uo pipefail
+        deadline=$(( $(date +%s) + TIMEOUT ))
+
+        # --jq is gh's built-in JSON filter, so this needs no separate jq binary.
+        fetch() { gh run list --workflow "$WORKFLOW" --commit "$SHA" --limit 1 \
+                        --json status,conclusion,url --jq "$1" 2>/dev/null || echo ""; }
+
+        while :; do
+          status=$(fetch '.[0].status // "missing"')
+
+          if [ "$status" = "completed" ]; then
+            conclusion=$(fetch '.[0].conclusion // "unknown"')
+            url=$(fetch '.[0].url // ""')
+            echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
+            echo "url=$url" >> "$GITHUB_OUTPUT"
+            if [ "$conclusion" = "success" ]; then
+              echo "passed=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::$WORKFLOW passed for ${SHA:0:7}"
+              exit 0
+            fi
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::$WORKFLOW concluded '$conclusion' for ${SHA:0:7} — skipping image build"
+            exit 0
+          fi
+
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "conclusion=timeout" >> "$GITHUB_OUTPUT"
+            echo "::error::timed out after ${TIMEOUT}s waiting for $WORKFLOW on ${SHA:0:7} — skipping image build"
+            exit 0
+          fi
+
+          sleep "$INTERVAL"
+        done
