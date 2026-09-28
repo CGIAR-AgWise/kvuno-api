@@ -1,61 +1,60 @@
 services:
-  dev:
-    container_name: kvuno-dev
-    hostname: kvuno-dev
-    image: masgeek/kvuno-api:${TAG:-latest}
+  # Shared builder base (python:3.14-slim + pinned Poetry), published as
+  # ghcr.io/masgeek/python-3.14-poetry:<version>. CI does not build it — build it
+  # here and (optionally) push it:
+  #   docker compose build base
+  #   docker push ghcr.io/masgeek/python-3.14-poetry:2.3.2
+  # The tag MUST match the `POETRY_VERSION` ARG in Dockerfile.base and in the
+  # three application Dockerfiles, because those do
+  # `FROM ghcr.io/masgeek/python-3.14-poetry:${POETRY_VERSION}`.
+  base:
+    image: ghcr.io/masgeek/python-3.14-poetry:${POETRY_VERSION:-2.3.2}
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile.base
+      args:
+        POETRY_VERSION: ${POETRY_VERSION:-2.3.2}
+
+  api:
+    container_name: kvuno-api
+    hostname: kvuno-api
+    image: ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     env_file:
       - .env
-#    environment:
-#      FLASK_ENV: ${FLASK_ENV:-development}
-#      FLASK_APP: ${FLASK_APP:-development}
-#      FLASK_DEBUG: ${FLASK_DEBUG:-false}
-#      DEBUG_DB: ${DEBUG_DB:-false}
-#      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-#      DB_DRIVER: ${DB_DRIVER:-postgresql}
-#      DB_HOST: ${DB_HOST:-db}
-#      DB_PORT: ${DB_PORT:-5432}
-#      DB_USER: ${DB_USER:?DB_USER is required}
-#      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-#      DB_NAME: ${DB_NAME:?DB_NAME is required}
-#      SORT_JSON: ${SORT_JSON:-0}
-#      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
-#      SERVER_PORT: ${SERVER_PORT:-5000}
-#      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
-#      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
-#      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
-#      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
-#      CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
-#      CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
-#      CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
-#      REMOTE_RDS_URLS: ${REMOTE_RDS_URLS:-}
-#      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-20}
-#      CLEANUP_AGE: ${CLEANUP_AGE:-1d}
-#      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
-#      TOKEN_TTL_DAYS: ${TOKEN_TTL_DAYS:-0}
-#      RATE_LIMIT_STORAGE: ${RATE_LIMIT_STORAGE:-memory://}
-#      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-10 per hour}
-#      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-20 per hour}
-#      RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-10 per hour}
-#      RATE_LIMIT_DATA: ${RATE_LIMIT_DATA:-120 per minute}
+    environment:
+      FLASK_ENV: ${FLASK_ENV:-development}
+      FLASK_APP: ${FLASK_APP:-development}
+      FLASK_DEBUG: ${FLASK_DEBUG:-false}
+      DEBUG_DB: ${DEBUG_DB:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_DRIVER: ${DB_DRIVER:-postgresql}
+    #      DB_HOST: ${DB_HOST:-db}
+    #      DB_PORT: ${DB_PORT:-5432}
+    #      DB_USER: ${DB_USER:?DB_USER is required}
+    #      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    #      DB_NAME: ${DB_NAME:?DB_NAME is required}
+    #      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+    #      SERVER_PORT: ${SERVER_PORT:-5000}
+    #      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
+    #      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
+    #      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+    #      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
 
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
       - "5000:5000"
-    depends_on:
-      - db
-      - redis
 
   worker:
     container_name: kvuno-worker
     hostname: kvuno-worker
-    image: masgeek/kvuno-worker:${TAG:-latest}
+    image: ghcr.io/cgiar-agwise/kvuno-worker:${TAG:-latest}
     build:
       context: .
-      dockerfile: Dockerfile.worker
+      dockerfile: docker/Dockerfile.worker
     restart: unless-stopped
     environment:
       DEBUG_DB: ${DEBUG_DB:-false}
@@ -80,17 +79,14 @@ services:
       RDS_COLUMN_MAP: ${RDS_COLUMN_MAP:-}
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
-    depends_on:
-      - db
-      - redis
 
   migrate:
     container_name: kvuno-migrate
-    image: masgeek/kvuno-api:${TAG:-latest}
+    image: ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}
     build:
       context: .
-      dockerfile: Dockerfile
-    command: ["python3", "scripts/run_migrations.py"]
+      dockerfile: docker/Dockerfile
+    command: [ "python3", "scripts/run_migrations.py" ]
     restart: no
     environment:
       DB_DRIVER: ${DB_DRIVER:-postgresql}
@@ -99,25 +95,3 @@ services:
       DB_USER: ${DB_USER:?DB_USER is required}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: ${DB_NAME:?DB_NAME is required}
-    depends_on:
-      db:
-        condition: service_started
-
-  redis:
-    container_name: kvuno-redis
-    hostname: redis
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-
-  db:
-    container_name: db
-    hostname: db
-#    image: postgres:17-alpine
-    image: postgis/postgis:17-3.5
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${DB_NAME:?DB_NAME is required}
-      POSTGRES_USER: ${DB_USER:?DB_USER is required}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}

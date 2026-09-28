@@ -1,15 +1,12 @@
-FROM python:3.14-slim AS builder
-
-ENV PIP_NO_CACHE_DIR=1 \
-    POETRY_NO_INTERACTION=1 \
-    POETRY_VIRTUALENVS_IN_PROJECT=true
-
-RUN pip install poetry==2 --no-cache-dir
+ARG POETRY_VERSION=2.3.2
+FROM ghcr.io/masgeek/python-3.14-poetry:${POETRY_VERSION} AS builder
 
 WORKDIR /app
 
-#COPY pyproject.toml poetry.lock ./
-COPY pyproject.toml ./
+# poetry.lock pins the dependency set; without it the build re-resolves on every
+# image and drifts from CI. README.md is required because pyproject.toml declares
+# `readme = "README.md"`, and Poetry validates that at install time.
+COPY pyproject.toml poetry.lock README.md ./
 
 RUN poetry install --no-root --no-ansi
 
