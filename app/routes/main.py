@@ -1,14 +1,11 @@
 import json
 import os
-import queue
-import threading
+import time
 import uuid
 
 import pandas as pd
 import pyreadr
 from flask import abort, redirect, jsonify, render_template, request, Response, stream_with_context
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
 
 from pathlib import Path
 
@@ -43,46 +40,6 @@ COLUMN_ALIASES = {
 CHUNK_DIR = os.path.join(DATA_DIR, '.chunks')
 
 
-# ── File watcher (SSE push on changes) ─────────────────────────
-
-class _ProgressHandler(FileSystemEventHandler):
-    def on_created(self, event):
-        if event.src_path.endswith('.progress.json'):
-            _notify_sse_clients()
-    def on_modified(self, event):
-        if event.src_path.endswith('.progress.json'):
-            _notify_sse_clients()
-
-
-_sse_queues: list[queue.Queue] = []
-_sse_lock = threading.Lock()
-_MAX_SSE_CLIENTS = 50
-
-
-def _notify_sse_clients():
-    with _sse_lock:
-        dead = []
-        for q in _sse_queues:
-            try:
-                q.put_nowait(True)
-            except queue.Full:
-                dead.append(q)
-        for q in dead:
-            _sse_queues.remove(q)
-
-
-def _start_watcher():
-    data_dir = Path(DATA_DIR)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    observer = Observer()
-    observer.schedule(_ProgressHandler(), str(data_dir), recursive=False)
-    observer.daemon = True
-    observer.start()
-
-
-_start_watcher()
-
-
 def _read_columns(path: str, ext: str):
     if ext == '.parquet':
         return pd.read_parquet(path, nrows=0).columns.tolist()
@@ -104,33 +61,8 @@ def _chunk_path(identifier: str, number: int):
 
 
 def _load_jobs():
-    jobs = []
-    data_dir = Path(DATA_DIR)
-    for p in data_dir.glob('*.progress.json'):
-        try:
-            with open(p) as f:
-                job = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-        stem = p.stem.replace('.progress', '')
-        mtime = os.path.getmtime(p)
-        job['file'] = stem
-        job['mtime'] = mtime
-
-        meta_path = data_dir / f"{stem}.meta.json"
-        if meta_path.is_file():
-            try:
-                with open(meta_path) as f:
-                    meta = json.load(f)
-                job['original_name'] = meta.get('original_name', stem)
-            except (json.JSONDecodeError, OSError):
-                job['original_name'] = stem
-        else:
-            job['original_name'] = stem
-
-        jobs.append(job)
-    jobs.sort(key=lambda j: j.get('mtime', 0), reverse=True)
-    return jobs
+    from app.services.progress_store import load_all_jobs
+    return load_all_jobs()
 
 
 def _format_jobs(raw):
@@ -355,29 +287,41 @@ def register_app_routes(app):
     @app.route('/ui/jobs/events', methods=['GET'])
     @require_auth
     def ui_jobs_events():
-        with _sse_lock:
-            if len(_sse_queues) >= _MAX_SSE_CLIENTS:
-                return jsonify(error="Too many SSE connections. Try again later."), 503
         def generate():
-            q = queue.Queue(maxsize=16)
-            with _sse_lock:
-                _sse_queues.append(q)
+            raw, counts = _format_jobs(_load_jobs())
+            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+
+            use_redis = True
+            r = None
+            pubsub = None
             try:
-                raw, counts = _format_jobs(_load_jobs())
-                yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                from redis import Redis
+                r = Redis.from_url(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
+                                   socket_connect_timeout=2, socket_timeout=2)
+                r.ping()
+                pubsub = r.pubsub()
+                pubsub.subscribe('jobs:updates')
+            except Exception:
+                use_redis = False
+
+            if use_redis and pubsub:
+                try:
+                    for message in pubsub.listen():
+                        if message['type'] == 'message':
+                            raw, counts = _format_jobs(_load_jobs())
+                            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                except GeneratorExit:
+                    pass
+                finally:
+                    if pubsub:
+                        pubsub.unsubscribe()
+                        pubsub.close()
+                    if r:
+                        r.close()
+            else:
                 while True:
-                    try:
-                        q.get(timeout=60)
-                    except queue.Empty:
-                        # Send keepalive comment and continue waiting
-                        yield ": keepalive\n\n"
-                        continue
+                    time.sleep(3)
                     raw, counts = _format_jobs(_load_jobs())
                     yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
-            except GeneratorExit:
-                pass
-            finally:
-                with _sse_lock:
-                    if q in _sse_queues:
-                        _sse_queues.remove(q)
+
         return Response(stream_with_context(generate()), mimetype='text/event-stream')
