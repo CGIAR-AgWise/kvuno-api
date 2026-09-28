@@ -16,7 +16,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Health Check** — `GET /health` endpoint with database connectivity status
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
-- **JWT Authentication** — Sanctum-style `{id}|{secret}` tokens with BCrypt password hashing
+- **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
 - **Login & Registration UI** — Web forms at `/ui/login` and `/ui/register`
 - **Token Management** — List and revoke tokens at `/ui/tokens`
 - **CORS** — Cross-origin support enabled globally
@@ -32,7 +32,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | Migrations | Alembic |
 | Spatial | GeoAlchemy2 / PostGIS |
 | RDS Parsing | pyreadr + pandas |
-| Authentication | JWT (HS256) + bcrypt |
+| Authentication | Opaque bearer tokens (`{id}|{secret}`, SHA-256 at rest) + bcrypt |
 | Background Tasks | Celery + Redis (Kombu transport) |
 | Logging | loguru |
 | Serving | Waitress (dev) / Gunicorn (prod) |
@@ -92,10 +92,12 @@ kvuno/
 ├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup (api, worker, migrate)
-├── Dockerfile                # Dev Docker image
-├── Dockerfile.prod.dockerfile# Production Docker image
-├── Dockerfile.worker         # Celery worker Docker image
+├── docker-compose.yml        # Multi-service Docker setup (base, api, worker, migrate)
+├── docker/
+│   ├── Dockerfile.base           # Shared builder base: Python 3.14 + Poetry (via uv)
+│   ├── Dockerfile                # Dev Docker image
+│   ├── Dockerfile.prod.dockerfile# Production Docker image
+│   └── Dockerfile.worker         # Celery worker Docker image
 ├── dev_worker.py             # Dev Celery worker launcher (auto solo pool on Windows)
 ├── housekeeping.py           # Thin CLI wrapper over app/services/housekeeper.py
 ├── model-generator.py        # ORM model code generator
@@ -125,11 +127,10 @@ poetry install
 cp .env.example .env
 ```
 
-Edit `.env` with your database connection and a random JWT secret:
+Edit `.env` with your database connection:
 
 ```env
 # Required
-JWT_SECRET=your-random-secret-here
 DB_USER=postgres
 DB_PASSWORD=postgres
 DB_NAME=agwise_api
@@ -182,11 +183,14 @@ Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker aut
 
 ### Docker Deployment
 
-`docker-compose.yml` defines three services: `api` (Flask dev server, port 5000), `worker` (Celery), and `migrate` (one-shot migration runner).
+`docker-compose.yml` defines four services: `base` (build-only, never started), `api` (Flask dev server, port 5000), `worker` (Celery), and `migrate` (one-shot migration runner).
 
 > PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
 ```bash
+# Build the shared builder base FIRST — the app images FROM it
+docker compose build base
+
 # Build and start
 docker compose up --build -d
 
@@ -196,6 +200,8 @@ docker compose run --rm migrate
 # Verify
 curl http://localhost:5000/health
 ```
+
+> `base` is never started; it exists so the three application images share one pinned Poetry install. Skipping `docker compose build base` makes them fail trying to pull it from GHCR.
 
 ### Docker — Individual Services
 
@@ -213,9 +219,9 @@ Images are published to GitHub Container Registry, not Docker Hub:
 
 | Image | Dockerfile | Built on |
 |---|---|---|
-| `ghcr.io/cgiar-agwise/kvuno-api` | `Dockerfile` (dev server, Python 3.14) | `develop` |
-| `ghcr.io/cgiar-agwise/kvuno-api` | `Dockerfile.prod.dockerfile` (Gunicorn) | `main` |
-| `ghcr.io/cgiar-agwise/kvuno-worker` | `Dockerfile.worker` (Celery) | `main`, `develop`, `beta/*` |
+| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev server, Python 3.14) | `develop` |
+| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (Gunicorn) | `main` |
+| `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `main`, `develop`, `beta/*` |
 
 CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
@@ -224,6 +230,16 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
 ```
 
 Packages are private by default; set them to public in the org settings if you want anonymous pulls.
+
+### Base Image (GHCR)
+
+The builder base is `ghcr.io/masgeek/python-3.14-poetry:2.3.2` — `python:3.14-slim` plus Poetry, installed with `uv` and pinned exactly. CI does not build or push it; build it locally with `docker compose build base`, and `docker push` it if you want to share it with other projects.
+
+The Poetry version is the **tag**, not part of the name, so a Poetry bump publishes a new tag on the same package rather than creating a new one.
+
+### Upgrading Poetry
+
+`poetry.lock` is only valid for the Poetry release that generated it: different 2.x releases compute a different content-hash for `pyproject.toml`, and the build fails with *"pyproject.toml changed significantly"*. There is no automated check, so a bump must touch five places in one commit — `ARG POETRY_VERSION` in `docker/Dockerfile.base` and in all three application Dockerfiles under `docker/`, plus the `base` service `image:` tag **and** `POETRY_VERSION:` build arg in `docker-compose.yml`. Then regenerate the lock with that same Poetry and rebuild the base image. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#5-image-variants).
 
 ### Local Development without Postgres
 
@@ -424,7 +440,6 @@ Key environment variables (see `.env.example`):
 | `DB_USER` | Database user | — | **Yes** (unless `DB_URL`) |
 | `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
 | `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
-| `JWT_SECRET` | Secret key for JWT signing | — | **Yes** |
 | `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
 | `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
 | `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |

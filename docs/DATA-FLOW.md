@@ -309,4 +309,4 @@ Index: `idx_user_tokens_token`.
 | Cache | `app/cache.py` | `@api_cache` / `invalidate_cache` (Redis, no-op if unavailable) |
 | Routes | `app/routes/main.py` | `/` redirect, `/health`, all `/ui/*` pages, resumable upload endpoints, SSE stream |
 | App | `app/__init__.py` | `create_app()` — OpenAPI factory, CORS, rate limiter, security headers, DB init |
-| Config | `app/config.py` | Constants + `build_db_url()`; **raises at import if `JWT_SECRET` is unset** |
+| Config | `app/config.py` | Constants + `build_db_url()`; **raises at import if `DB_USER`/`DB_PASSWORD`/`DB_NAME` are unset** (no `DB_URL`) |
