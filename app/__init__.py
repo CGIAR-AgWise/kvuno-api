@@ -123,13 +123,19 @@ def _sanitize_db_url(url: str) -> str:
 
 
 def run_migrations():
-    """Run pending Alembic migrations at startup."""
+    """Apply pending Alembic migrations.
+
+    Called by docker/entrypoint.sh before the app starts (and by
+    scripts/run_migrations.py). A no-op when the database is unreachable, so a
+    database that is still booting will not block the app from starting.
+    """
     if not _db_available():
         from app.utils.logging import SharedLogger
         _log = SharedLogger().get_logger()
         _log.warning(
             f"Database at {_sanitize_db_url(build_db_url())} is not reachable — skipping migrations. "
-            f"Set RUN_MIGRATION=false to suppress this check."
+            f"The app will start, but requests will fail until the database is available. "
+            f"Set RUN_MIGRATIONS=false in the container environment to skip migrations entirely."
         )
         return
     alembic_cfg = AlembicConfig("alembic.ini")

@@ -6,14 +6,13 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 
 ## 1. Architecture
 
-`docker-compose.yml` defines four services:
+`docker-compose.yml` defines three services:
 
 | Service | Image | Purpose |
 |---|---|---|
 | `base` | `ghcr.io/masgeek/python-3.14-poetry:2.3.2` (from `docker/Dockerfile.base`) | Build-only: Python 3.14 + pinned Poetry. Never started; nothing runs in it. |
-| `api` | `ghcr.io/cgiar-agwise/kvuno-api` (built from `docker/Dockerfile`) | Flask dev server on port 5000 |
+| `api` | `ghcr.io/cgiar-agwise/kvuno-api` (built from `docker/Dockerfile`) | Flask dev server on port 5000. Entrypoint migrates, then serves. |
 | `worker` | `ghcr.io/cgiar-agwise/kvuno-worker` (built from `docker/Dockerfile.worker`) | Celery ingestion worker |
-| `migrate` | `ghcr.io/cgiar-agwise/kvuno-api` | One-shot `scripts/run_migrations.py` run, then exits |
 
 ```
 ┌──────────────┐      port 5432     ┌──────────────┐
@@ -30,7 +29,7 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 
 > **Postgres and Redis are no longer compose services.** They are expected to be running elsewhere (or added back via an override file), and `DB_HOST` / `CELERY_BROKER_URL` must point at whatever is reachable. The services also no longer declare `depends_on`. If you need the full stack locally, bring your own `postgis/postgis:17-3.5` and `redis:7-alpine`, or add a `docker-compose.override.yml`.
 
-`api`, `worker`, and `migrate` all bind-mount `${DATA_DIR:-./data}` at `/app/static/data`.
+`api` and `worker` both bind-mount `${DATA_DIR:-./data}` at `/app/static/data`.
 
 > **`base` is a build-time dependency, not a running service.** Build it before the others — the application images `FROM` it and will fail otherwise: `docker compose build base`.
 
@@ -44,7 +43,7 @@ The compose file reads these variables from the host environment (or `.env` file
 
 | Compose variable | Default | Used by |
 |---|---|---|
-| `TAG` | `latest` | `api` / `worker` / `migrate` image tag |
+| `TAG` | `latest` | `api` / `worker` image tag |
 | `DATA_DIR` | `./data` | Host directory mounted at `/app/static/data` |
 | `DB_NAME` | *(required)* | Database name |
 | `DB_USER` | *(required)* | Database user |
@@ -57,7 +56,7 @@ The compose file reads these variables from the host environment (or `.env` file
 | Service | How it gets config |
 |---|---|
 | `api` | `env_file: .env` (the explicit `environment:` block is commented out) |
-| `worker`, `migrate` | Explicit `environment:` blocks with `${VAR:-default}` interpolation |
+| `worker` | Explicit `environment:` block with `${VAR:-default}` interpolation |
 | All | `load_dotenv()` at import time, so a mounted/baked `.env` also applies |
 
 ### Required values for the app container
@@ -87,11 +86,9 @@ DB_NAME=agwise_api
 # Build the shared builder base FIRST — the app images FROM it
 docker compose build base
 
-# Build and start all services in the background
+# Build and start all services. The api container applies migrations
+# before it starts serving, so there is no separate migration step.
 docker compose up --build -d
-
-# Run database migrations (one-shot)
-docker compose run --rm migrate
 
 # Verify health
 curl http://localhost:5000/health
@@ -124,16 +121,24 @@ Note the service names — there is no `kvuno` service.
 
 ### Database migrations
 
-```bash
-# Recommended: the dedicated one-shot service
-docker compose run --rm migrate
+There is no separate migration service. The `api` image entrypoint (`docker/entrypoint.sh`) applies pending migrations, then execs the server:
 
-# Or exec into a running container
+```bash
+# Manual, when you need to run them outside a container start
 docker compose exec api python scripts/run_migrations.py
 docker compose exec api alembic upgrade head
 ```
 
-Migrations are **not** applied by the web service at startup; run them as a separate deploy step.
+| `RUN_MIGRATIONS` | Effect |
+|---|---|
+| `true` | Entrypoint migrates, then starts the server |
+| `false` | Skips migration entirely; schema must already be current |
+
+> `docker-compose.yml` currently sets `RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}`, so **migrations are not applied automatically** — run them manually with `docker compose exec api python scripts/run_migrations.py`. Flip it to `true` to let the `api` container migrate on start.
+
+**Set it to `false` when you run more than one API replica**, otherwise each replica races to migrate the same schema — concurrent `alembic upgrade head` calls can deadlock or fail. This is the reason startup migrations were originally removed in favour of a separate step.
+
+The `worker` never migrates. It only receives tasks from the already-running API, and `process_pending()` is enqueued from `create_app()`. A task already sitting in the broker when the worker restarts could execute before the API migrates, but Celery's `autoretry_for=(Exception,)` with 10 retries at 60s absorbs that window. `depends_on: api` would **not** help — the API container counts as started the moment its entrypoint begins, which is before migrations finish.
 
 ### Housekeeping (RDS ingestion)
 
@@ -159,13 +164,16 @@ docker compose logs -f worker
 
 All four Dockerfiles live in `docker/`. The three application images share a builder base; none of them install Poetry themselves. The build context is still the **repo root** — only the Dockerfile paths changed — so `docker-compose.yml` and `.dockerignore` remain at the root, and `COPY` paths inside the Dockerfiles are unchanged.
 
-The base installs Poetry with `uv tool install` (pinned by `ARG UV_VERSION`, currently 0.9.0) rather than `pip`. `UV_VERSION` is independent of `poetry.lock` and can be bumped freely; `POETRY_VERSION` cannot.
+The base installs Poetry with the official installer
+(`https://install.python-poetry.org`), pinned to `ARG POETRY_VERSION`, and
+verifies the resolved version in the same layer. `curl` is installed only for
+that step and purged again in the same layer.
 
 > `.dockerignore` cannot move into `docker/`: Docker only reads it from the build-context root. Moving it would silently disable every rule, including the `!README.md` negation that `poetry install` depends on.
 
 | Dockerfile | Output | Notes |
 |---|---|---|
-| `docker/Dockerfile.base` | `ghcr.io/masgeek/python-3.14-poetry:<poetry-version>` | `python:3.14-slim` + Poetry installed via `uv tool install` into an isolated `/opt/uv-tools` venv. **Not built by CI** — build locally. |
+| `docker/Dockerfile.base` | `ghcr.io/masgeek/python-3.14-poetry:<poetry-version>` | `python:3.14-slim` + Poetry via the official installer into `POETRY_HOME=/opt/poetry`. **Not built by CI** — build locally. |
 | `docker/Dockerfile` | `ghcr.io/cgiar-agwise/kvuno-api` (dev) | All dependencies; runs `python run.py` |
 | `docker/Dockerfile.prod.dockerfile` | same image, prod build | `--without dev`; runs Gunicorn |
 | `docker/Dockerfile.worker` | `ghcr.io/cgiar-agwise/kvuno-worker` | `--without dev`; runs the Celery worker |
@@ -210,7 +218,10 @@ Then regenerate the lock using that same Poetry, and rebuild the base image. Mis
 > Note: `pip install poetry==2` does **not** mean "latest 2.x" — it resolves to 2.0.0 and silently disagrees with a lock generated by a newer release. The base image avoids that trap by pinning the exact version and asserting it in the same layer:
 
 ```dockerfile
-RUN --mount=type=cache,target=/root/.cache/uv     uv tool install "poetry==${POETRY_VERSION}"     && installed="$(poetry --version)"     && case "${installed}" in *"version ${POETRY_VERSION})"*) ;;          *) echo "expected poetry ${POETRY_VERSION}, got: ${installed}" >&2; exit 1 ;; esac
+# pipefail: a failed curl must fail the build, not feed empty input to python.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update     && apt-get install -y --no-install-recommends ca-certificates curl     && curl -fsSL https://install.python-poetry.org | python3 - --version "${POETRY_VERSION}"     && apt-get purge -y --auto-remove curl     && rm -rf /var/lib/apt/lists/*     && installed="$(poetry --version)"     && case "${installed}" in *"version ${POETRY_VERSION})"*) ;;          *) echo "expected poetry ${POETRY_VERSION}, got: ${installed}" >&2; exit 1 ;; esac
 ```
 
 ### Builder stage requirements
@@ -251,7 +262,7 @@ docker run -p 5000:5000 --env-file .env kvuno-api:latest
 
 | Host path | Mount point | Purpose |
 |---|---|---|
-| `${DATA_DIR:-./data}` | `/app/static/data` | Uploaded + downloaded RDS/Parquet files (shared by `api`, `worker`, `migrate`) |
+| `${DATA_DIR:-./data}` | `/app/static/data` | Uploaded + downloaded RDS/Parquet files (shared by `api` and `worker`) |
 
 There is no Postgres volume to back up here — the database is external (see §1).
 
@@ -264,15 +275,16 @@ There is no Postgres volume to back up here — the database is external (see §
 | Compose exits immediately with `DB_USER is required` | Missing env var | Set `DB_USER`/`DB_PASSWORD`/`DB_NAME` in the shell or `.env` |
 | API returns 500 on `/health` | DB connection refused | Check `DB_HOST` resolves from inside the container — `db` is no longer a compose service |
 | `psycopg2.OperationalError` | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
-| Migrations fail with "no such table" | Alembic not yet run | `docker compose run --rm migrate` |
+| Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Uploads accepted but never processed | `HOUSEKEEPING_ENABLED` unset/false and no worker | Set `HOUSEKEEPING_ENABLED=true` and start the `worker` service |
-| 500s with "relation does not exist" | App started without migrations | Same as above — the app does **not** migrate on startup |
+| 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
 | Port 5000 already in use | Another service on port 5000 | Stop it, or remap with `ports: - "5001:5000"` |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |
 | `manifest unknown` on pull | Tag not built yet, or wrong `TAG` | Tags come from the Docker Build workflow; check what exists under the `CGIAR-AgWise` org |
 | `pull access denied` / `manifest unknown` for `python-3.14-poetry` | Base image not built locally and the tag is not in the registry (or is private) | `docker compose build base`, or `docker login ghcr.io` and retry the pull |
 | `pyproject.toml changed significantly` during build | Poetry version does not match the one that generated the lock | See [Bumping Poetry](#bumping-poetry) — five places to update |
 | `Declared README file does not exist` during build | `!README.md` missing from `.dockerignore` | The negation must follow the `*.md` rule |
+| Entrypoint fails with `not found` | `docker/entrypoint.sh` checked out with CRLF | `.gitattributes` pins `*.sh` to LF; re-checkout after it is committed |
 
 ---
 

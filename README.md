@@ -92,9 +92,9 @@ kvuno/
 ├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup (base, api, worker, migrate)
+├── docker-compose.yml        # Multi-service Docker setup (base, api, worker)
 ├── docker/
-│   ├── Dockerfile.base           # Shared builder base: Python 3.14 + Poetry (via uv)
+│   ├── Dockerfile.base           # Shared builder base: Python 3.14 + pinned Poetry
 │   ├── Dockerfile                # Dev Docker image
 │   ├── Dockerfile.prod.dockerfile# Production Docker image
 │   └── Dockerfile.worker         # Celery worker Docker image
@@ -150,7 +150,7 @@ DB_PORT=5432
 
 ### Database Migrations
 
-Migrations are **not** run automatically at app startup. Run them explicitly:
+Migrations are applied by the container entrypoint (`docker/entrypoint.sh`) before the API starts. Locally, run them explicitly:
 
 ```bash
 # Apply migrations
@@ -183,7 +183,9 @@ Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker aut
 
 ### Docker Deployment
 
-`docker-compose.yml` defines four services: `base` (build-only, never started), `api` (Flask dev server, port 5000), `worker` (Celery), and `migrate` (one-shot migration runner).
+`docker-compose.yml` defines three services: `base` (build-only, never started), `api` (Flask dev server, port 5000), and `worker` (Celery).
+
+Database migrations are applied by the `api` container's entrypoint before the server starts — there is no separate migration service. Set `RUN_MIGRATIONS=false` to skip, which is what you want if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
 > PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
@@ -194,8 +196,6 @@ docker compose build base
 # Build and start
 docker compose up --build -d
 
-# Apply migrations (separate deploy step — the app does not migrate on startup)
-docker compose run --rm migrate
 
 # Verify
 curl http://localhost:5000/health
@@ -233,7 +233,7 @@ Packages are private by default; set them to public in the org settings if you w
 
 ### Base Image (GHCR)
 
-The builder base is `ghcr.io/masgeek/python-3.14-poetry:2.3.2` — `python:3.14-slim` plus Poetry, installed with `uv` and pinned exactly. CI does not build or push it; build it locally with `docker compose build base`, and `docker push` it if you want to share it with other projects.
+The builder base is `ghcr.io/masgeek/python-3.14-poetry:2.3.2` — `python:3.14-slim` plus a pinned Poetry. CI does not build or push it; build it locally with `docker compose build base`, and `docker push` it if you want to share it with other projects.
 
 The Poetry version is the **tag**, not part of the name, so a Poetry bump publishes a new tag on the same package rather than creating a new one.
 
