@@ -7,8 +7,6 @@ Pub/sub channel: ``jobs:updates`` → stem published on each change
 import json
 import os
 import time
-from typing import Optional
-from urllib.parse import urlparse
 
 PROGRESS_CHANNEL = 'jobs:updates'
 
@@ -72,7 +70,6 @@ def _db_save(stem: str, payload: dict):
     try:
         from app.models.database_conn import MyDb
         from app.models.kvuno import JobProgress
-        from sqlalchemy import update
 
         session = MyDb.get_db().session
         existing = session.query(JobProgress).filter_by(file_name=stem).first()
