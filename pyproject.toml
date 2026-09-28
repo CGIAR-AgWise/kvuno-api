@@ -37,6 +37,7 @@ dependencies = [
 
 [project.scripts]
 dev = "run:main"
+dev-worker = "dev_worker:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
