@@ -41,11 +41,11 @@ jobs:
 
       # GHCR authenticates with the workflow's own GITHUB_TOKEN (packages: write),
       # so no DOCKER_USERNAME / DOCKER_PASSWORD secrets are required.
-      - name: Docker login to GHCR
+      - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
       - name: Set Docker tags
