@@ -37,6 +37,6 @@ def process_file_task(self, file_path: str):
 def process_pending_task(self):
     app = _get_worker_app()
     with app.app_context():
-        from app.services.housekeeper import process_pending, housekeeping_settings, set_app
+        from app.services.housekeeper import load_rds_to_db, set_app, DATA_DIR, housekeeping_settings
         set_app(app)
-        process_pending(**housekeeping_settings())
+        load_rds_to_db(data_folder=DATA_DIR, **housekeeping_settings())
