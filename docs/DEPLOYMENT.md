@@ -323,8 +323,10 @@ Both workflows trigger on `push`, so they start at the same time and neither can
 | Outcome | Result |
 |---|---|
 | PR Checks succeeds | Images build |
-| PR Checks fails or is cancelled | Image jobs skipped, with the run URL in the error annotation |
-| No run found within `timeout` (default 1800s) | Image jobs skipped — a missing run never counts as a pass |
+| PR Checks fails or is cancelled | `gate` **fails** (red run) with the conclusion and run URL; image jobs are skipped |
+| No run found within `timeout` (default 1800s) | Same — `gate` fails. A missing run never counts as a pass |
+
+The gate marks the run failed rather than silently skipping, so a red push is visible in the Actions tab instead of looking like a no-op.
 
 The gate needs `actions: read` to read run status; the image jobs keep `packages: write`.
 
