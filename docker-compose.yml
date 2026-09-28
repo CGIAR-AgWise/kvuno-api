@@ -6,91 +6,45 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    environment:
-      FLASK_ENV: ${FLASK_ENV:-development}
-      FLASK_APP: ${FLASK_APP:-development}
-      FLASK_DEBUG: ${FLASK_DEBUG:-false}
-      DEBUG_DB: ${DEBUG_DB:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DB_DRIVER: ${DB_DRIVER:-postgresql}
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-5432}
-      DB_USER: ${DB_USER:?DB_USER is required}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-      DB_NAME: ${DB_NAME:?DB_NAME is required}
-      SORT_JSON: ${SORT_JSON:-0}
-      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
-      SERVER_PORT: ${SERVER_PORT:-5000}
-      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
-      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
-      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
-      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
-      CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
-      CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
-      CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
-      REMOTE_RDS_URLS: ${REMOTE_RDS_URLS:-}
-      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-20}
-      CLEANUP_AGE: ${CLEANUP_AGE:-1d}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
-      TOKEN_TTL_DAYS: ${TOKEN_TTL_DAYS:-0}
-      RATE_LIMIT_STORAGE: ${RATE_LIMIT_STORAGE:-memory://}
-      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-10 per hour}
-      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-20 per hour}
-      RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-10 per hour}
-      RATE_LIMIT_DATA: ${RATE_LIMIT_DATA:-120 per minute}
+    env_file:
+      - .env
+#    environment:
+#      FLASK_ENV: ${FLASK_ENV:-development}
+#      FLASK_APP: ${FLASK_APP:-development}
+#      FLASK_DEBUG: ${FLASK_DEBUG:-false}
+#      DEBUG_DB: ${DEBUG_DB:-false}
+#      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+#      DB_DRIVER: ${DB_DRIVER:-postgresql}
+#      DB_HOST: ${DB_HOST:-db}
+#      DB_PORT: ${DB_PORT:-5432}
+#      DB_USER: ${DB_USER:?DB_USER is required}
+#      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+#      DB_NAME: ${DB_NAME:?DB_NAME is required}
+#      SORT_JSON: ${SORT_JSON:-0}
+#      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+#      SERVER_PORT: ${SERVER_PORT:-5000}
+#      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
+#      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
+#      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+#      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+#      CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
+#      CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
+#      CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
+#      REMOTE_RDS_URLS: ${REMOTE_RDS_URLS:-}
+#      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-20}
+#      CLEANUP_AGE: ${CLEANUP_AGE:-1d}
+#      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+#      TOKEN_TTL_DAYS: ${TOKEN_TTL_DAYS:-0}
+#      RATE_LIMIT_STORAGE: ${RATE_LIMIT_STORAGE:-memory://}
+#      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-10 per hour}
+#      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-20 per hour}
+#      RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-10 per hour}
+#      RATE_LIMIT_DATA: ${RATE_LIMIT_DATA:-120 per minute}
 
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
       - "5000:5000"
-    depends_on:
-      - db
-      - redis
-
-  prod:
-    container_name: kvuno-prod
-    hostname: kvuno-prod
-    image: masgeek/kvuno-api:${PROD_TAG:-production}
-    build:
-      context: .
-      dockerfile: Dockerfile.prod.dockerfile
-    environment:
-      FLASK_ENV: ${FLASK_ENV:-development}
-      FLASK_APP: ${FLASK_APP:-development}
-      FLASK_DEBUG: ${FLASK_DEBUG:-false}
-      DEBUG_DB: ${DEBUG_DB:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      DB_DRIVER: ${DB_DRIVER:-postgresql}
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-5432}
-      DB_USER: ${DB_USER:?DB_USER is required}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-      DB_NAME: ${DB_NAME:?DB_NAME is required}
-      SORT_JSON: ${SORT_JSON:-0}
-      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
-      SERVER_PORT: ${SERVER_PORT:-5000}
-      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
-      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
-      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
-      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
-      CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
-      CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
-      CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
-      REMOTE_RDS_URLS: ${REMOTE_RDS_URLS:-}
-      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-20}
-      CLEANUP_AGE: ${CLEANUP_AGE:-1d}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
-      TOKEN_TTL_DAYS: ${TOKEN_TTL_DAYS:-0}
-      RATE_LIMIT_STORAGE: ${RATE_LIMIT_STORAGE:-memory://}
-      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-10 per hour}
-      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-20 per hour}
-      RATE_LIMIT_UPLOAD: ${RATE_LIMIT_UPLOAD:-10 per hour}
-      RATE_LIMIT_DATA: ${RATE_LIMIT_DATA:-120 per minute}
-
-    volumes:
-      - ${DATA_DIR:-./data}:/app/static/data
-    ports:
-      - "5001:5000"
     depends_on:
       - db
       - redis
