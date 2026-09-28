@@ -292,11 +292,24 @@ There is no Postgres volume to back up here — the database is external (see §
 
 Images are published to **GitHub Container Registry**, not Docker Hub:
 
-| Image | Source Dockerfile | Built when |
+| Trigger | Image | Source Dockerfile | Tags |
+|---|---|---|---|
+| `develop` | `kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
+| `develop` | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:develop` |
+| `main` | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
+| any tag | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` | `:latest`, `:<tag>`, `:production` |
+| any tag | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
+
+### Build workflows
+
+| Workflow | Trigger | Builds |
 |---|---|---|
-| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev) | `develop` pushes after PR Checks pass |
-| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `main` pushes after PR Checks pass |
-| `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `main`, `develop`, or `beta/*` |
+| `docker-build.yml` | `workflow_run` of PR Checks | Branch images |
+| `docker-release.yml` | `push` on tags (`*`) | Release images |
+
+They are separate because PR Checks only runs on `pull_request` and `workflow_dispatch` — its `workflow_run` trigger can never fire for a tag push. A `push: tags` trigger is required, and keeping it in its own file means neither workflow needs compound branching.
+
+Each job has a single-condition `if`. `main` builds **only** the production API image; the worker is not built there, so deploy the worker from a release tag.
 
 > `ghcr.io/masgeek/python-3.14-poetry` is **not** in this list: no CI workflow builds or pushes it. It is a general-purpose image, so it lives in the `masgeek` namespace rather than the `cgiar-agwise` one used by the kvuno images. Build it with `docker compose build base` and push it yourself if you want it available to others.
 

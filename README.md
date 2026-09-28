@@ -217,11 +217,15 @@ docker compose up -d api worker
 
 Images are published to GitHub Container Registry, not Docker Hub:
 
-| Image | Dockerfile | Built on |
-|---|---|---|
-| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev server, Python 3.14) | `develop` |
-| `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (Gunicorn) | `main` |
-| `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `main`, `develop`, `beta/*` |
+| Trigger | Image | Dockerfile | Tags pushed |
+|---|---|---|---|
+| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev server, Python 3.14) | `:latest`, `:develop` |
+| `develop` | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `:latest`, `:develop` |
+| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (Gunicorn) | `:latest`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` | `:latest`, `:<tag>`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
+
+Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
 
 CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
