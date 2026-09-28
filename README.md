@@ -9,13 +9,16 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **RDS File Ingestion** — Reads `.RDS` files using `pyreadr`, processes data in chunks with batch inserts
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
 - **Background Processing** — Celery + Redis worker for async file ingestion; separately deployable
-- **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/openapi`
+- **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering
-- **Multi-Database** — SQLite, MySQL, PostgreSQL compatible
+- **Multi-Database** — SQLite and PostgreSQL/PostGIS (the spatial features require PostGIS)
 - **Health Check** — `GET /health` endpoint with database connectivity status
-- **Dockerized** — Dev and production Dockerfiles with docker-compose (PostgreSQL, Redis, Celery worker)
+- **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
+- **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
+- **Login & Registration UI** — Web forms at `/ui/login` and `/ui/register`
+- **Token Management** — List and revoke tokens at `/ui/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
 
@@ -29,6 +32,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | Migrations | Alembic |
 | Spatial | GeoAlchemy2 / PostGIS |
 | RDS Parsing | pyreadr + pandas |
+| Authentication | Opaque bearer tokens (`{id}|{secret}`, SHA-256 at rest) + bcrypt |
 | Background Tasks | Celery + Redis (Kombu transport) |
 | Logging | loguru |
 | Serving | Waitress (dev) / Gunicorn (prod) |
@@ -45,10 +49,14 @@ kvuno/
 │   ├── config.py             # App constants and configuration
 │   ├── gunicorn_config.py    # Gunicorn server configuration
 │   ├── tasks.py              # Celery task definitions
+│   ├── auth.py               # require_auth decorator
 │   ├── api/
-│   │   ├── planting_data.py  # Planting data API blueprint
+│   │   ├── planting_data.py  # Planting data API (public_api + protected_api)
+│   │   ├── quality.py        # Data quality endpoints
 │   │   ├── upload.py         # File upload API blueprint
-│   │   └── user.py           # User auth API blueprint (stubs)
+│   │   └── user.py           # User auth API blueprint
+│   ├── cache.py              # Redis-backed @api_cache / invalidate_cache
+│   ├── rate_limit.py         # Flask-Limiter instance (shared)
 │   ├── dto/
 │   │   ├── auth.py           # Auth request/response DTOs
 │   │   ├── planting_recommendation.py # Response DTOs (Pydantic models)
@@ -59,26 +67,39 @@ kvuno/
 │   │   └── kvuno.py          # SQLAlchemy ORM models
 │   ├── repo/
 │   │   ├── planting_recommendation.py # PlantingRecommendation repo
-│   │   └── file_import.py    # FileImport repository
+│   │   ├── file_import.py    # FileImport repository
+│   │   └── import_conflict.py# ImportConflict repository
 │   ├── routes/
-│   │   └── main.py           # App routes (/, /health)
+│   │   └── main.py           # HTML /ui/* routes, resumable upload, /health
+│   ├── services/
+│   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
+│   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
+│   │   └── watch_handler.py  # watchdog directory watcher
+│   ├── templates/            # Jinja pages (base, jobs, upload, explore, quality, login…)
+│   ├── static/               # css/ js/ favicon served by Flask
 │   └── utils/
 │       ├── logging.py        # SharedLogger (loguru wrapper)
+│       ├── downloader.py     # RDSDownloader (auth, SSRF guards)
+│       ├── rds_to_parquet.py # RDS → Parquet batch converter
 │       └── migration_utils.py# Dialect-aware column utilities
 │
 ├── alembic/                  # Database migration scripts
 │   └── versions/             # Migration versions
+├── scripts/
+│   └── run_migrations.py     # Standalone migration runner (deploy step)
 │
 ├── logs/                     # Log output directory
-├── static/data/              # RDS data files for ingestion
+├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup
-├── Dockerfile                # Dev Docker image
-├── Dockerfile.prod.dockerfile# Production Docker image
-├── Dockerfile.worker         # Celery worker Docker image
-├── dev.bat                   # Windows dev launcher
-├── housekeeping.py           # RDS file processing ETL script
+├── docker-compose.yml        # Multi-service Docker setup (base, api, worker)
+├── docker/
+│   ├── Dockerfile.base           # Shared builder base: Python 3.14 + pinned Poetry
+│   ├── Dockerfile                # API image — APP_MODE=dev|prod
+│   ├── Dockerfile.worker         # Celery worker Docker image
+│   └── entrypoint.sh             # Migrations, then server dispatch by APP_MODE
+├── dev_worker.py             # Dev Celery worker launcher (auto solo pool on Windows)
+├── housekeeping.py           # Thin CLI wrapper over app/services/housekeeper.py
 ├── model-generator.py        # ORM model code generator
 ├── pyproject.toml            # Project metadata and dependencies
 ├── run.py                    # Dev server entry point
@@ -96,7 +117,7 @@ kvuno/
 
 ```bash
 # Clone the repository
-git clone git@github.com:AgWISE-EiA/kvuno-api.git
+git clone git@github.com:CGIAR-AgWise/kvuno-api.git
 cd kvuno-api
 
 # Install dependencies
@@ -106,19 +127,21 @@ poetry install
 cp .env.example .env
 ```
 
-Edit `.env` with your database connection. You can either set a full `DB_URL` or individual parts:
+Edit `.env` with your database connection:
 
 ```env
-# Full URL (takes priority)
+# Required
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_NAME=agwise_api
+
+# Full URL takes priority over individual parts
 # DB_URL="postgresql://user:pass@host:5432/kvuno"
 
 # Individual parts
 DB_DRIVER=postgresql
 DB_HOST=127.0.0.1
 DB_PORT=5432
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=agwise_api
 
 # For SQLite:
 # DB_DRIVER=sqlite
@@ -127,9 +150,14 @@ DB_NAME=agwise_api
 
 ### Database Migrations
 
+Migrations are applied by the container entrypoint (`docker/entrypoint.sh`) before the API starts. Locally, run them explicitly:
+
 ```bash
 # Apply migrations
 alembic upgrade head
+
+# Or use the standalone runner (same thing, builds a minimal app context)
+python scripts/run_migrations.py
 
 # Create a new migration (after model changes)
 alembic revision --autogenerate -m "description"
@@ -139,54 +167,83 @@ alembic revision --autogenerate -m "description"
 
 ```bash
 # API server only (no background processing)
-python run.py
+python run.py            # or: poetry run dev
 ```
 
 ```bash
 # With background processing (requires Redis + Celery worker)
-celery -A app.celery_app worker --loglevel=info  # separate terminal
+python dev_worker.py     # auto-selects --pool solo on Windows, prefork elsewhere
 ```
 
-The API will be available at `http://localhost:5000` and the OpenAPI docs at `http://localhost:5000/openapi`.
+The API will be available at `http://localhost:5000` and the Swagger UI at `http://localhost:5000/api-docs`.
 
 Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Celery worker.
 
 Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker automatically.
 
-### Docker Deployment (Full Stack)
+### Docker Deployment
 
-A `docker-compose.yml` runs the Flask API alongside PostgreSQL, Redis, and the Celery worker:
+`docker-compose.yml` defines three services: `base` (build-only, never started), `api` (Flask dev server, port 5000), and `worker` (Celery).
+
+Database migrations are applied by the `api` container's entrypoint before the server starts — there is no separate migration service. Set `RUN_MIGRATIONS=false` to skip, which is what you want if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
+
+> PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
 ```bash
-# Build and start all services
+# Build the shared builder base FIRST — the app images FROM it
+docker compose build base
+
+# Build and start
 docker compose up --build -d
 
-# Run database migrations
-docker compose exec kvuno alembic upgrade head
 
 # Verify
 curl http://localhost:5000/health
 ```
 
-Three image variants are provided:
-- **`Dockerfile`** — dev image with Flask dev server
-- **`Dockerfile.prod.dockerfile`** — production image with Gunicorn
-- **`Dockerfile.worker`** — standalone Celery worker image
+> `base` is never started; it exists so the three application images share one pinned Poetry install. Skipping `docker compose build base` makes them fail trying to pull it from GHCR.
 
 ### Docker — Individual Services
 
-Start only specific services:
+```bash
+# API only (no background processing)
+docker compose up -d api
+
+# API + worker
+docker compose up -d api worker
+```
+
+### Container Images (GHCR)
+
+Images are published to GitHub Container Registry, not Docker Hub:
+
+| Trigger | Image | Dockerfile | Tags pushed |
+|---|---|---|---|
+| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=true APP_MODE=dev`) | `:latest`, `:develop` |
+| `develop` | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `:latest`, `:develop` |
+| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=false APP_MODE=prod`) | `:latest`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (`WITH_DEV=false APP_MODE=prod`) | `:latest`, `:<tag>`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
+
+Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
+
+CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
 ```bash
-# API + Postgres (no background processing)
-docker compose up -d kvuno db
-
-# Just Redis (for local Celery worker)
-docker compose up -d redis
-
-# Full stack: API + Postgres + Redis + Celery worker
-docker compose up --build -d
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
 ```
+
+Packages are private by default; set them to public in the org settings if you want anonymous pulls.
+
+### Base Image (GHCR)
+
+The builder base is `ghcr.io/masgeek/python-3.14-poetry:2.3.2` — `python:3.14-slim` plus a pinned Poetry. CI does not build or push it; build it locally with `docker compose build base`, and `docker push` it if you want to share it with other projects.
+
+The Poetry version is the **tag**, not part of the name, so a Poetry bump publishes a new tag on the same package rather than creating a new one.
+
+### Upgrading Poetry
+
+`poetry.lock` is only valid for the Poetry release that generated it: different 2.x releases compute a different content-hash for `pyproject.toml`, and the build fails with *"pyproject.toml changed significantly"*. There is no automated check, so a bump must touch five places in one commit — `ARG POETRY_VERSION` in `docker/Dockerfile.base` and in all three application Dockerfiles under `docker/`, plus the `base` service `image:` tag **and** `POETRY_VERSION:` build arg in `docker-compose.yml`. Then regenerate the lock with that same Poetry and rebuild the base image. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#5-image-variants).
 
 ### Local Development without Postgres
 
@@ -274,23 +331,70 @@ Convert large `.RDS` files to `.parquet` for faster processing:
 python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('static/data/')"
 ```
 
+### Authentication
+
+All UI routes (`/ui/*`) and most API routes require authentication. Obtain a token via:
+
+```bash
+curl -X POST http://localhost:5000/api/v1/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "johndoe", "password": "securePass123"}'
+# Returns: {"msg": "login success", "access_token": "1|a1b2c3d4e5f6..."}
+```
+
+Use the token in subsequent requests:
+
+```bash
+curl http://localhost:5000/api/v1/planting-data/ \
+  -H "Authorization: Bearer 1|a1b2c3d4e5f6..."
+```
+
+Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie for browser navigation.
+
 ### API Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/` | Redirects to `/openapi` (Swagger UI) |
-| `GET` | `/health` | Health check with database status |
-| `GET` | `/api/v1/planting-data/` | Paginated, filterable crop data |
-| `POST` | `/api/v1/upload/` | Upload an RDS/parquet file for processing |
-| `POST` | `/api/v1/users/register` | User registration (stub) |
-| `POST` | `/api/v1/users/login` | User login (stub) |
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/` | — | Redirects to `/ui/jobs` |
+| `GET` | `/health` | — | Health check with database status |
+| `GET` | `/ui/login` | — | Login page |
+| `GET` | `/ui/register` | — | Registration page |
+| `GET` | `/ui/jobs` | Required | Job list |
+| `GET` | `/ui/jobs/data` | Required | JSON: job list |
+| `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
+| `GET` | `/ui/upload` | Required | File upload UI (resumable.js) |
+| `POST` | `/ui/upload/resumable` | Required | Receive one upload chunk (resumable.js) |
+| `GET` | `/ui/upload/resumable` | Required | Chunk probe — 200 if exists, 204 otherwise |
+| `POST` | `/ui/upload/complete` | Required | Merge chunks, return columns + sample rows |
+| `POST` | `/ui/process` | Required | Save column mapping and start ingestion |
+| `GET` | `/ui/progress/<file_name>` | Required | Per-file progress JSON |
+| `GET` | `/ui/explore` | Required | Map explorer |
+| `GET` | `/ui/quality` | Required | Data quality dashboard |
+| `GET` | `/ui/columns` | Required | Mappable DB columns + aliases |
+| `GET` | `/ui/tokens` | Required | Token management |
+| `POST` | `/api/v1/users/register` | — | Register a new account |
+| `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
+| `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
+| `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
+| `GET` | `/api/v1/users/tokens` | Required | List active tokens |
+| `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
+| `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
+| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
+| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values |
+| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates |
+| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON) |
+| `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
+| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts |
+
+> `GET /api/v1/planting-data/` is intentionally **public** (rate-limited via `RATE_LIMIT_DATA`); the supporting endpoints under the same prefix require a token.
 
 ### Query Parameters for `/api/v1/planting-data/`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `page` | int | Page number (default: 1) |
-| `per_page` | int | Items per page (default: 10) |
+| `per_page` | int | Items per page (default: 50, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
 | `radius` | float | Search radius in meters (requires `coordinates`) |
 | `country` | string | Country name (partial ILIKE match) |
@@ -299,6 +403,7 @@ python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('st
 | `season_type` | string | Season type exact match |
 | `opt_date` | string | Optimal sowing date (`YYYY-MM-DD`) |
 | `planting_option` | string | Planting option exact match |
+| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI |
 
 ### Response Format
 
@@ -330,41 +435,61 @@ python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('st
 
 Key environment variables (see `.env.example`):
 
-| Variable | Description | Default |
-|---|---|---|
-| `DB_URL` | Full database connection string (overrides DB_*) | — |
-| `DB_DRIVER` | Database driver | `postgresql` |
-| `DB_HOST` | Database host | `127.0.0.1` |
-| `DB_PORT` | Database port | `5432` |
-| `DB_USER` | Database user | `postgres` |
-| `DB_PASSWORD` | Database password | `postgres` |
-| `DB_NAME` | Database name | `agwise_api` |
-| `FLASK_DEBUG` | Enable debug mode | `false` |
-| `SERVER_HOST` | Bind address | `0.0.0.0` |
-| `SERVER_PORT` | Bind port | `5000` |
-| `LOG_LEVEL` | Logging level | `DEBUG` |
-| `SERVER_URL_PROD` | Production server URL | — |
-| `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` |
-| `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` |
-| `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` |
-| `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` |
-| `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` |
-| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `3` |
-| `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` |
-| `REMOTE_RDS_URLS` | Semicol.-delimited remote file URLs | — |
-| `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — |
-| `REMOTE_RDS_COOKIES` | Cookie header for remote downloads | — |
-| `REMOTE_RDS_HEADERS` | Custom headers (key:value; key:value) | — |
+| Variable | Description | Default | Required |
+|---|---|---|---|
+| `DB_URL` | Full database connection string (overrides DB_*) | — | |
+| `DB_DRIVER` | Database driver | `postgresql` | |
+| `DB_HOST` | Database host | `127.0.0.1` | |
+| `DB_PORT` | Database port | `5432` | |
+| `DB_USER` | Database user | — | **Yes** (unless `DB_URL`) |
+| `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
+| `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
+| `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
+| `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
+| `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
+| `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
+| `RATE_LIMIT_DATA` | flask-limiter limit string | `120 per minute` | |
+| `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
+| `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000` | |
+| `FLASK_DEBUG` | Enable debug mode | `false` | |
+| `SERVER_HOST` | Bind address | `0.0.0.0` | |
+| `SERVER_PORT` | Bind port | `5000` (`run.py` falls back to `80`) | |
+| `LOG_LEVEL` | Logging level | `DEBUG` | |
+| `DEBUG_DB` | Echo SQL statements | `false` | |
+| `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |
+| `MAX_FILE_SIZE_MB` | Upload size cap (API-enforced) | `20` | |
+| `CLEANUP_AGE` | Age of completed files purged at startup (`1d`, `12h`, …) | `1d` | |
+| `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` | |
+| `HOUSEKEEPING_DATA_DIR` | Directory watched for uploads | `static/data` | |
+| `HOUSEKEEPING_BATCH_SIZE` | Rows per batch insert | `2000` | |
+| `HOUSEKEEPING_CHUNK_SIZE` | Rows per in-memory chunk | `5000` | |
+| `HOUSEKEEPING_CHECKPOINT_INTERVAL` | Batches between offset commits | `50` | |
+| `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` | |
+| `RDS_COLUMN_MAP` | JSON map of RDS column → ORM field | built-in defaults | |
+| `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` | |
+| `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` | |
+| `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` | |
+| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `10` | |
+| `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` | |
+| `REMOTE_RDS_URLS` | Semicolon-delimited remote file URLs | — | |
+| `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — | |
+| `REMOTE_RDS_COOKIES` | Cookie header (comma-separated `k=v` pairs) | — | |
+| `REMOTE_RDS_HEADERS` | Custom headers (`key: value; key2: value2`) | — | |
+| `REMOTE_RDS_ALLOW_HTTP` | Permit non-HTTPS remote URLs | `false` | |
+| `REMOTE_RDS_ALLOWED_DOMAINS` | Comma-separated domain allow-list | — (any) | |
 
 ## CI/CD
 
 GitHub Actions workflows:
 
-- **PR Checks** — Runs Ruff linting and pytest on pull requests
+- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, then `pytest` on Python 3.13 and 3.14 (test job depends on lint)
 - **Version Bumping** — Automated version tags on main
 - **Auto PR** — Creates release PRs from version bumps
 - **TODO Scanner** — Scans codebase for TODO/FIXME markers
+- **Docker Build** — Builds and pushes images to GHCR after PR Checks pass (dev image on `develop`, prod + worker on `main`; see [Container Images](#container-images-ghcr))
+
+> `pyproject.toml` pins Python `>=3.13,<4.0`; the Docker images use `python:3.14-slim`.
 
 ## License
 
-Project maintained by [masgeek](mailto:barsamms@gmail.com) as part of the AgWISE-EiA initiative.
+Project maintained by [Sammy Barasa](mailto:s.barasa@cgiar.org) as part of the SFP initiative.

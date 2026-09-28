@@ -12,9 +12,9 @@ def test_build_db_url_defaults(monkeypatch):
     _reset(monkeypatch)
     monkeypatch.delenv("DB_HOST", raising=False)
     monkeypatch.delenv("DB_PORT", raising=False)
-    monkeypatch.delenv("DB_USER", raising=False)
-    monkeypatch.delenv("DB_PASSWORD", raising=False)
-    monkeypatch.delenv("DB_NAME", raising=False)
+    monkeypatch.setenv("DB_USER", "postgres")
+    monkeypatch.setenv("DB_PASSWORD", "postgres")
+    monkeypatch.setenv("DB_NAME", "agwise_api")
     url = build_db_url()
     assert url == "postgresql://postgres:postgres@127.0.0.1:5432/agwise_api"
 

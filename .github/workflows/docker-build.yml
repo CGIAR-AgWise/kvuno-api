@@ -1,4 +1,13 @@
-name: Docker Build
+name: Docker Build (branches)
+
+# Branch builds only. Releases are handled by docker-release.yml.
+#
+# Branch -> image:
+#   develop -> api (dev server) + worker, tagged :develop
+#   main    -> api (gunicorn production image) ONLY
+#
+# Each job has a single-condition `if`, so no job is skipped by a compound
+# expression. The worker is deliberately not built on main.
 
 on:
   workflow_run:
@@ -7,66 +16,49 @@ on:
       - completed
 
 jobs:
-  build-dev:
+  build-api-dev:
     if: >
       github.event.workflow_run.conclusion == 'success'
-      && (github.event.workflow_run.head_branch == 'main'
-          || github.event.workflow_run.head_branch == 'develop'
-          || startsWith(github.event.workflow_run.head_branch, 'beta/'))
+      && github.event.workflow_run.head_branch == 'develop'
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
-      dockerfile: Dockerfile
-      image_name: masgeek/kvuno-api
+      dockerfile: docker/Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-api
+      build_args: WITH_DEV=true APP_MODE=dev
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
-    secrets:
-      docker_username: ${{ secrets.DOCKER_USERNAME }}
-      docker_password: ${{ secrets.DOCKER_PASSWORD }}
-
-  build-prod:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'main'
-    uses: ./.github/workflows/docker-build-reusable.yml
-    with:
-      dockerfile: Dockerfile.prod.dockerfile
-      image_name: masgeek/kvuno-api
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
-    secrets:
-      docker_username: ${{ secrets.DOCKER_USERNAME }}
-      docker_password: ${{ secrets.DOCKER_PASSWORD }}
 
   build-worker-dev:
     if: >
       github.event.workflow_run.conclusion == 'success'
-      && (github.event.workflow_run.head_branch == 'main'
-          || github.event.workflow_run.head_branch == 'develop'
-          || startsWith(github.event.workflow_run.head_branch, 'beta/'))
+      && github.event.workflow_run.head_branch == 'develop'
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
-      dockerfile: Dockerfile.worker
-      image_name: masgeek/kvuno-worker
+      dockerfile: docker/Dockerfile.worker
+      image_name: ghcr.io/cgiar-agwise/kvuno-worker
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
-    secrets:
-      docker_username: ${{ secrets.DOCKER_USERNAME }}
-      docker_password: ${{ secrets.DOCKER_PASSWORD }}
 
-  build-worker-prod:
+  build-api-prod:
     if: >
       github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_branch == 'main'
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
-      dockerfile: Dockerfile.worker
-      image_name: masgeek/kvuno-worker
+      dockerfile: docker/Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-api
+      build_args: WITH_DEV=false APP_MODE=prod
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
-    secrets:
-      docker_username: ${{ secrets.DOCKER_USERNAME }}
-      docker_password: ${{ secrets.DOCKER_PASSWORD }}

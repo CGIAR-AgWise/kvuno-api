@@ -10,7 +10,7 @@ The script performs the following steps:
 Environment Variables:
 - `FLASK_DEBUG`: If set to '1', the application will run in debug mode.
 - `SERVER_HOST`: Specifies the host address on which the Flask app will run. Defaults to '0.0.0.0'.
-- `SERVER_PORT`: Specifies the port on which the Flask app will run. Defaults to 5000.
+- `SERVER_PORT`: Specifies the port on which the Flask app will run. Defaults to 80.
 
 Usage:
 - Run this script directly to start the Flask application.
@@ -34,9 +34,10 @@ app.app_context().push()
 def main():
     debug = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
     host = os.getenv('SERVER_HOST', default='0.0.0.0')
-    port = os.getenv('SERVER_PORT', default=5000)
+    port = os.getenv('SERVER_PORT', default=80)
 
     app.run(host=host, port=port, debug=debug, use_reloader=True)
+
 
 if __name__ == '__main__':
     main()

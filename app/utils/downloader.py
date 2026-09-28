@@ -3,9 +3,12 @@ Utility for downloading RDS files from remote sources.
 Supports authenticated downloads with session cookies, bearer tokens, and custom headers.
 """
 
+import ipaddress
 import os
+import socket
 import time
 from typing import Optional
+from urllib.parse import urlparse, urlunparse, unquote
 
 import requests
 
@@ -15,6 +18,99 @@ _shared_logger = SharedLogger()
 _logger = _shared_logger.get_logger()
 
 DEFAULT_DATA_DIR = os.path.join("static", "data")
+
+
+def sanitize_url(url: str) -> str:
+    """Strip query string and credentials from a URL for safe logging."""
+    parsed = urlparse(url)
+    netloc = parsed.hostname or ''
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    cleaned = parsed._replace(query='', netloc=netloc)
+    return urlunparse(cleaned)
+
+
+_SSRF_ALLOWED_DOMAINS: list[str] | None = None
+_SSRF_REQUIRE_HTTPS: bool = True
+
+
+def configure_ssrf(allowed_domains: list[str] | None = None, require_https: bool = True):
+    """Configure SSRF protection settings at module level.
+
+    Args:
+        allowed_domains: List of allowed hostnames (substring match). If None, all domains allowed.
+        require_https: If True (default), only HTTPS URLs are permitted.
+    """
+    global _SSRF_ALLOWED_DOMAINS, _SSRF_REQUIRE_HTTPS
+    _SSRF_ALLOWED_DOMAINS = allowed_domains
+    _SSRF_REQUIRE_HTTPS = require_https
+
+
+def _is_private_address(host: str) -> bool:
+    """Check if a hostname resolves to a private, loopback, or link-local address."""
+    try:
+        addrs = socket.getaddrinfo(host, None)
+    except (socket.gaierror, OSError):
+        return False
+    for family, _, _, _, sockaddr in addrs:
+        ip = sockaddr[0]
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_private or addr.is_loopback or addr.is_link_local:
+                return True
+            if addr.is_multicast:
+                return True
+            # AWS/GCP/Azure metadata endpoints
+            if ip.startswith('169.254.'):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _is_metadata_address(host: str) -> bool:
+    """Check if host is a known cloud metadata service."""
+    metadata_hosts = {
+        '169.254.169.254',          # AWS/GCP/Azure
+        'metadata.google.internal',  # GCP
+        '100.100.100.200',          # Alibaba Cloud
+    }
+    return host in metadata_hosts or host.lower() in metadata_hosts
+
+
+def validate_remote_url(url: str) -> str:
+    """Validate a URL against SSRF protections.
+
+    Args:
+        url: The URL to validate.
+
+    Returns:
+        The validated URL.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ''
+
+    if not host:
+        raise ValueError("URL has no hostname")
+
+    if _SSRF_REQUIRE_HTTPS and parsed.scheme != 'https':
+        raise ValueError(f"Only HTTPS URLs are allowed: {sanitize_url(url)}")
+
+    if _is_metadata_address(host):
+        raise ValueError(f"Requests to metadata services are blocked: {sanitize_url(url)}")
+
+    if _is_private_address(host):
+        raise ValueError(f"Requests to private/internal addresses are blocked: {sanitize_url(url)}")
+
+    if _SSRF_ALLOWED_DOMAINS is not None:
+        allowed = any(d in host for d in _SSRF_ALLOWED_DOMAINS)
+        if not allowed:
+            raise ValueError(f"Domain not in allow-list: {sanitize_url(url)}")
+
+    return url
 
 
 class RDSDownloader:
@@ -48,8 +144,11 @@ class RDSDownloader:
 
         Returns:
             Absolute path to the downloaded file
+
+        Raises:
+            ValueError: If the URL fails SSRF validation.
         """
-        from urllib.parse import urlparse, unquote
+        validate_remote_url(url)
 
         start = time.time()
         parsed = urlparse(url)
@@ -58,12 +157,21 @@ class RDSDownloader:
             name += ".RDS"
         dest = os.path.abspath(os.path.join(self.data_dir, name))
 
-        self.logger.info(f"Downloading {url}")
+        self.logger.info(f"Downloading {sanitize_url(url)}")
         self.logger.info(f"Destination: {dest}")
 
         try:
-            resp = self.session.get(url, stream=True, timeout=300)
+            resp = self.session.get(url, stream=True, timeout=300, allow_redirects=False)
             resp.raise_for_status()
+
+            # Validate redirect target if redirected
+            if resp.history:
+                final_url = resp.url
+                try:
+                    validate_remote_url(final_url)
+                except ValueError as e:
+                    self.logger.error(f"Redirect target blocked by SSRF policy: {e}")
+                    raise
 
             total = int(resp.headers.get("content-length", 0))
             downloaded = 0
@@ -81,7 +189,7 @@ class RDSDownloader:
             return dest
 
         except requests.RequestException as e:
-            self.logger.error(f"Download failed for {url}: {e}")
+            self.logger.error(f"Download failed for {sanitize_url(url)}: {e}")
             if os.path.exists(dest):
                 os.remove(dest)
             raise

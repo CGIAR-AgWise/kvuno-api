@@ -12,3 +12,6 @@ kvuno.db.journal
 node_modules/
 .pnpm-store/
 
+.aider*
+.venv-linux
+session-ses*

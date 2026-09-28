@@ -21,6 +21,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from tqdm import tqdm
 
 from app import create_app
+from app.config import (
+    CELERY_BROKER_URL,
+    HOUSEKEEPING_BATCH_SIZE,
+    HOUSEKEEPING_CHECKPOINT_INTERVAL,
+    HOUSEKEEPING_CHUNK_SIZE,
+    HOUSEKEEPING_DATA_DIR,
+    HOUSEKEEPING_MAX_WORKERS,
+    celery_broker_available,
+)
 from app.dto.planting_recommendation import PlantingRecommendationCreate
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, ImportConflict
@@ -36,7 +45,7 @@ shared_logger = SharedLogger()
 logger = shared_logger.get_logger()
 
 _app = None
-DATA_DIR = os.getenv('HOUSEKEEPING_DATA_DIR', os.path.join("static", "data"))
+DATA_DIR = HOUSEKEEPING_DATA_DIR
 
 
 # ── App management ─────────────────────────────────────────────
@@ -57,16 +66,12 @@ def set_app(app_instance):
 # ── Settings ───────────────────────────────────────────────────
 
 def housekeeping_settings() -> dict:
-    """Read housekeeping parameters from environment variables.
-
-    Returns a dict suitable for passing as ``**kwargs`` to
-    :func:`load_rds_to_db` or :func:`process_file`.
-    """
+    """Return current housekeeping parameters (read from centralized config)."""
     return {
-        'batch_size': int(os.getenv('HOUSEKEEPING_BATCH_SIZE', '2000')),
-        'chunk_size': int(os.getenv('HOUSEKEEPING_CHUNK_SIZE', '5000')),
-        'checkpoint_interval': int(os.getenv('HOUSEKEEPING_CHECKPOINT_INTERVAL', '50')),
-        'max_workers': int(os.getenv('HOUSEKEEPING_MAX_WORKERS', '1')),
+        'batch_size': HOUSEKEEPING_BATCH_SIZE,
+        'chunk_size': HOUSEKEEPING_CHUNK_SIZE,
+        'checkpoint_interval': HOUSEKEEPING_CHECKPOINT_INTERVAL,
+        'max_workers': HOUSEKEEPING_MAX_WORKERS,
     }
 
 
@@ -150,13 +155,8 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
 
 
 def _write_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
-    """Write processing progress to a JSON file alongside the data file."""
-    try:
-        payload = {"status": status, "current": current, "total": total, "message": message}
-        with open(file_path + '.progress.json', 'w') as f:
-            json.dump(payload, f)
-    except OSError as e:
-        logger.warning(f"Failed to write progress file: {e}")
+    from app.services.progress_store import save_progress
+    save_progress(file_path, status, current, total, message)
 
 
 # ── DB helpers ─────────────────────────────────────────────────
@@ -196,8 +196,21 @@ def download_remote_files(data_folder: str) -> list[str]:
       - REMOTE_RDS_COOKIES: Comma-separated key=value pairs
       - REMOTE_RDS_HEADERS: Comma-separated key:value pairs
 
+    SSRF protection is enforced:
+      - Only HTTPS URLs are allowed (override with REMOTE_RDS_ALLOW_HTTP=true)
+      - Private/internal IP addresses are blocked
+      - Cloud metadata endpoints are blocked
+      - Redirects are not followed unless redirect targets pass validation
+
     Download errors are logged and skipped gracefully.
     """
+    from app.utils.downloader import configure_ssrf
+
+    allowed_domains_raw = os.getenv("REMOTE_RDS_ALLOWED_DOMAINS", "").strip()
+    allowed_domains = [d.strip() for d in allowed_domains_raw.split(",") if d.strip()] or None
+    require_https = os.getenv("REMOTE_RDS_ALLOW_HTTP", "").lower() != "true"
+    configure_ssrf(allowed_domains=allowed_domains, require_https=require_https)
+
     urls_raw = os.getenv("REMOTE_RDS_URLS", "").strip()
     if not urls_raw:
         logger.info("No REMOTE_RDS_URLS defined, skipping remote download")
@@ -265,8 +278,12 @@ def _log_batch_conflicts(session, mappings):
     for m in mappings:
         key = tuple(m.get(c) for c in unique_cols)
         if key in existing_keys:
+            record_data = {
+                k: str(v) if not isinstance(v, (str, int, float, bool, list, dict)) and v is not None else v
+                for k, v in m.items()
+            }
             conflict = ImportConflict(
-                record_data=m,
+                record_data=record_data,
                 country=m.get('country'),
                 province=m.get('province'),
                 lon=m.get('lon'),
@@ -503,7 +520,7 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
     file_paths = [
         os.path.join(data_folder, f)
         for f in os.listdir(data_folder)
-        if f.endswith('.RDS') or f.endswith('.parquet')
+        if f.lower().endswith(('.rds', '.parquet'))
     ]
 
     logger.info(f"Starting to process {len(file_paths)} file(s) from {data_folder}")
@@ -591,27 +608,12 @@ def watch_directory(
 
 # ── Celery helpers ─────────────────────────────────────────────
 
-def _celery_available() -> bool:
-    """Check if Redis/Celery broker is reachable (non-blocking)."""
-    import socket
-    from urllib.parse import urlparse
-    url = urlparse(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'))
-    host = url.hostname or 'localhost'
-    port = url.port or 6379
-    try:
-        s = socket.create_connection((host, port), timeout=2)
-        s.close()
-        return True
-    except (OSError, ValueError):
-        return False
-
-
 def _enqueue_or_warn(task, **kwargs):
     """Enqueue a Celery task, or log a warning if the broker is unreachable."""
-    if not _celery_available():
+    if not celery_broker_available():
         logger.warning(
             f"Cannot enqueue {task.__name__} — Redis at "
-            f"{os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')} "
+            f"{CELERY_BROKER_URL} "
             f"is not reachable. Start Redis or disable HOUSEKEEPING_ENABLED."
         )
         return
@@ -633,7 +635,7 @@ def _enqueue_or_warn(task, **kwargs):
         logger.warning(
             f"Timed out enqueuing {task.__name__} — "
             f"Kombu/Celery cannot connect to Redis at "
-            f"{os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')}. "
+            f"{CELERY_BROKER_URL}. "
             f"Run the worker in Docker for housekeeping, or set HOUSEKEEPING_ENABLED=false."
         )
         return

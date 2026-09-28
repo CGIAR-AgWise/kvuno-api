@@ -1,17 +1,17 @@
-import os
-
 from celery import Celery
 
 from dotenv import load_dotenv
+
+from app.config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, CELERY_TASK_DEFAULT_QUEUE
 
 load_dotenv()
 
 celery_app = Celery('kvuno')
 
 celery_app.config_from_object({
-    'broker_url': os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-    'result_backend': os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6379/0'),
-    'task_default_queue': os.getenv('CELERY_TASK_DEFAULT_QUEUE', 'kvuno'),
+    'broker_url': CELERY_BROKER_URL,
+    'result_backend': CELERY_RESULT_BACKEND,
+    'task_default_queue': CELERY_TASK_DEFAULT_QUEUE,
     'task_serializer': 'json',
     'accept_content': ['json'],
     'result_serializer': 'json',

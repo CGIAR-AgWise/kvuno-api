@@ -8,18 +8,18 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 
 from pathlib import Path
-import json
 import shutil
 
 from app.models.database_conn import MyDb
 from app.routes.main import register_app_routes
-from app.config import build_db_url, APP_NAME, APP_VERSION
+from app.config import build_db_url, APP_NAME, APP_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED
 
 # Load environment variables from .env file
 load_dotenv()
 
+
 def _cleanup_temp_files():
-    data_dir = Path(os.getenv('HOUSEKEEPING_DATA_DIR', os.path.join('static', 'data')))
+    data_dir = Path(HOUSEKEEPING_DATA_DIR)
     if not data_dir.is_dir():
         return
 
@@ -38,18 +38,14 @@ def _cleanup_temp_files():
     multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
     cutoff = time.time() - value * multipliers.get(unit, 86400)
 
-    for p in data_dir.glob('*.progress.json'):
-        try:
-            with open(p) as f:
-                job = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
+    from app.services.progress_store import load_all_jobs, delete_job
+    for job in load_all_jobs():
         if job.get('status') != 'completed':
             continue
-        if p.stat().st_mtime > cutoff:
+        if job.get('mtime', 0) > cutoff:
             continue
-        stem = p.stem.replace('.progress', '')
-        for suffix in ('.rds', '.parquet', '.progress.json', '.meta.json', '.map.json'):
+        stem = job['file']
+        for suffix in ('.rds', '.parquet', '.meta.json', '.map.json'):
             target = data_dir / f"{stem}{suffix}"
             try:
                 if target.is_file():
@@ -57,6 +53,7 @@ def _cleanup_temp_files():
                     log.info("Removed processed file: %s", target.name)
             except OSError:
                 pass
+        delete_job(stem)
 
 
 # API contact information
@@ -78,13 +75,14 @@ info = Info(
     version=APP_VERSION,
     contact=contact,
     license=api_license,
-    termsOfService="https://agwise.cgiar.org/terms-of-service"
+    termsOfService="https://agwise.org/terms-of-service"
 )
 
 # API servers
 servers = [
     Server(url="http://127.0.0.1:5000"),
-    Server(url=os.getenv("SERVER_URL_PROD", "https://kvuno.akilimo.org")),
+    Server(url=os.getenv("SERVER_URL_PROD", "https://kvuno.agwise.org")),
+    Server(url=os.getenv("SERVER_URL_PROD_2", "https://kvuno.akilimo.org")),
 ]
 
 
@@ -111,13 +109,33 @@ def _db_available() -> bool:
         return False
 
 
+def _sanitize_db_url(url: str) -> str:
+    """Strip credentials from a database URL for safe logging."""
+    from urllib.parse import urlparse, urlunparse
+    parsed = urlparse(url)
+    if parsed.password:
+        netloc = f"{parsed.username or ''}:****@{parsed.hostname or ''}"
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        cleaned = parsed._replace(netloc=netloc)
+        return str(urlunparse(cleaned))
+    return url
+
+
 def run_migrations():
-    """Run pending Alembic migrations at startup."""
+    """Apply pending Alembic migrations.
+
+    Called by docker/entrypoint.sh before the app starts (and by
+    scripts/run_migrations.py). A no-op when the database is unreachable, so a
+    database that is still booting will not block the app from starting.
+    """
     if not _db_available():
-        import logging
-        logging.warning(
-            f"Database at {build_db_url()} is not reachable — skipping migrations. "
-            f"Set RUN_MIGRATION=false to suppress this check."
+        from app.utils.logging import SharedLogger
+        _log = SharedLogger().get_logger()
+        _log.warning(
+            f"Database at {_sanitize_db_url(build_db_url())} is not reachable — skipping migrations. "
+            f"The app will start, but requests will fail until the database is available. "
+            f"Set RUN_MIGRATIONS=false in the container environment to skip migrations entirely."
         )
         return
     alembic_cfg = AlembicConfig("alembic.ini")
@@ -128,12 +146,16 @@ def run_migrations():
 def register_apis(app: OpenAPI):
     """Register all API Blueprints with the Flask app."""
     from app.api.user import api as user_api
-    from app.api.planting_data import api as planting_data_api
+    from app.api.planting_data import public_api as pd_public_api
+    from app.api.planting_data import protected_api as pd_protected_api
     from app.api.upload import api as upload_api
+    from app.api.quality import api as quality_api
 
     app.register_api(user_api)
-    app.register_api(planting_data_api)
+    app.register_api(pd_public_api)
+    app.register_api(pd_protected_api)
     app.register_api(upload_api)
+    app.register_api(quality_api)
 
 
 def create_app():
@@ -142,14 +164,74 @@ def create_app():
         __name__,
         servers=servers,
         info=info,
+        doc_prefix="/api-docs",
         security_schemes={
-            "basic": {"type": "http", "scheme": "basic"},
-            "jwt": {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"}
+            "jwt": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "OpaqueToken",
+                "description": "Access token returned by POST /api/v1/users/login in the format {id}|{secret}. "
+                               "It is an opaque Sanctum-style token (SHA-256 hashed at rest), not a signed JWT. "
+                               "Include as: Authorization: Bearer {token}"
+            },
         }
     )
 
+    # Swagger UI config — hide the Schemas section
+    # app.config['SWAGGER_CONFIG'] = {"defaultModelsExpandDepth": -1}
+    # app.config['OPENAPI_HTML_STRING'] = '<!DOCTYPE html><script>window.location.href="swagger"</script>'
+
     # Enable Cross-Origin Resource Sharing (CORS)
-    CORS(app)
+    cors_origins = os.getenv('CORS_ORIGINS', 'http://127.0.0.1:5000')
+    origins = [o.strip() for o in cors_origins.split(',') if o.strip()]
+    CORS(app, origins=origins, supports_credentials=True)
+
+    # Rate limiting
+    from app.rate_limit import limiter
+    limiter.init_app(app)
+    storage_uri = os.getenv('RATE_LIMIT_STORAGE', 'memory://')
+    if storage_uri != 'memory://':
+        limiter._storage_uri = storage_uri
+
+    @app.errorhandler(429)
+    def ratelimit_handler(e):
+        return {"error": "Rate limit exceeded. Please slow down."}, 429
+
+    @app.errorhandler(400)
+    def bad_request(e):
+        return {"error": "Bad request"}, 400
+
+    @app.errorhandler(403)
+    def forbidden(e):
+        return {"error": "Forbidden"}, 403
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return {"error": "Not found"}, 404
+
+    @app.errorhandler(500)
+    def server_error(e):
+        return {"error": "Internal server error"}, 500
+
+    # Security headers for all responses
+    @app.after_request
+    def add_security_headers(response):
+        response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+        response.headers.setdefault('X-Frame-Options', 'DENY')
+        response.headers.setdefault('X-XSS-Protection', '0')
+        response.headers.setdefault('Referrer-Policy', 'strict-origin-when-cross-origin')
+        response.headers.setdefault('Permissions-Policy', '')
+        if response.content_type and 'text/html' in response.content_type:
+            response.headers.setdefault(
+                'Content-Security-Policy',
+                "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
+                "img-src 'self' data: https://tile.openstreetmap.org; "
+                "font-src 'self' https://cdn.jsdelivr.net; "
+                "connect-src 'self' https://tile.openstreetmap.org https://cdn.jsdelivr.net; "
+                "frame-ancestors 'none';"
+            )
+        return response
 
     # Configure the database URI
     app.config['SQLALCHEMY_DATABASE_URI'] = build_db_url()
@@ -158,11 +240,6 @@ def create_app():
 
     # Initialize the database
     init_db(app)
-
-    # Run pending Alembic migrations
-    if os.getenv('RUN_MIGRATION', 'true').lower() == 'true':
-        with app.app_context():
-            run_migrations()
 
     @app.template_filter('datetime')
     def datetime_filter(ts):
@@ -178,7 +255,7 @@ def create_app():
         _cleanup_temp_files()
 
     # Enqueue background processing of any unprocessed files via Celery
-    if os.getenv('HOUSEKEEPING_ENABLED', 'false').lower() == 'true':
+    if HOUSEKEEPING_ENABLED:
         from app.services.housekeeper import process_pending
         process_pending()
 

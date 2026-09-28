@@ -45,6 +45,16 @@ class PlantingDataFilter(BaseModel):
         description='Option for planting, typically an integer',
         json_schema_extra={"example": 1},
     )
+    sort_col: Optional[str] = Field(
+        default=None,
+        description='Column to sort by',
+        json_schema_extra={"example": "country"},
+    )
+    sort_dir: Optional[str] = Field(
+        default=None,
+        description='Sort direction: asc or desc',
+        json_schema_extra={"example": "asc"},
+    )
 
     model_config = ConfigDict(
         use_enum_values=True,
@@ -78,3 +88,11 @@ class PlantingDataFilter(BaseModel):
             if not pattern.match(value):
                 raise ValueError("Date must be in 'YYYY-MM-DD' format.")
         return value
+
+
+class QualityFilter(BaseModel):
+    country: Optional[str] = Field(default=None)
+    source: Optional[str] = Field(default=None)
+    search: Optional[str] = Field(default=None)
+    sort_col: Optional[str] = Field(default=None)
+    sort_dir: Optional[str] = Field(default=None)

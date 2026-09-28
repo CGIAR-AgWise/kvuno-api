@@ -2,11 +2,23 @@ from typing import Any, Optional
 import datetime
 
 from geoalchemy2.types import Geometry
-from sqlalchemy import BigInteger, DateTime, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, text
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import BigInteger, DateTime, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
     pass
+
+
+class JobProgress(Base):
+    __tablename__ = 'job_progress'
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    file_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default='unknown')
+    current_row: Mapped[int] = mapped_column(BigInteger, default=0)
+    total_rows: Mapped[int] = mapped_column(BigInteger, default=0)
+    message: Mapped[Optional[str]] = mapped_column(String(500))
+    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
 
 
 class FileImport(Base):
@@ -76,3 +88,38 @@ class PlantingRecommendation(Base):
     planting_option: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
     updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+
+
+class User(Base):
+    __tablename__ = 'users'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='users_pkey'),
+        UniqueConstraint('email', name='users_email_key'),
+        UniqueConstraint('username', name='users_username_key')
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+
+    user_tokens: Mapped[list['UserToken']] = relationship('UserToken', back_populates='user')
+
+
+class UserToken(Base):
+    __tablename__ = 'user_tokens'
+    __table_args__ = (
+        ForeignKeyConstraint(['user_id'], ['users.id'], name='user_tokens_user_id_fkey'),
+        PrimaryKeyConstraint('id', name='user_tokens_pkey'),
+        Index('idx_user_tokens_token', 'token')
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    expires_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    last_used_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+
+    user: Mapped['User'] = relationship('User', back_populates='user_tokens')

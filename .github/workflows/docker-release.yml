@@ -1,0 +1,49 @@
+name: Docker Release
+
+# Release builds, triggered by any tag push.
+#
+# This is a separate workflow from docker-build.yml on purpose: PR Checks only
+# runs on pull_request and workflow_dispatch, so its `workflow_run` trigger can
+# never fire for a tag push. A `push: tags` trigger is required, and keeping it
+# in its own file means neither workflow needs compound branching.
+#
+# Produces a complete deployable pair:
+#   kvuno-api    <- docker/Dockerfile (APP_MODE=prod)
+#   kvuno-worker <- docker/Dockerfile.worker
+#
+# Tags: :latest, :<tag>, :production (see .github/actions/set-docker-tags).
+#
+# ⚠️ These builds FROM ghcr.io/masgeek/python-3.14-poetry:<version>, which no CI
+# job builds or pushes. That package must be published and publicly readable, or
+# every build here fails with a pull error.
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build-api-release:
+    uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      dockerfile: docker/Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-api
+      build_args: WITH_DEV=false APP_MODE=prod
+      branch_ref: refs/tags/${{ github.ref_name }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+
+  build-worker-release:
+    uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      dockerfile: docker/Dockerfile.worker
+      image_name: ghcr.io/cgiar-agwise/kvuno-worker
+      branch_ref: refs/tags/${{ github.ref_name }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
