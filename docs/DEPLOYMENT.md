@@ -293,6 +293,7 @@ There is no Postgres volume to back up here — the database is external (see §
 | `pyproject.toml changed significantly` during build | Poetry version does not match the one that generated the lock | See [Bumping Poetry](#bumping-poetry) — five places to update |
 | `Declared README file does not exist` during build | `!README.md` missing from `.dockerignore` | The negation must follow the `*.md` rule |
 | Entrypoint fails with `not found` | `docker/entrypoint.sh` checked out with CRLF | `.gitattributes` pins `*.sh` to LF; re-checkout after it is committed |
+| `denied: permission_denied: read_package` on push | The workflow's `GITHUB_TOKEN` cannot write the package | With a `push` trigger the token keeps `packages: write`. If it still fails, the package already exists with its own access rules — in the package settings set access to inherit from the repository, or add this repository explicitly |
 
 ---
 
@@ -312,10 +313,12 @@ Images are published to **GitHub Container Registry**, not Docker Hub:
 
 | Workflow | Trigger | Builds |
 |---|---|---|
-| `docker-build.yml` | `workflow_run` of PR Checks | Branch images |
+| `docker-build.yml` | `push` to `develop` or `main` | Branch images |
 | `docker-release.yml` | `push` on tags (`*`) | Release images |
 
-They are separate because PR Checks only runs on `pull_request` and `workflow_dispatch` — its `workflow_run` trigger can never fire for a tag push. A `push: tags` trigger is required, and keeping it in its own file means neither workflow needs compound branching.
+They are separate so neither needs compound branching. Branch builds used to be triggered by `workflow_run` of PR Checks, which had to fail: **a `workflow_run` fired from a forked pull request gets a read-only `GITHUB_TOKEN`**, so the registry rejected the push with `denied: permission_denied: read_package`. Triggering on `push` fixes that — a push to `develop` or `main` cannot originate from a fork, so `packages: write` holds.
+
+The trade-off is that images now build on the push itself rather than after PR Checks goes green. `main` is protected, so it only advances through a reviewed PR.
 
 Each job has a single-condition `if`. `main` builds **only** the production API image; the worker is not built there, so deploy the worker from a release tag.
 
