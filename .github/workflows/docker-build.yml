@@ -1,25 +1,26 @@
 name: Docker Build (branches)
 
-# Branch builds only. Releases are handled by docker-release.yml.
+# Branch builds. Releases are handled by docker-release.yml.
 #
-# Branch -> image:
 #   develop -> api (dev server) + worker, tagged :develop
 #   main    -> api (gunicorn production image) ONLY
 #
-# Each job has a single-condition `if`, so no job is skipped by a compound
-# expression. The worker is deliberately not built on main.
+# Triggered by `push`, not by `workflow_run` of PR Checks. A workflow_run that
+# fires from a forked pull request gets a read-only GITHUB_TOKEN, and the push
+# then fails with "denied: permission_denied: read_package". A push to these
+# branches cannot come from a fork, so the token keeps packages: write.
+# Trade-off: images build on the push itself, not after PR Checks reports green.
+# main is protected, so it only advances through a reviewed PR anyway.
 
 on:
-  workflow_run:
-    workflows: ["PR Checks"]
-    types:
-      - completed
+  push:
+    branches:
+      - develop
+      - main
 
 jobs:
   build-api-dev:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'develop'
+    if: github.ref == 'refs/heads/develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -27,14 +28,12 @@ jobs:
     with:
       dockerfile: docker/Dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
 
   build-worker-dev:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'develop'
+    if: github.ref == 'refs/heads/develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -42,14 +41,12 @@ jobs:
     with:
       dockerfile: docker/Dockerfile.worker
       image_name: ghcr.io/cgiar-agwise/kvuno-worker
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
 
   build-api-prod:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'main'
+    if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -57,6 +54,6 @@ jobs:
     with:
       dockerfile: docker/Dockerfile.prod.dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+      branch_ref: ${{ github.ref }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
