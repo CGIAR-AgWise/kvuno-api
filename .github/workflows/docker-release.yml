@@ -8,7 +8,7 @@ name: Docker Release
 # in its own file means neither workflow needs compound branching.
 #
 # Produces a complete deployable pair:
-#   kvuno-api    <- docker/Dockerfile.prod.dockerfile
+#   kvuno-api    <- docker/Dockerfile (APP_MODE=prod)
 #   kvuno-worker <- docker/Dockerfile.worker
 #
 # Tags: :latest, :<tag>, :production (see .github/actions/set-docker-tags).
@@ -29,8 +29,9 @@ jobs:
       contents: read
       packages: write
     with:
-      dockerfile: docker/Dockerfile.prod.dockerfile
+      dockerfile: docker/Dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
+      build_args: WITH_DEV=false APP_MODE=prod
       branch_ref: refs/tags/${{ github.ref_name }}
       branch_name: ${{ github.ref_name }}
       commit_sha: ${{ github.sha }}
