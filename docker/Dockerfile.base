@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Munywele Consulting LTD. All rights reserved.
 #
-# Shared builder base: python:3.14-slim + a pinned Poetry (installed via uv).
+# Shared builder base: python:3.14-slim + a pinned Poetry (official installer).
 #
 # Image: ghcr.io/masgeek/python-3.14-poetry:<POETRY_VERSION>
 # The version is the TAG, not part of the name.
@@ -18,18 +18,10 @@
 # "pyproject.toml changed significantly since poetry.lock was last generated".
 #
 # When bumping Poetry, update ALL of these in the same commit:
-#   1. docker/Dockerfile.base           — ARG POETRY_VERSION
-#   2. docker/Dockerfile                — ARG POETRY_VERSION
-#   3. docker/Dockerfile.prod.dockerfile— ARG POETRY_VERSION
-#   4. docker/Dockerfile.worker         — ARG POETRY_VERSION
-#   5. docker-compose.yml               — base service `image:` tag AND build arg
+#   1. Dockerfile.base    — ARG POETRY_VERSION
+#   2. Dockerfile         — ARG POETRY_VERSION
+#   3. docker-compose.yml — base service `image:` tag AND build arg
 # Then regenerate poetry.lock with the same Poetry and rebuild the base image.
-# UV_VERSION is independent of the lock; bump it freely.
-
-# syntax=docker/dockerfile:1
-ARG UV_VERSION=0.9.0
-
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 FROM python:3.14-slim
 
@@ -41,26 +33,27 @@ LABEL org.opencontainers.image.title="python-3.14-poetry" \
       org.opencontainers.image.vendor="Munywele Consulting LTD" \
       org.opencontainers.image.version="${POETRY_VERSION}"
 
-COPY --from=uv /uv /uvx /usr/local/bin/
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    UV_TOOL_DIR=/opt/uv-tools \
-    UV_TOOL_BIN_DIR=/usr/local/bin \
-    UV_LINK_MODE=copy \
-    UV_PYTHON_PREFERENCE=only-system \
-    UV_PYTHON_DOWNLOADS=never \
+    POETRY_HOME=/opt/poetry \
     POETRY_NO_INTERACTION=1 \
     POETRY_NO_ANSI=1 \
     POETRY_VIRTUALENVS_IN_PROJECT=true \
-    POETRY_VERSION=${POETRY_VERSION}
+    POETRY_VERSION=${POETRY_VERSION} \
+    PATH="/opt/poetry/bin:${PATH}"
 
-# Isolated Poetry venv under /opt/uv-tools, shim in /usr/local/bin.
-# Verify the exact version in the same layer.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv tool install "poetry==${POETRY_VERSION}" \
+# pipefail: a failed curl must fail the build, not feed empty input to python.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Install curl, run the official installer pinned to POETRY_VERSION, remove
+# curl again, and verify the exact version, all in one layer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL https://install.python-poetry.org | python3 - --version "${POETRY_VERSION}" \
+    && apt-get purge -y --auto-remove curl \
+    && rm -rf /var/lib/apt/lists/* \
     && installed="$(poetry --version)" \
     && case "${installed}" in \
          *"version ${POETRY_VERSION})"*) ;; \
