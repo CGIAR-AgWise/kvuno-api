@@ -14,7 +14,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering
 - **Multi-Database** — SQLite and PostgreSQL/PostGIS (the spatial features require PostGIS)
 - **Health Check** — `GET /health` endpoint with database connectivity status
-- **Dockerized** — Dev and production Dockerfiles with docker-compose (PostgreSQL, Redis, Celery worker)
+- **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **JWT Authentication** — Sanctum-style `{id}|{secret}` tokens with BCrypt password hashing
 - **Login & Registration UI** — Web forms at `/ui/login` and `/ui/register`
@@ -92,7 +92,7 @@ kvuno/
 ├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup (dev, prod, worker, migrate, redis, db)
+├── docker-compose.yml        # Multi-service Docker setup (api, worker, migrate)
 ├── Dockerfile                # Dev Docker image
 ├── Dockerfile.prod.dockerfile# Production Docker image
 ├── Dockerfile.worker         # Celery worker Docker image
@@ -115,7 +115,7 @@ kvuno/
 
 ```bash
 # Clone the repository
-git clone git@github.com:AgWISE-EiA/kvuno-api.git
+git clone git@github.com:CGIAR-AgWise/kvuno-api.git
 cd kvuno-api
 
 # Install dependencies
@@ -180,42 +180,50 @@ Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Cele
 
 Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker automatically.
 
-### Docker Deployment (Full Stack)
+### Docker Deployment
 
-A `docker-compose.yml` runs the Flask API alongside PostgreSQL, Redis, and the Celery worker:
+`docker-compose.yml` defines three services: `api` (Flask dev server, port 5000), `worker` (Celery), and `migrate` (one-shot migration runner).
+
+> PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
 ```bash
-# Build and start all services
+# Build and start
 docker compose up --build -d
 
-# Apply migrations (the `migrate` service does this for you on `up`)
+# Apply migrations (separate deploy step — the app does not migrate on startup)
 docker compose run --rm migrate
 
 # Verify
 curl http://localhost:5000/health
 ```
 
-Six services are defined: `dev` (Flask dev server, port 5000), `prod` (Gunicorn, port 5001), `worker` (Celery), `migrate` (one-shot migration runner), `redis`, and `db` (PostGIS).
-
-Three image variants are provided:
-- **`Dockerfile`** — dev image with Flask dev server (Python 3.14)
-- **`Dockerfile.prod.dockerfile`** — production image with Gunicorn
-- **`Dockerfile.worker`** — standalone Celery worker image
-
 ### Docker — Individual Services
 
-Start only specific services:
+```bash
+# API only (no background processing)
+docker compose up -d api
+
+# API + worker
+docker compose up -d api worker
+```
+
+### Container Images (GHCR)
+
+Images are published to GitHub Container Registry, not Docker Hub:
+
+| Image | Dockerfile | Built on |
+|---|---|---|
+| `ghcr.io/cgiar-agwise/kvuno-api` | `Dockerfile` (dev server, Python 3.14) | `develop` |
+| `ghcr.io/cgiar-agwise/kvuno-api` | `Dockerfile.prod.dockerfile` (Gunicorn) | `main` |
+| `ghcr.io/cgiar-agwise/kvuno-worker` | `Dockerfile.worker` (Celery) | `main`, `develop`, `beta/*` |
+
+CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
 ```bash
-# API + Postgres (no background processing)
-docker compose up -d dev db
-
-# Just Redis (for local Celery worker)
-docker compose up -d redis
-
-# Full stack: API + Postgres + Redis + Celery worker
-docker compose up --build -d
+echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
 ```
+
+Packages are private by default; set them to public in the org settings if you want anonymous pulls.
 
 ### Local Development without Postgres
 
@@ -459,10 +467,10 @@ GitHub Actions workflows:
 - **Version Bumping** — Automated version tags on main
 - **Auto PR** — Creates release PRs from version bumps
 - **TODO Scanner** — Scans codebase for TODO/FIXME markers
-- **Docker Build** — Builds and pushes dev/worker images on version
+- **Docker Build** — Builds and pushes images to GHCR after PR Checks pass (dev image on `develop`, prod + worker on `main`; see [Container Images](#container-images-ghcr))
 
 > `pyproject.toml` pins Python `>=3.13,<4.0`; the Docker images use `python:3.14-slim`.
 
 ## License
 
-Project maintained by [masgeek](mailto:barsamms@gmail.com) as part of the AgWISE-EiA initiative.
+Project maintained by [Sammy Barasa](mailto:s.barasa@cgiar.org) as part of the SFP initiative.
