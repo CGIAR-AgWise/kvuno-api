@@ -32,6 +32,8 @@ jobs:
   # reports a conclusion for this exact commit, then gates the image jobs.
   gate:
     name: Wait for PR Checks
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
