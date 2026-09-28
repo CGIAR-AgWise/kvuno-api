@@ -113,7 +113,14 @@ jobs:
       - name: Run tests
         run: poetry run pytest -v --tb=short --junitxml=test-results.xml
 
+      # app/config.py raises at import if the DB env vars are missing, and
+      # pytest-env only injects them for pytest runs — a bare `python -c` gets
+      # nothing. Mirrors [tool.pytest.ini_options] env so both paths agree.
       - name: Smoke-test app import
+        env:
+          DB_URL: "sqlite:///:memory:"
+          DB_DRIVER: "sqlite"
+          DB_NAME: ":memory:"
         run: poetry run python -c "from app.config import build_db_url; print('import OK:', build_db_url())"
 
       - name: Upload test results
