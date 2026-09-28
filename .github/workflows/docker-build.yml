@@ -23,7 +23,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: akilimo-api-${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: kvuno-${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
   cancel-in-progress: true
 
 jobs:
