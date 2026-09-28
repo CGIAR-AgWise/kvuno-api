@@ -23,7 +23,7 @@ WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --chown=app:app . .
-RUN chown app:app /app
+RUN chown app:app /app && chmod +x /app/docker/entrypoint.sh
 
 USER app
 
@@ -31,5 +31,10 @@ EXPOSE 5000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+
+# Applies pending Alembic migrations, then execs the CMD below. Set
+# RUN_MIGRATIONS=false to skip — required if you run more than one replica, so
+# they don't race to migrate the same schema.
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
 
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "-w", "4", "--timeout", "60", "wsgi:app"]

@@ -1,0 +1,7 @@
+# Shell scripts are executed inside the container, where a stray CR from a
+# CRLF checkout breaks the shebang (`#!/bin/sh\r` -> "not found"). This repo is
+# developed on Windows with core.autocrlf=true, so pin LF explicitly.
+*.sh text eol=lf
+
+# Keep the shell scripts executable in the container image.
+docker/*.sh text eol=lf

@@ -1,3 +1,11 @@
+networks:
+  internal:
+    name: internal
+    external: false
+  dokploy-network:
+    name: dokploy-network
+    external: true
+
 services:
   # Shared builder base (python:3.14-slim + pinned Poetry), published as
   # ghcr.io/masgeek/python-3.14-poetry:<version>. CI does not build it — build it
@@ -25,20 +33,25 @@ services:
     env_file:
       - .env
     environment:
-      FLASK_ENV: ${FLASK_ENV:-development}
-      FLASK_APP: ${FLASK_APP:-development}
-      FLASK_DEBUG: ${FLASK_DEBUG:-false}
-      DEBUG_DB: ${DEBUG_DB:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      FLASK_ENV: development
+      FLASK_APP: development
+      FLASK_DEBUG: true
+      DEBUG_DB: true
       DB_DRIVER: ${DB_DRIVER:-postgresql}
-    #      DB_HOST: ${DB_HOST:-db}
+      DB_HOST: postgres
+      # The api image entrypoint can apply migrations before starting the server.
+      # It is currently false here, so migrations must be run manually:
+      #   docker compose exec api python scripts/run_migrations.py
+      # Set true to let the api migrate on start — but never with more than one
+      # replica, or they race to migrate the same schema.
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
     #      DB_PORT: ${DB_PORT:-5432}
     #      DB_USER: ${DB_USER:?DB_USER is required}
     #      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
     #      DB_NAME: ${DB_NAME:?DB_NAME is required}
     #      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
     #      SERVER_PORT: ${SERVER_PORT:-5000}
-    #      HOUSEKEEPING_ENABLED: ${HOUSEKEEPING_ENABLED:-true}
+      HOUSEKEEPING_ENABLED: false
     #      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
     #      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
     #      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
@@ -47,6 +60,9 @@ services:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
       - "5000:5000"
+    networks:
+      - dokploy-network
+      - internal
 
   worker:
     container_name: kvuno-worker
@@ -79,19 +95,6 @@ services:
       RDS_COLUMN_MAP: ${RDS_COLUMN_MAP:-}
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
-
-  migrate:
-    container_name: kvuno-migrate
-    image: ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    command: [ "python3", "scripts/run_migrations.py" ]
-    restart: no
-    environment:
-      DB_DRIVER: ${DB_DRIVER:-postgresql}
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-5432}
-      DB_USER: ${DB_USER:?DB_USER is required}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-      DB_NAME: ${DB_NAME:?DB_NAME is required}
+    networks:
+      - dokploy-network
+      - internal
