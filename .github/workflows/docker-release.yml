@@ -43,6 +43,14 @@ jobs:
           workflow: PR Checks
           timeout: '1800'
 
+      - name: Fail if checks did not pass
+        if: steps.gate.outputs.passed != 'true'
+        run: |
+          echo "::error::PR Checks did not pass for ${{ github.sha }} — refusing to build images"
+          echo "::error::conclusion: ${{ steps.gate.outputs.conclusion }}"
+          echo "::error::run: ${{ steps.gate.outputs.url }}"
+          exit 1
+
   build-api-release:
     needs: [ gate ]
     if: needs.gate.outputs.passed == 'true'
