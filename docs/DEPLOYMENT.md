@@ -318,7 +318,15 @@ Images are published to **GitHub Container Registry**, not Docker Hub:
 
 They are separate so neither needs compound branching. Branch builds used to be triggered by `workflow_run` of PR Checks, which had to fail: **a `workflow_run` fired from a forked pull request gets a read-only `GITHUB_TOKEN`**, so the registry rejected the push with `denied: permission_denied: read_package`. Triggering on `push` fixes that — a push to `develop` or `main` cannot originate from a fork, so `packages: write` holds.
 
-The trade-off is that images now build on the push itself rather than after PR Checks goes green. `main` is protected, so it only advances through a reviewed PR.
+Both workflows trigger on `push`, so they start at the same time and neither can simply `needs` the other. Each image workflow therefore runs a `gate` job first, using `.github/actions/wait-for-checks`: it polls the GitHub API until PR Checks reports a conclusion **for that exact commit**, then sets `passed`. The image jobs have `needs: [ gate ]` and `if: needs.gate.outputs.passed == 'true'`.
+
+| Outcome | Result |
+|---|---|
+| PR Checks succeeds | Images build |
+| PR Checks fails or is cancelled | Image jobs skipped, with the run URL in the error annotation |
+| No run found within `timeout` (default 1800s) | Image jobs skipped — a missing run never counts as a pass |
+
+The gate needs `actions: read` to read run status; the image jobs keep `packages: write`.
 
 Each job has a single-condition `if`. `main` builds **only** the production API image; the worker is not built there, so deploy the worker from a release tag.
 
