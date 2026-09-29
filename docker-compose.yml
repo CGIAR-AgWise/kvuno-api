@@ -101,6 +101,10 @@ services:
       RDS_COLUMN_MAP: ${RDS_COLUMN_MAP:-}
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
+    # Contain an ingest spike in this container instead of letting it OOM the
+    # host. Streaming Parquet keeps normal usage far below this; the limit is a
+    # backstop, not a target. Raise it if large files are legitimate.
+    mem_limit: ${WORKER_MEM_LIMIT:-3g}
     networks:
       - dokploy-network
       - internal

@@ -5,6 +5,7 @@ Used as the primary processing module by both the Flask app (upload API,
 startup background job) and the standalone CLI (``python housekeeping.py``).
 """
 import concurrent.futures
+import gc
 import json
 import os
 import signal
@@ -261,6 +262,38 @@ def download_remote_files(data_folder: str) -> list[str]:
 
 # ── Conflict logging ───────────────────────────────────────────
 
+def _iter_frame_chunks(data, start: int, chunk_size: int):
+    """Yield (offset, DataFrame) slices from an in-memory frame (RDS path)."""
+    total = len(data)
+    for offset in range(start, total, chunk_size):
+        yield offset, data.iloc[offset:min(offset + chunk_size, total)]
+
+
+def _iter_parquet_chunks(parquet_file, columns, start: int, chunk_size: int):
+    """Yield (offset, DataFrame) from a Parquet file one batch at a time.
+
+    Memory stays flat regardless of file size: only `chunk_size` rows are
+    decoded at once, and pyarrow releases each batch before the next. `start`
+    is a row offset so a partially-ingested file can resume; batches wholly
+    before it are skipped without being converted to pandas at all.
+    """
+    offset = 0
+    for batch in parquet_file.iter_batches(batch_size=chunk_size, columns=columns):
+        frame = batch.to_pandas()
+        length = len(frame)
+        if length == 0:
+            continue
+        end = offset + length
+        if end <= start:
+            offset = end
+            continue
+        if offset < start:
+            yield start, frame.iloc[start - offset:]
+        else:
+            yield offset, frame
+        offset = end
+
+
 def _log_batch_conflicts(session, mappings):
     from sqlalchemy import tuple_
     unique_cols = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date']
@@ -353,12 +386,28 @@ def process_file(
                 logger.info(f"Resuming {file_name} from row {resume_offset} (checksum: {checksum})")
 
             column_names = list(column_map.keys())
-            if file_path.endswith('.parquet'):
-                data = pd.read_parquet(file_path, columns=column_names + ['XY'])
+            is_parquet = file_path.endswith('.parquet')
+
+            if is_parquet:
+                # Stream row groups instead of materialising the whole file.
+                # A 3M-row upload would otherwise sit in memory in full, which is
+                # what OOM-kills the worker container. Uploads are converted to
+                # Parquet on arrival precisely so this path is the common one.
+                import pyarrow.parquet as pq
+                parquet_file = pq.ParquetFile(file_path)
+                num_rows = parquet_file.metadata.num_rows
+                chunk_source = _iter_parquet_chunks(
+                    parquet_file, column_names + ['XY'], resume_offset, chunk_size
+                )
             else:
+                # pyreadr has no chunksize parameter, so an RDS cannot be read
+                # incrementally — it must be fully deserialised. Uploads are
+                # converted to Parquet at upload time, so this is the rarer path.
                 result = pyreadr.read_r(file_path)
                 data = result[None]
-            num_rows = len(data)
+                num_rows = len(data)
+                chunk_source = _iter_frame_chunks(data, resume_offset, chunk_size)
+
             _write_progress(file_path, 'processing', resume_offset, num_rows, 'Processing…')
 
             if resume_offset >= num_rows:
@@ -385,14 +434,13 @@ def process_file(
             )
 
             try:
-                for chunk_start in range(resume_offset, num_rows, chunk_size):
+                for chunk_start, chunk in chunk_source:
                     if shutdown_requested:
                         logger.warning("Shutdown requested — breaking after current chunk")
                         break
 
-                    chunk_end = min(chunk_start + chunk_size, num_rows)
-                    pbar.update(chunk_end - chunk_start)
-                    chunk = data.iloc[chunk_start:chunk_end]
+                    chunk_end = chunk_start + len(chunk)
+                    pbar.update(len(chunk))
 
                     logger.debug(f"Processing chunk from rows {chunk_start} to {chunk_end} of {file_name}")
 
@@ -466,7 +514,13 @@ def process_file(
             pbar.close()
             session.commit()
 
-            del data
+            # Drop references to the bulk frame before returning. Only the RDS
+            # path holds one — Parquet streams batches — so a bare `del data`
+            # would raise NameError there. gc.collect() matters more than the
+            # delete: pandas/pyarrow return memory to the allocator in arenas,
+            # so a large file's peak otherwise sticks around in the worker.
+            data = None
+            gc.collect()
 
             elapsed = time.time() - start_time
             emit_event("file.processing_end", file=file_name, checksum=checksum,
