@@ -18,9 +18,11 @@
 # "pyproject.toml changed significantly since poetry.lock was last generated".
 #
 # When bumping Poetry, update ALL of these in the same commit:
-#   1. Dockerfile.base    — ARG POETRY_VERSION
-#   2. Dockerfile         — ARG POETRY_VERSION
-#   3. docker-compose.yml — base service `image:` tag AND build arg
+#   1. docker/Dockerfile.base            — ARG POETRY_VERSION
+#   2. docker/Dockerfile                 — ARG POETRY_VERSION
+#   3. docker/Dockerfile.prod.dockerfile — ARG POETRY_VERSION
+#   4. docker/Dockerfile.worker          — ARG POETRY_VERSION
+#   5. docker-compose.yml                — base service `image:` tag AND build arg
 # Then regenerate poetry.lock with the same Poetry and rebuild the base image.
 
 FROM python:3.14-slim
