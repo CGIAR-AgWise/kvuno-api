@@ -298,6 +298,8 @@ There is no Postgres volume to back up here — the database is external (see §
 | `Declared README file does not exist` during build | `!README.md` missing from `.dockerignore` | The negation must follow the `*.md` rule |
 | Upload returns `413` on the chunked path | The merged file exceeded `MAX_FILE_SIZE_MB` (default 20) | The cap is now enforced server-side during the merge, not just in the browser |
 | Upload returns a `.parquet` file name when `.rds` went in | Uploads are converted to Parquet on arrival so previews and ingestion read the cheap format | Use the returned `file` value from `/ui/upload/complete` or `/api/v1/data/upload`; it is the name the worker will read |
+| A job shows as *Processing* indefinitely | The worker died (OOM, restart, crash) and never wrote a terminal status | It becomes *Stalled* after `JOB_STALE_AFTER_SECONDS` (default 1800) and offers Retry. A job that stays Processing past that is still being written to |
+| Worker container restarts during an ingest | Exceeded `WORKER_MEM_LIMIT` | Raise it, or check whether the file is unusually large for its format |
 | Entrypoint fails with `not found` | `docker/entrypoint.sh` checked out with CRLF | `.gitattributes` pins `*.sh` to LF; re-checkout after it is committed |
 | `denied: permission_denied: read_package` on push | The workflow's `GITHUB_TOKEN` cannot write the package | With a `push` trigger the token keeps `packages: write`. If it still fails, the package already exists with its own access rules — in the package settings set access to inherit from the repository, or add this repository explicitly |
 
