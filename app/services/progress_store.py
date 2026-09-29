@@ -44,11 +44,21 @@ PROGRESS_CHANNEL = 'jobs:updates'
 KEY_PREFIX = 'job:'
 INDEX_KEY = 'jobs:index'
 
+# Terminal states: always written through, never throttled.
+TERMINAL_STATUSES = {'completed', 'error'}
+
 # How long a job may go without reporting before we call it abandoned.
 STALE_AFTER_SECONDS = int(os.getenv('JOB_STALE_AFTER_SECONDS', '1800'))
 
 # Keys expire on their own so a crashed run cannot leak entries forever.
 KEY_TTL_SECONDS = int(os.getenv('JOB_PROGRESS_TTL_SECONDS', str(7 * 24 * 3600)))
+
+# Minimum seconds between published updates for one job in an active state.
+MIN_INTERVAL_SECONDS = float(os.getenv('JOB_PROGRESS_MIN_INTERVAL', '1.0'))
+
+# Last publish time per stem, for throttling. Per-process and advisory only:
+# losing it just means a slightly higher publish rate.
+_last_published: dict[str, float] = {}
 
 _migrated = False
 
@@ -107,10 +117,24 @@ def _to_job(stem: str, h: dict) -> dict:
     }
 
 
+def _should_publish(stem: str, status: str, now: float) -> bool:
+    """Throttle intermediate updates; always let terminal states through."""
+    if status in TERMINAL_STATUSES:
+        return True
+    last = _last_published.get(stem)
+    if last is not None and (now - last) < MIN_INTERVAL_SECONDS:
+        return False
+    return True
+
+
 def save_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
-    """Record progress for a file and publish the change."""
+    """Record progress for a file. Publishes at most once per interval."""
     stem = os.path.basename(file_path)
     now = time.time()
+
+    if not _should_publish(stem, status, now):
+        return
+    _last_published[stem] = now
 
     r = _redis_client()
     if r is not None:
@@ -135,7 +159,10 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
         except Exception:
             pass
 
-    if r is None:
+    # Always persist terminal states, even when Redis is healthy. Otherwise the
+    # DB fallback holds no history at all, and a later Redis outage loses every
+    # completed and failed job.
+    if status in TERMINAL_STATUSES or r is None:
         _db_save(stem, {
             'status': status, 'current': int(current), 'total': int(total),
             'message': message, 'mtime': now,
@@ -190,6 +217,7 @@ def delete_job(stem: str):
             r.zrem(INDEX_KEY, stem)
         except Exception:
             pass
+    _last_published.pop(stem, None)
 
 
 def _migrate_legacy(r) -> None:
