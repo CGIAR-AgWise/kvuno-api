@@ -1,8 +1,13 @@
 import os
 
 
-APP_NAME="KVuno API"
-APP_VERSION="1.0.0"
+APP_NAME = "KVuno API"
+
+# Sourced from the build, not hardcoded: the Dockerfiles pass the git tag (or
+# branch name) as APP_VERSION, so /health and the OpenAPI Info block report what
+# was actually deployed. `version-release.yml` derives the tag from git history,
+# so keeping a number here would only ever drift from it.
+APP_VERSION = os.getenv('APP_VERSION') or os.getenv('GITHUB_REF_NAME') or '0.0.0-dev'
 API_PREFIX = "/api"
 API_VERSION = "/v1"
 
@@ -72,6 +77,11 @@ RATE_LIMIT_REGISTER = os.getenv('RATE_LIMIT_REGISTER', '10 per hour')
 RATE_LIMIT_LOGIN = os.getenv('RATE_LIMIT_LOGIN', '20 per hour')
 RATE_LIMIT_UPLOAD = os.getenv('RATE_LIMIT_UPLOAD', '10 per hour')
 RATE_LIMIT_DATA = os.getenv('RATE_LIMIT_DATA', '120 per minute')
+# Backstop applied to every route without its own limit (UI pages, health).
+# Deliberately generous: raising this is the fix when legitimate users start
+# seeing 429s, since it is the limit that HTML page loads consume.
+RATE_LIMIT_DEFAULT_HOURLY = os.getenv('RATE_LIMIT_DEFAULT_HOURLY', '600')
+RATE_LIMIT_DEFAULT_DAILY = os.getenv('RATE_LIMIT_DEFAULT_DAILY', '5000')
 # Storage backend for rate limit counters.
 # Supports any flask-limiter storage URI:
 #   memory://          — in-process (default, resets on restart)

@@ -18,11 +18,48 @@ document.getElementById('job-search').addEventListener('input', function () {
 });
 
 source.addEventListener('message', function (e) {
-  const data = JSON.parse(e.data);
-  allJobs = data.jobs || [];
+  let data;
+  try { data = JSON.parse(e.data); } catch (err) { return; }
+
+  if (data.job) {
+    // Delta: one job changed. Update it in place instead of re-rendering the
+    // whole list, which the server used to have to re-read for every tick.
+    const j = data.job;
+    const i = allJobs.findIndex(function (x) { return x.file === j.file; });
+    if (i === -1) {
+      // New job appeared (or we missed a snapshot) — take the cheap way out.
+      allJobs.unshift(j);
+    } else {
+      allJobs[i] = j;
+    }
+    allJobs.sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });
+  } else {
+    // Full snapshot, sent once on connect.
+    allJobs = data.jobs || [];
+  }
   renderJobs(allJobs);
   highlightJob();
 });
+
+// Rows/sec and a finish estimate, from the job's original start time. Only
+// meaningful while running: the clock restarts whenever a job resumes.
+function rateInfo(j) {
+  if (j.status !== 'processing') return '';
+  var total = j.total || 0, current = j.current || 0, started = j.started_at || 0;
+  if (!started || !total || !current) return '';
+  var elapsed = (Date.now() / 1000) - started;
+  if (elapsed < 5) return '';            // too short to be meaningful
+  var perSec = current / elapsed;
+  if (!(perSec > 0)) return '';
+  var remainSec = Math.round((total - current) / perSec);
+  if (remainSec < 0) return '';
+  function fmt(s) {
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    return (s / 3600).toFixed(1) + 'h';
+  }
+  return perSec.toLocaleString(undefined, {maximumFractionDigits: 0}) + ' rows/s, ~' + fmt(remainSec) + ' left';
+}
 
 function filtered(jobs) {
   return jobs.filter(function (j) {
@@ -36,7 +73,7 @@ function filtered(jobs) {
 }
 
 function countByStatus(jobs) {
-  var c = { completed: 0, processing: 0, error: 0, unknown: 0 };
+  var c = { completed: 0, processing: 0, error: 0, stale: 0, unknown: 0 };
   jobs.forEach(function (j) { c[j.status] = (c[j.status] || 0) + 1; });
   return c;
 }
@@ -45,6 +82,8 @@ const STATUS = {
   processing: { color: 'primary',  bar: '#0d6efd', label: 'Processing' },
   completed:  { color: 'success',  bar: '#198754', label: 'Completed' },
   error:      { color: 'danger',   bar: '#dc3545', label: 'Failed' },
+  // Worker stopped reporting (crash, OOM kill, restart). Not running.
+  stale:      { color: 'warning',  bar: '#fd7e14', label: 'Stalled' },
   unknown:    { color: 'secondary', bar: '#6c757d', label: 'Pending' },
 };
 
@@ -64,6 +103,7 @@ function renderJobs(jobs) {
     + '<span><span class="badge bg-success rounded-pill">' + (counts.completed || 0) + '</span> completed</span>'
     + '<span><span class="badge bg-primary rounded-pill">' + (counts.processing || 0) + '</span> processing</span>'
     + '<span><span class="badge bg-danger rounded-pill">' + (counts.error || 0) + '</span> failed</span>'
+    + '<span><span class="badge bg-warning rounded-pill">' + (counts.stale || 0) + '</span> stalled</span>'
     + '<span class="text-muted ms-auto">' + visible.length + ' / ' + jobs.length + ' shown</span>'
     + '</div>';
 
@@ -83,9 +123,11 @@ function renderJobs(jobs) {
       + '<td><span class="badge rounded-pill bg-' + badge.color + '">' + badge.label + '</span></td>'
       + '<td class="text-nowrap small text-muted">' + fmtCur + ' / ' + fmtTot + '</td>'
       + '<td style="min-width:140px;"><div class="progress" style="height:6px;"><div class="progress-bar' + anim + '" role="progressbar" style="width:' + barW + '%;background-color:' + badge.bar + '"></div></div></td>'
-      + '<td class="small text-muted">' + escHtml(j.message || '') + '</td>'
+      + '<td class="small text-muted">' + escHtml(j.message || '')
+      + (rateInfo(j) ? '<div class="text-muted" style="font-size:.75rem">' + escHtml(rateInfo(j)) + '</div>' : '')
+      + '</td>'
       + '<td class="small text-muted text-nowrap">' + time + '</td>'
-      + (j.status === 'error' ? '<td><button class="btn btn-outline-danger btn-sm retry-btn" data-file="' + escHtml(j.file) + '">Retry</button></td>' : '<td></td>')
+      + ((j.status === 'error' || j.status === 'stale') ? '<td><button class="btn btn-outline-' + (j.status === 'stale' ? 'warning' : 'danger') + ' btn-sm retry-btn" data-file="' + escHtml(j.file) + '">Retry</button></td>' : '<td></td>')
       + '</tr>';
   }).join('');
 
@@ -146,7 +188,7 @@ function showJobDetail(file) {
         + '<dt class="col-sm-4">Last updated</dt><dd class="col-sm-8">' + time + '</dd>'
         + '</dl>';
       body.innerHTML = html;
-      if (data.status === 'error') {
+      if (data.status === 'error' || data.status === 'stale') {
         var btn = document.getElementById('detail-retry-btn');
         btn.classList.remove('d-none');
         btn.onclick = function () {

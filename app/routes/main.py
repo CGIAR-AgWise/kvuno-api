@@ -1,18 +1,19 @@
 import json
 import os
+import shutil
 import time
 import uuid
 
-import pandas as pd
-import pyreadr
 from flask import abort, redirect, jsonify, render_template, request, Response, stream_with_context
 
 from pathlib import Path
 
 from app.auth import require_auth
-from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED
+from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, MAX_FILE_SIZE
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation
+from app.utils.preview import FileTooLarge, build_preview, iter_chunks
+from app.utils.rds_to_parquet import convert_for_ingestion
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
@@ -40,22 +41,6 @@ COLUMN_ALIASES = {
 CHUNK_DIR = os.path.join(DATA_DIR, '.chunks')
 
 
-def _read_columns(path: str, ext: str):
-    if ext == '.parquet':
-        return pd.read_parquet(path, nrows=0).columns.tolist()
-    data = pyreadr.read_r(path)
-    return data[None].columns.tolist()
-
-
-def _read_rows(path: str, ext: str, n: int = 5):
-    if ext == '.parquet':
-        df = pd.read_parquet(path, nrows=n)
-    else:
-        data = pyreadr.read_r(path)
-        df = data[None].head(n)
-    return json.loads(df.to_json(orient='records'))
-
-
 def _chunk_path(identifier: str, number: int):
     return os.path.join(CHUNK_DIR, identifier, str(number))
 
@@ -66,7 +51,7 @@ def _load_jobs():
 
 
 def _format_jobs(raw):
-    counts = {'completed': 0, 'processing': 0, 'error': 0, 'unknown': 0}
+    counts = {'completed': 0, 'processing': 0, 'error': 0, 'stale': 0, 'unknown': 0}
     for j in raw:
         st = j.get('status', 'unknown')
         counts[st] = counts.get(st, 0) + 1
@@ -170,31 +155,45 @@ def register_app_routes(app):
         unique_name = f"{uuid.uuid4().hex}{ext}"
         dest = os.path.join(DATA_DIR, unique_name)
 
+        # Bound the merge as we go. Without this the endpoint accepted chunks of
+        # any size — the UI cap is client-side only — so one request could fill
+        # the disk and then block on a full-file RDS parse below.
         try:
             with open(dest, 'wb') as out:
-                for i in range(1, total_chunks + 1):
-                    p = _chunk_path(identifier, i)
-                    with open(p, 'rb') as inp:
-                        out.write(inp.read())
+                for block in iter_chunks(identifier, _chunk_path, total_chunks, MAX_FILE_SIZE):
+                    out.write(block)
+        except FileTooLarge as e:
+            shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
+            if os.path.exists(dest):
+                os.remove(dest)
+            return jsonify(error=str(e)), 413
         except FileNotFoundError:
+            if os.path.exists(dest):
+                os.remove(dest)
             return jsonify(error="Missing chunk — upload may have failed"), 400
 
         # clean up chunk dir
-        import shutil
         shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
 
+        # Convert RDS -> Parquet once, here. An RDS is re-parsed in full by both
+        # the preview below and again by the worker; a Parquet answers both from
+        # the footer plus one batch. Falls back to the RDS if conversion fails.
+        stored = convert_for_ingestion(dest)
+        ext = os.path.splitext(stored)[1].lower()
+
         meta = {"original_name": filename}
-        with open(dest + '.meta.json', 'w') as f:
+        with open(stored + '.meta.json', 'w') as f:
             json.dump(meta, f)
 
         try:
-            columns = _read_columns(dest, ext)
-            rows = _read_rows(dest, ext)
+            preview = build_preview(stored, ext)
         except Exception as e:
-            os.remove(dest)
+            for p in (stored, stored + '.meta.json'):
+                if os.path.exists(p):
+                    os.remove(p)
             return jsonify(error=f"Failed to read file: {e}"), 400
 
-        return jsonify(file=unique_name, columns=columns, rows=rows)
+        return jsonify(file=os.path.basename(stored), **preview)
 
     @app.route('/ui/process', methods=['POST'])
     @require_auth
@@ -287,41 +286,95 @@ def register_app_routes(app):
     @app.route('/ui/jobs/events', methods=['GET'])
     @require_auth
     def ui_jobs_events():
-        def generate():
-            raw, counts = _format_jobs(_load_jobs())
-            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+        # A comment line, ignored by EventSource but seen by reverse proxies.
+        # Proxies commonly drop an idle connection, and a job list can be silent
+        # for minutes, so this is what keeps the stream alive.
+        KEEPALIVE = ': keepalive\n\n'
+        POLL_SECONDS = 15
 
-            use_redis = True
-            r = None
+        def snapshot():
+            raw, counts = _format_jobs(_load_jobs())
+            return f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+
+        def generate():
+            # Full snapshot on connect, then one message per changed job.
+            # The pubsub payload IS the job record, so a client no longer
+            # re-reads the whole keyspace on every progress write.
+            from app.services.progress_store import get_job
+            yield snapshot()
+
             pubsub = None
+            r = None
             try:
                 from redis import Redis
+                # No socket_timeout here. A subscription is supposed to block
+                # indefinitely; a 2s read timeout made the connection raise
+                # TimeoutError whenever a job list was simply quiet. The wait is
+                # bounded by get_message() instead.
                 r = Redis.from_url(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-                                   socket_connect_timeout=2, socket_timeout=2)
+                                   socket_connect_timeout=2, socket_timeout=None,
+                                   health_check_interval=30)
                 r.ping()
-                pubsub = r.pubsub()
+                pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe('jobs:updates')
             except Exception:
-                use_redis = False
+                pubsub = None
 
-            if use_redis and pubsub:
-                try:
-                    for message in pubsub.listen():
-                        if message['type'] == 'message':
-                            raw, counts = _format_jobs(_load_jobs())
-                            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
-                except GeneratorExit:
-                    pass
-                finally:
-                    if pubsub:
-                        pubsub.unsubscribe()
-                        pubsub.close()
-                    if r:
-                        r.close()
-            else:
+            def polling():
+                # Used when pubsub is unavailable or the connection drops. The
+                # job list is small, so polling is acceptable as a fallback.
                 while True:
                     time.sleep(3)
-                    raw, counts = _format_jobs(_load_jobs())
-                    yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                    yield snapshot()
+
+            if pubsub is not None:
+                last_sent = time.time()
+                try:
+                    while True:
+                        # get_message(timeout=...) returns None on idle rather
+                        # than blocking the socket, so keepalives and error
+                        # handling stay under our control.
+                        message = pubsub.get_message(timeout=1.0)
+                        if message is not None and message.get('type') == 'message':
+                            try:
+                                changed = json.loads(message['data'])
+                            except (ValueError, TypeError):
+                                changed = None
+                            if changed and 'file' in changed:
+                                # Prefer the stored record: the published message
+                                # may have been in flight when a job crossed the
+                                # staleness threshold.
+                                job = get_job(changed['file']) or changed
+                                yield f"data: {json.dumps({'job': job})}\n\n"
+                                last_sent = time.time()
+                        elif time.time() - last_sent >= POLL_SECONDS:
+                            yield KEEPALIVE
+                            last_sent = time.time()
+                except GeneratorExit:
+                    raise
+                except Exception:
+                    # A dropped or erroring subscription must not 500 the
+                    # response; degrade to polling instead.
+                    yield snapshot()
+                    try:
+                        yield from polling()
+                    except GeneratorExit:
+                        raise
+                finally:
+                    try:
+                        pubsub.unsubscribe()
+                        pubsub.close()
+                    except Exception:
+                        pass
+                    if r is not None:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+            else:
+                try:
+                    yield from polling()
+                except GeneratorExit:
+                    raise
 
         return Response(stream_with_context(generate()), mimetype='text/event-stream')

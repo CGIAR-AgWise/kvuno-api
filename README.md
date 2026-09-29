@@ -13,7 +13,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering
 - **Multi-Database** — SQLite and PostgreSQL/PostGIS (the spatial features require PostGIS)
-- **Health Check** — `GET /health` endpoint with database connectivity status
+- **Health Check** — `GET /health` returns app name, build version, and database status
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
@@ -176,7 +176,7 @@ python run.py            # or: poetry run dev
 python dev_worker.py     # auto-selects --pool solo on Windows, prefork elsewhere
 ```
 
-The API will be available at `http://localhost:5000` and the Swagger UI at `http://localhost:5000/api-docs`.
+The API will be available at `http://localhost:5000` (host) and the Swagger UI at `http://localhost:5000/api-docs`. The container listens on port 80 internally; compose maps host 5000 to it.
 
 Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Celery worker.
 
@@ -184,7 +184,7 @@ Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker aut
 
 ### Docker Deployment
 
-`docker-compose.yml` defines three services: `base` (build-only, never started), `api` (Flask dev server, port 5000), and `worker` (Celery).
+`docker-compose.yml` defines three services: `base` (build-only, never started), `api` (Flask dev server), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `5000` to it.
 
 Database migrations are applied by the `api` container's entrypoint before the server starts — there is no separate migration service. Set `RUN_MIGRATIONS=false` to skip, which is what you want if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
@@ -377,16 +377,32 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
-| `GET` | `/api/v1/users/tokens` | Required | List active tokens |
+| `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
 | `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
 | `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
-| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values |
-| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates |
-| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters |
-| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON) |
+| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values (paginated per column) |
+| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates (paginated) |
+| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated) |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated) |
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
-| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts |
+| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated) |
+
+### Pagination
+
+Every collection endpoint is paginated server-side. `page` defaults to `1` and
+`per_page` to `100`, clamped to a maximum of `500` (`MAX_PER_PAGE` in
+`app/dto/pagination.py`). `per_page` is clamped rather than rejected, and `page`
+is floored at `1` so a malformed value cannot produce a negative offset.
+
+Responses carry `total`, `pages`, `current_page`, and `per_page` alongside their
+rows. `page` is 1-based. `/planting-data/filters` is the one exception to a
+single row axis: its columns are paginated independently, and `totals` / `pages`
+are reported per column so a client can tell when each is exhausted.
+
+`/quality/stats` returns aggregates rather than a record list, so it has no
+pagination; `register`, `login`, `logout`, `upload`, and token creation return
+single objects.
 
 > `GET /api/v1/planting-data/` is intentionally **public** (rate-limited via `RATE_LIMIT_DATA`); the supporting endpoints under the same prefix require a token.
 
@@ -395,7 +411,7 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | Parameter | Type | Description |
 |---|---|---|
 | `page` | int | Page number (default: 1) |
-| `per_page` | int | Items per page (default: 50, max 500) |
+| `per_page` | int | Items per page (default: 100, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
 | `radius` | float | Search radius in meters (requires `coordinates`) |
 | `country` | string | Country name (partial ILIKE match) |
@@ -450,11 +466,22 @@ Key environment variables (see `.env.example`):
 | `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
 | `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
 | `RATE_LIMIT_DATA` | flask-limiter limit string | `120 per minute` | |
+| `RATE_LIMIT_DEFAULT_HOURLY` | Blanket limit for routes with no explicit limit (UI pages) | `600` | |
+| `RATE_LIMIT_DEFAULT_DAILY` | Same, daily | `5000` | |
+| `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs | `0` | |
 | `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
 | `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000` | |
 | `FLASK_DEBUG` | Enable debug mode | `false` | |
 | `SERVER_HOST` | Bind address | `0.0.0.0` | |
-| `SERVER_PORT` | Bind port | `5000` (`run.py` falls back to `80`) | |
+| `SERVER_PORT` | Bind port for the dev server | `80` | |
+| `BIND_PORT` | Gunicorn bind port (`app/gunicorn_config.py`) | `80` | |
+| `BIND_IP` | Gunicorn bind address | `0.0.0.0` | |
+| `WORKER_CLASS` | Gunicorn worker class — `gthread` so SSE doesn't exhaust workers | `gthread` | |
+| `WORKERS` | Gunicorn worker processes | `2` | |
+| `THREADS` | Threads per worker | `4` | |
+| `TIMEOUT` | Request timeout (s) — raised from the 30s default for large uploads | `120` | |
+| `ACCESSLOG` / `ERRORLOG` | Gunicorn log targets; `-` means stdout/stderr | `-` | |
+| `LOG_LEVEL` | Gunicorn log level | `INFO` | |
 | `LOG_LEVEL` | Logging level | `DEBUG` | |
 | `DEBUG_DB` | Echo SQL statements | `false` | |
 | `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |

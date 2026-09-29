@@ -133,10 +133,10 @@ POST   /api/v1/users/tokens            → create token
 DELETE /api/v1/users/tokens/<id>       → revoke token
 
 GET  /api/v1/planting-data             → JSON: filtered data (public, rate-limited)
-GET  /api/v1/planting-data/filters     → JSON: distinct filter values
-GET  /api/v1/planting-data/coordinates → JSON: lat/lon points for the map
-GET  /api/v1/planting-data/clusters    → JSON: server-side spatial clusters
-GET  /api/v1/planting-data/export      → CSV / JSON stream of filtered results
+GET  /api/v1/planting-data/filters     → JSON: distinct filter values (per-column paged)
+GET  /api/v1/planting-data/coordinates → JSON: lat/lon points for the map (paged)
+GET  /api/v1/planting-data/clusters    → JSON: server-side spatial clusters (paged)
+GET  /api/v1/planting-data/export      → CSV / JSON stream of one page of results
 
 POST /api/v1/data/upload               → upload a single RDS/Parquet file
 GET  /api/v1/quality/stats             → JSON: summary statistics
@@ -144,6 +144,30 @@ GET  /api/v1/quality/conflicts         → JSON: paginated conflict list
 ```
 
 All `/ui/*` routes except `/ui/login` and `/ui/register` require a session (`@require_auth`); they redirect browsers to `/ui/login` and return `401` JSON to API clients.
+
+### API pagination
+
+Every collection endpoint under `/api/v1/` is paginated server-side. `page`
+defaults to `1`, `per_page` to `100`, clamped to `MAX_PER_PAGE` (500). Values are
+clamped rather than rejected, and `page` is floored at `1` so a malformed
+parameter cannot produce a negative SQL offset. All of it funnels through
+`get_pagination()` in `app/dto/pagination.py`, so the default and the ceiling
+exist in exactly one place.
+
+Responses carry `total` / `pages` / `current_page` / `per_page` next to their
+rows. `/planting-data/filters` is the exception: it returns a dict of four
+independent lists, so `page` slices each column on its own and `totals` / `pages`
+are reported per column. `/quality/stats` returns aggregates rather than a record
+list and so has no pagination.
+
+Ordering is always tie-broken on the primary key (`get_filtered_data`).
+A non-unique sort column leaves row order ambiguous, and `LIMIT`/`OFFSET` over an
+ambiguous order silently repeats and skips rows as a client pages.
+
+Client-side, `explore.js` walks pages and accumulates (`fetchAllPages`) so the
+map, heatmap, and filter dropdowns still render a complete set rather than just
+the first page. It stops at `MAX_PAGES` (200) and tells the user when the result
+is a sample rather than pretending it is complete.
 
 ---
 

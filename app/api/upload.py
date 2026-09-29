@@ -2,8 +2,6 @@
 import os
 import uuid
 
-import pandas as pd
-import pyreadr
 from flask import request
 from flask_openapi3 import Tag, APIBlueprint
 from pydantic import BaseModel, Field
@@ -14,6 +12,8 @@ from app.config import API_PREFIX, API_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEP
 from app.config import MAX_FILE_SIZE, ALLOWED_EXTENSIONS
 from app.dto.upload import UploadResponse
 from app.rate_limit import limiter
+from app.utils.preview import read_columns
+from app.utils.rds_to_parquet import convert_for_ingestion
 
 __bp__ = "/data"
 url_prefix = API_PREFIX + API_VERSION + __bp__
@@ -22,13 +22,6 @@ tag = Tag(name="ingestion", description="File upload and data ingestion")
 api = APIBlueprint(__bp__, __name__, url_prefix=url_prefix, abp_tags=[tag], abp_security=[{"jwt": []}])
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
-
-
-def _read_columns(path: str, ext: str):
-    if ext == '.parquet':
-        return pd.read_parquet(path, nrows=0).columns.tolist()
-    data = pyreadr.read_r(path)
-    return data[None].columns.tolist()
 
 
 class UploadBatchResponse(BaseModel):
@@ -56,9 +49,17 @@ def _process_uploaded_file(f):
     dest = os.path.join(DATA_DIR, unique_name)
     f.save(dest)
 
+    # Convert RDS -> Parquet once so the worker does not re-parse the whole file.
+    # Falls back to the RDS if conversion fails.
+    stored = convert_for_ingestion(dest)
+    stored_ext = os.path.splitext(stored)[1].lower()
+
     try:
-        columns = _read_columns(dest, ext)
+        columns = read_columns(stored, stored_ext)
     except Exception as e:
+        for p in (stored, stored + '.preview.json'):
+            if os.path.exists(p):
+                os.remove(p)
         return {"error": f"Failed to read file columns: {e}", "file": unique_name}, 400
 
     # Invalidate cached aggregation data since the dataset changed
@@ -67,12 +68,14 @@ def _process_uploaded_file(f):
 
     if HOUSEKEEPING_ENABLED:
         from app.services.housekeeper import process_file_async
-        process_file_async(file_path=dest)
+        process_file_async(file_path=stored)
 
     return UploadResponse(
         message="File accepted for processing" if HOUSEKEEPING_ENABLED
         else "File saved. Set HOUSEKEEPING_ENABLED=true and start a Celery worker for background processing.",
-        file=unique_name,
+        # The stored name may differ from the upload name: an RDS is converted
+        # to Parquet, so return whatever the worker will actually read.
+        file=os.path.basename(stored),
         columns=columns,
     )
 

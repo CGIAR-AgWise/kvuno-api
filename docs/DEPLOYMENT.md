@@ -11,14 +11,14 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 | Service | Image | Purpose |
 |---|---|---|
 | `base` | `ghcr.io/masgeek/python-3.14-poetry:2.3.2` (from `docker/Dockerfile.base`) | Build-only: Python 3.14 + pinned Poetry. Never started; nothing runs in it. |
-| `api` | `ghcr.io/cgiar-agwise/kvuno-api` (built from `docker/Dockerfile`) | Flask dev server on port 5000. Entrypoint migrates, then serves. |
+| `api` | `ghcr.io/cgiar-agwise/kvuno-api` (built from `docker/Dockerfile`) | Flask dev server. Listens on **80** in the container; compose maps host `5000`. Entrypoint migrates, then serves. |
 | `worker` | `ghcr.io/cgiar-agwise/kvuno-worker` (built from `docker/Dockerfile.worker`) | Celery ingestion worker |
 
 ```
 ┌──────────────┐      port 5432     ┌──────────────┐
 │  PostgreSQL  │◀───────────────────│     api      │
 │  + PostGIS   │   DB_HOST=db       │  Flask API   │
-│  (external)  │                    │   port 5000  │
+│  (external)  │                    │   port 80   │
 └──────────────┘                    └──────┬───────┘
                                              │
 ┌──────────────┐                              │
@@ -249,9 +249,10 @@ All application images use `python:3.14-slim` for the runtime stage and run as a
 
 **Production (`docker/Dockerfile.prod.dockerfile`)**
 - Installs runtime dependencies (`poetry install --only main`)
-- `HEALTHCHECK` polls `http://localhost:5000/health`
-- Runs Gunicorn: `gunicorn -b 0.0.0.0:5000 -w 4 --timeout 60 wsgi:app`
-  (overridable via `app/gunicorn_config.py` env vars: `bind_ip`, `bind_port`, `workers`)
+- `HEALTHCHECK` polls `http://localhost:80/health`
+- Runs `gunicorn -c app/gunicorn_config.py wsgi:app`, so the config file is genuinely loaded and its env vars apply: `BIND_IP` (`0.0.0.0`), `BIND_PORT` (`80`), `WORKER_CLASS` (`gthread`), `WORKERS` (`2`), `THREADS` (`4`), `TIMEOUT` (`120`), `GRACEFUL_TIMEOUT`, `KEEPALIVE`, `MAX_REQUESTS`, `WORKER_TMP_DIR` (`/dev/shm`), `ACCESSLOG`/`ERRORLOG` (`-`, i.e. stdout/stderr)
+
+`gthread` is the default worker class because `/ui/jobs/events` is an indefinite SSE stream: a `sync` worker handles one request at a time, so open Jobs pages would exhaust the pool and stall the API.
 
 **Worker (`docker/Dockerfile.worker`)**
 - `celery -A app.celery_app worker --loglevel=info --concurrency=1`
@@ -261,7 +262,8 @@ To build and run the production image standalone (base image must already be bui
 
 ```bash
 docker build -f docker/Dockerfile.prod.dockerfile -t kvuno-api:latest .
-docker run -p 5000:5000 --env-file .env kvuno-api:latest
+# --cap-add NET_BIND_SERVICE: the app runs as non-root and port 80 is privileged
+docker run -p 5000:80 --cap-add NET_BIND_SERVICE --env-file .env kvuno-api:latest
 ```
 
 ---
@@ -286,18 +288,48 @@ There is no Postgres volume to back up here — the database is external (see §
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Uploads accepted but never processed | `HOUSEKEEPING_ENABLED` unset/false and no worker | Set `HOUSEKEEPING_ENABLED=true` and start the `worker` service |
 | 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
-| Port 5000 already in use | Another service on port 5000 | Stop it, or remap with `ports: - "5001:5000"` |
+| `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
+| Port 5000 already in use on the host | Another service on host port 5000 | Stop it, or remap the host side: `ports: - "5001:80"` |
+| `Permission denied` binding, app exits at startup | Container runs as non-root and port 80 is privileged | Add `cap_add: [NET_BIND_SERVICE]` (compose already does for `api`) |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |
 | `manifest unknown` on pull | Tag not built yet, or wrong `TAG` | Tags come from the Docker Build workflow; check what exists under the `CGIAR-AgWise` org |
 | `pull access denied` / `manifest unknown` for `python-3.14-poetry` | Base image not built locally and the tag is not in the registry (or is private) | `docker compose build base`, or `docker login ghcr.io` and retry the pull |
 | `pyproject.toml changed significantly` during build | Poetry version does not match the one that generated the lock | See [Bumping Poetry](#bumping-poetry) — five places to update |
 | `Declared README file does not exist` during build | `!README.md` missing from `.dockerignore` | The negation must follow the `*.md` rule |
+| Upload returns `413` on the chunked path | The merged file exceeded `MAX_FILE_SIZE_MB` (default 20) | The cap is now enforced server-side during the merge, not just in the browser |
+| Upload returns a `.parquet` file name when `.rds` went in | Uploads are converted to Parquet on arrival so previews and ingestion read the cheap format | Use the returned `file` value from `/ui/upload/complete` or `/api/v1/data/upload`; it is the name the worker will read |
+| A job shows as *Processing* indefinitely | The worker died (OOM, restart, crash) and never wrote a terminal status | It becomes *Stalled* after `JOB_STALE_AFTER_SECONDS` (default 1800) and offers Retry. A job that stays Processing past that is still being written to |
+| Worker container restarts during an ingest | Exceeded `WORKER_MEM_LIMIT` | Raise it, or check whether the file is unusually large for its format |
 | Entrypoint fails with `not found` | `docker/entrypoint.sh` checked out with CRLF | `.gitattributes` pins `*.sh` to LF; re-checkout after it is committed |
 | `denied: permission_denied: read_package` on push | The workflow's `GITHUB_TOKEN` cannot write the package | With a `push` trigger the token keeps `packages: write`. If it still fails, the package already exists with its own access rules — in the package settings set access to inherit from the repository, or add this repository explicitly |
 
 ---
 
-## 8. Container Registry (GHCR)
+## 8. Version Reporting
+
+`/health` and the OpenAPI `Info` block report `APP_VERSION`, injected at build
+time as a Docker build arg. Nothing in the source hardcodes a version number:
+
+| Build | `APP_VERSION` | Example |
+|---|---|---|
+| Release (tag) | `${{ github.ref_name }}` | `1.4.2` |
+| `main` | `${{ github.ref_name }}` | `main` |
+| `develop` | `${{ github.ref_name }}-dev` | `develop-dev` |
+| Local `docker compose build` | `ARG` default | `0.0.0-dev` |
+
+```bash
+curl http://localhost:5000/health   # {"status":..., "version":"1.4.2"}
+```
+
+Tags come from `masgeek/github-tag-action`, which computes the next version
+from the previous tag plus conventional commit messages. It has no
+`version_file` input — the git tag is the source of truth, so there is no file
+to keep in sync. `app/config.py` falls back to `GITHUB_REF_NAME`, then
+`0.0.0-dev`.
+
+---
+
+## 9. Container Registry (GHCR)
 
 Images are published to **GitHub Container Registry**, not Docker Hub:
 

@@ -12,6 +12,12 @@ RUN poetry install --no-root --without dev --no-ansi
 
 FROM python:3.14-slim AS runtime
 
+# Set by CI from the git tag (or branch name for dev builds); see
+# .github/workflows/docker-build-reusable.yml. Surfaces in /health and the
+# OpenAPI Info block via app/config.py.
+ARG APP_VERSION=0.0.0-dev
+
+ENV APP_VERSION=${APP_VERSION}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH" \
@@ -27,14 +33,17 @@ RUN chown app:app /app && chmod +x /app/docker/entrypoint.sh
 
 USER app
 
-EXPOSE 5000
+EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
 
 # Applies pending Alembic migrations, then execs the CMD below. Set
 # RUN_MIGRATIONS=false to skip — required if you run more than one replica, so
 # they don't race to migrate the same schema.
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
 
-CMD ["gunicorn", "-b", "0.0.0.0:5000", "-w", "4", "--timeout", "60", "wsgi:app"]
+# Loads app/gunicorn_config.py, so bind_ip / bind_port / workers / LOG_LEVEL
+# env vars actually take effect. Gunicorn would otherwise auto-load only
+# gunicorn.conf.py from the working directory, which does not exist here.
+CMD ["gunicorn", "-c", "app/gunicorn_config.py", "wsgi:app"]
