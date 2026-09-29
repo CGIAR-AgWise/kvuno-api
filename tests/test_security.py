@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from flask import Flask
 from werkzeug.utils import safe_join
 
+from app.dto.pagination import DEFAULT_PER_PAGE, get_pagination
+
 
 @contextmanager
 def _test_request_context(headers=None):
@@ -318,19 +320,41 @@ class TestRedisConfig:
 
 class TestPaginationBounds:
     def test_clamps_high_per_page(self):
-        from app.api.planting_data import _clamp_per_page, MAX_PER_PAGE
-        assert _clamp_per_page(1000) == MAX_PER_PAGE
-        assert _clamp_per_page(MAX_PER_PAGE) == MAX_PER_PAGE
+        from app.dto.pagination import MAX_PER_PAGE
+        with Flask(__name__).test_request_context('/?per_page=1000'):
+            assert get_pagination().per_page == MAX_PER_PAGE
+        with Flask(__name__).test_request_context(f'/?per_page={MAX_PER_PAGE}'):
+            assert get_pagination().per_page == MAX_PER_PAGE
 
     def test_clamps_low_per_page(self):
-        from app.api.planting_data import _clamp_per_page
-        assert _clamp_per_page(0) == 1
-        assert _clamp_per_page(-1) == 1
+        with Flask(__name__).test_request_context('/?per_page=0'):
+            assert get_pagination().per_page == 1
+        with Flask(__name__).test_request_context('/?per_page=-1'):
+            assert get_pagination().per_page == 1
 
     def test_accepts_normal_per_page(self):
-        from app.api.planting_data import _clamp_per_page
-        assert _clamp_per_page(50) == 50
-        assert _clamp_per_page(100) == 100
+        with Flask(__name__).test_request_context('/?per_page=50'):
+            assert get_pagination().per_page == 50
+        with Flask(__name__).test_request_context('/?per_page=100'):
+            assert get_pagination().per_page == 100
+
+    def test_defaults_to_100(self):
+        with Flask(__name__).test_request_context('/'):
+            assert get_pagination().per_page == DEFAULT_PER_PAGE == 100
+            assert get_pagination().page == 1
+
+    def test_page_is_floored_at_one(self):
+        with Flask(__name__).test_request_context('/?page=0'):
+            assert get_pagination().page == 1
+        with Flask(__name__).test_request_context('/?page=-5'):
+            assert get_pagination().page == 1
+
+    def test_offset_and_envelope(self):
+        with Flask(__name__).test_request_context('/?page=3&per_page=100'):
+            p = get_pagination()
+            assert p.offset == 200
+            assert p.envelope(450) == {'total': 450, 'pages': 5,
+                                       'current_page': 3, 'per_page': 100}
 
 
 class TestAuthPages:
@@ -393,14 +417,29 @@ class TestRequireAuth:
         mock_session.query.side_effect = q_side
 
         app = create_app()
+        # The filters endpoint is paginated and now also returns per-column
+        # distinct counts, so the repo has to return real (serializable) data
+        # rather than letting a MagicMock leak into the response body.
+        mock_repo = MagicMock()
+        mock_repo.get_distinct_values.return_value = {
+            'country': ['Kenya'], 'province': [], 'variety': [], 'season_type': [],
+        }
+        mock_repo.count_distinct_values.return_value = {
+            'country': 1, 'province': 0, 'variety': 0, 'season_type': 0,
+        }
         with (
             app.test_client() as c,
             patch("app.api.user.MyDb.get_db", return_value=MagicMock(session=mock_session)),
+            patch("app.api.planting_data.repo", mock_repo),
         ):
             resp = c.get('/api/v1/planting-data/filters',
                          headers={'Authorization': f'Bearer {bearer}'})
             # Should succeed (we mocked the DB)
             assert resp.status_code in (200, 500)  # 500 if real DB fails, but auth passed
+            if resp.status_code == 200:
+                body = resp.get_json()
+                assert body['current_page'] == 1
+                assert body['per_page'] == 100
 
 
 class TestCookieAuth:
