@@ -377,16 +377,32 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
-| `GET` | `/api/v1/users/tokens` | Required | List active tokens |
+| `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
 | `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
 | `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
-| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values |
-| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates |
-| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters |
-| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON) |
+| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values (paginated per column) |
+| `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates (paginated) |
+| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated) |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated) |
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
-| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts |
+| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated) |
+
+### Pagination
+
+Every collection endpoint is paginated server-side. `page` defaults to `1` and
+`per_page` to `100`, clamped to a maximum of `500` (`MAX_PER_PAGE` in
+`app/dto/pagination.py`). `per_page` is clamped rather than rejected, and `page`
+is floored at `1` so a malformed value cannot produce a negative offset.
+
+Responses carry `total`, `pages`, `current_page`, and `per_page` alongside their
+rows. `page` is 1-based. `/planting-data/filters` is the one exception to a
+single row axis: its columns are paginated independently, and `totals` / `pages`
+are reported per column so a client can tell when each is exhausted.
+
+`/quality/stats` returns aggregates rather than a record list, so it has no
+pagination; `register`, `login`, `logout`, `upload`, and token creation return
+single objects.
 
 > `GET /api/v1/planting-data/` is intentionally **public** (rate-limited via `RATE_LIMIT_DATA`); the supporting endpoints under the same prefix require a token.
 
@@ -395,7 +411,7 @@ Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie 
 | Parameter | Type | Description |
 |---|---|---|
 | `page` | int | Page number (default: 1) |
-| `per_page` | int | Items per page (default: 50, max 500) |
+| `per_page` | int | Items per page (default: 100, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
 | `radius` | float | Search radius in meters (requires `coordinates`) |
 | `country` | string | Country name (partial ILIKE match) |

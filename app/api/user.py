@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_REGISTER, RATE_LIMIT_LOGIN, TOKEN_TTL_DAYS
 from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, CreateTokenRequest
+from app.dto.pagination import get_pagination
 from app.models.database_conn import MyDb
 from app.models.kvuno import User, UserToken
 from app.rate_limit import limiter
@@ -159,12 +160,16 @@ class TokenInfoResponse(BaseModel):
 
 class TokenListResponse(BaseModel):
     tokens: list[TokenInfoResponse] = Field(default=[], description="Active tokens")
+    total: int = Field(0, description="Total active tokens")
+    pages: int = Field(0, description="Total number of pages")
+    current_page: int = Field(1, description="Current page number")
+    per_page: int = Field(100, description="Tokens per page")
 
 
 @api.get('/tokens',
          responses={200: TokenListResponse, 401: {"description": "Authentication required"}},
          summary="List active tokens for the current user",
-         description="Return all non-expired tokens belonging to the authenticated user.",
+         description="Return non-expired tokens belonging to the authenticated user, paginated server-side. Defaults to 100 per page, capped at 500.",
          security=[{"jwt": []}])
 def list_tokens():
     user = get_current_user()
@@ -172,10 +177,14 @@ def list_tokens():
         return {"msg": "authentication required"}, 401
     db = MyDb.get_db()
     now = datetime.now(timezone.utc)
-    tokens = db.session.query(UserToken).filter(
+    query = db.session.query(UserToken).filter(
         UserToken.user_id == user.id,
         (UserToken.expires_at.is_(None)) | (UserToken.expires_at > now),
-    ).all()
+    )
+    pagination = get_pagination()
+    total = query.count()
+    tokens = query.order_by(UserToken.id.asc()) \
+        .limit(pagination.per_page).offset(pagination.offset).all()
     return TokenListResponse(
         tokens=[
             TokenInfoResponse(
@@ -185,7 +194,8 @@ def list_tokens():
                 last_used_at=_z(t.last_used_at) if t.last_used_at else None,
             )
             for t in tokens
-        ]
+        ],
+        **pagination.envelope(total),
     ).model_dump(), 200
 
 

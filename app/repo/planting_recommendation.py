@@ -66,8 +66,13 @@ class PlantingRecommendationRepo:
         sort_col = filters.sort_col or 'id'
         sort_dir = filters.sort_dir or 'asc'
         col_attr = getattr(PlantingRecommendation, sort_col, PlantingRecommendation.id)
-        query = query.order_by(col_attr.asc() if sort_dir == 'asc' else col_attr.desc())
-        return query
+        order = col_attr.asc() if sort_dir == 'asc' else col_attr.desc()
+        # Tie-break on the primary key. A non-unique sort column leaves row
+        # order ambiguous, and LIMIT/OFFSET over an ambiguous order silently
+        # repeats and skips rows as the client pages through the result.
+        if col_attr is not PlantingRecommendation.id:
+            order = (order, PlantingRecommendation.id.asc())
+        return query.order_by(*order) if isinstance(order, tuple) else query.order_by(order)
 
     def _apply_filters(self, filters: PlantingDataFilter) -> Query:
         session = self._get_session()
@@ -97,7 +102,7 @@ class PlantingRecommendationRepo:
         query = self.get_filtered_data(filters)
         return query.paginate(page=page, per_page=per_page, error_out=False)
 
-    def get_coordinates(self, filters: PlantingDataFilter) -> list:
+    def get_coordinates(self, filters: PlantingDataFilter, limit: int, offset: int = 0) -> list:
         query = self.get_filtered_data(filters)
         query = query.with_entities(
             PlantingRecommendation.lat,
@@ -106,11 +111,25 @@ class PlantingRecommendationRepo:
             PlantingRecommendation.lat.isnot(None),
             PlantingRecommendation.lon.isnot(None),
         )
-        return query.all()
+        return query.limit(limit).offset(offset).all()
+
+    def count_coordinates(self, filters: PlantingDataFilter) -> int:
+        """Total rows the coordinates endpoint could page over.
+
+        Counted separately from the page query so the client learns the real
+        size of the set instead of inferring it from a short final page.
+        """
+        query = self.get_filtered_data(filters)
+        query = query.with_entities(func.count()).filter(
+            PlantingRecommendation.lat.isnot(None),
+            PlantingRecommendation.lon.isnot(None),
+        )
+        return query.scalar() or 0
 
     def get_clusters(self, filters: PlantingDataFilter, zoom: int,
                      ne_lat: float, ne_lng: float,
-                     sw_lat: float, sw_lng: float) -> list[dict]:
+                     sw_lat: float, sw_lng: float,
+                     limit: int | None = None, offset: int = 0) -> list[dict]:
         grid_size = max(0.0001, 360.0 / (2 ** max(zoom, 1)))
         bounds = func.ST_MakeEnvelope(sw_lng, sw_lat, ne_lng, ne_lat, 4326)
 
@@ -126,11 +145,20 @@ class PlantingRecommendationRepo:
 
         # Group by grid cell and return center + count
         grid = func.ST_SnapToGrid(PlantingRecommendation.coordinates, grid_size)
-        cols = query.with_entities(
+        grid_query = query.with_entities(
             func.avg(PlantingRecommendation.lat).label('lat'),
             func.avg(PlantingRecommendation.lon).label('lon'),
             func.count(PlantingRecommendation.id).label('count'),
-        ).group_by(grid).all()
+        ).group_by(grid)
+        # Grouped by grid cell, so the row count is bounded by cells rather than
+        # by records. Paginated anyway so a very low zoom cannot return a
+        # response the client has to buffer in full. Densest cells first, so
+        # the heatmap degrades gracefully when a page is dropped.
+        if limit is not None:
+            grid_query = grid_query.order_by(
+                func.count(PlantingRecommendation.id).desc()
+            ).limit(limit).offset(offset)
+        cols = grid_query.all()
 
         return [
             {'lat': round(float(r.lat), 6), 'lon': round(float(r.lon), 6), 'count': r.count}
@@ -171,7 +199,15 @@ class PlantingRecommendationRepo:
             self.logger.error(f"Failed to find PlantingRecommendation with checksum {check_sum}: {e}")
             raise
 
-    def get_distinct_values(self, columns: list[str]) -> dict[str, list]:
+    def get_distinct_values(self, columns: list[str], limit: int | None = None,
+                            offset: int = 0) -> dict[str, list]:
+        """Distinct values per column, optionally sliced server-side.
+
+        ``limit``/``offset`` apply to each column independently: the response is
+        a dict of independent lists, so there is no single row axis to page
+        along. The caller pages each column on its own using the per-column
+        totals from :meth:`count_distinct_values`.
+        """
         session = self._get_session()
         result = {}
         for col in columns:
@@ -179,17 +215,37 @@ class PlantingRecommendationRepo:
                 col_attr = getattr(PlantingRecommendation, col, None)
                 if col_attr is None:
                     continue
-                values = (
+                query = (
                     session.query(col_attr)
                     .filter(col_attr.isnot(None))
                     .distinct()
                     .order_by(col_attr)
-                    .all()
                 )
-                result[col] = [v[0] for v in values]
+                if limit is not None:
+                    query = query.limit(limit).offset(offset)
+                result[col] = [v[0] for v in query.all()]
             except Exception as e:
                 self.logger.error(f"Failed to get distinct values for {col}: {e}")
                 result[col] = []
+        return result
+
+    def count_distinct_values(self, columns: list[str]) -> dict[str, int]:
+        """Distinct value count per column, so a client knows when to stop paging."""
+        session = self._get_session()
+        result = {}
+        for col in columns:
+            try:
+                col_attr = getattr(PlantingRecommendation, col, None)
+                if col_attr is None:
+                    continue
+                result[col] = (
+                    session.query(func.count(func.distinct(col_attr)))
+                    .filter(col_attr.isnot(None))
+                    .scalar() or 0
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to count distinct values for {col}: {e}")
+                result[col] = 0
         return result
 
     def _log_conflicts(self, session, mappings, inserted_count):
