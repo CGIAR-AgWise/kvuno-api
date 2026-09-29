@@ -45,7 +45,7 @@ def _cleanup_temp_files():
         if job.get('mtime', 0) > cutoff:
             continue
         stem = job['file']
-        for suffix in ('.rds', '.parquet', '.meta.json', '.map.json'):
+        for suffix in ('.rds', '.parquet', '.meta.json', '.map.json', '.preview.json'):
             target = data_dir / f"{stem}{suffix}"
             try:
                 if target.is_file():
@@ -189,9 +189,11 @@ def create_app():
     # Rate limiting
     from app.rate_limit import limiter
     limiter.init_app(app)
-    storage_uri = os.getenv('RATE_LIMIT_STORAGE', 'memory://')
-    if storage_uri != 'memory://':
-        limiter._storage_uri = storage_uri
+    # Static assets must never be rate limited: browsers request several per
+    # page view, so counting them against the default limit makes a handful of
+    # page loads look like abuse. `storage_uri` is already applied by the
+    # Limiter constructor, so RATE_LIMIT_STORAGE needs nothing here.
+    limiter.exempt(app.send_static_file)
 
     @app.errorhandler(429)
     def ratelimit_handler(e):
@@ -258,5 +260,20 @@ def create_app():
     if HOUSEKEEPING_ENABLED:
         from app.services.housekeeper import process_pending
         process_pending()
+
+    # Behind a reverse proxy (Dokploy, nginx) request.remote_addr is the
+    # proxy's address, so every client shares one rate-limit bucket and the
+    # first few requests exhaust everyone's budget. ProxyFix makes Werkzeug
+    # read the real client IP from the forwarded headers.
+    #
+    # Only enable this when a trusted proxy sets those headers — otherwise a
+    # client can spoof X-Forwarded-For and bypass the limiter entirely.
+    # PROXY_FIX_HOPS counts proxies in front of the app: 1 for a single nginx.
+    if os.getenv('PROXY_FIX_HOPS', '0').isdigit() and int(os.getenv('PROXY_FIX_HOPS', '0')) > 0:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        hops = int(os.getenv('PROXY_FIX_HOPS', '0'))
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops)
+        from app.utils.logging import SharedLogger
+        SharedLogger().get_logger().info(f"ProxyFix enabled for {hops} proxy hop(s)")
 
     return app
