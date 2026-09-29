@@ -1,10 +1,9 @@
-from flask import request
 from flask_openapi3 import Tag, APIBlueprint
 
 from app.config import API_PREFIX, API_VERSION
 from app.dto.data_filters import QualityFilter
 from app.dto.import_conflict import ImportConflictRecord
-from app.dto.pagination import PaginatedResponse
+from app.dto.pagination import PaginatedResponse, get_pagination
 from app.dto.planting_recommendation import Unauthorized
 from app.repo.import_conflict import ImportConflictRepo
 from app.utils.logging import SharedLogger
@@ -52,13 +51,12 @@ def get_quality_stats():
 @api.get('/conflicts',
          responses={200: ConflictListResponse, 401: Unauthorized},
          summary="List import conflicts",
-         description="Return paginated list of import conflicts with optional filtering.")
+         description="Return paginated list of import conflicts with optional filtering. Defaults to 100 records per page, capped at 500.")
 def get_conflicts(query: QualityFilter):
-    page = int(request.args.get('page', default=1, type=int))
-    per_page = int(request.args.get('per_page', default=50, type=int))
+    pagination = get_pagination()
 
     try:
-        paginated = repo.get_paginated(query, page, per_page)
+        paginated = repo.get_paginated(query, pagination.page, pagination.per_page)
 
         records = [ImportConflictRecord(
             id=item.id,
