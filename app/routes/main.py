@@ -287,6 +287,10 @@ def register_app_routes(app):
     @require_auth
     def ui_jobs_events():
         def generate():
+            # Full snapshot on connect, then one message per changed job.
+            # The pubsub payload IS the job record, so a client no longer
+            # re-reads the whole keyspace on every progress write.
+            from app.services.progress_store import get_job
             raw, counts = _format_jobs(_load_jobs())
             yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
 
@@ -306,9 +310,19 @@ def register_app_routes(app):
             if use_redis and pubsub:
                 try:
                     for message in pubsub.listen():
-                        if message['type'] == 'message':
-                            raw, counts = _format_jobs(_load_jobs())
-                            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                        if message['type'] != 'message':
+                            continue
+                        try:
+                            changed = json.loads(message['data'])
+                        except (ValueError, TypeError):
+                            changed = None
+                        if not changed or 'file' not in changed:
+                            continue
+                        # Prefer the published record, but re-read if it looks
+                        # stale now — the message may have been in flight when
+                        # a job crossed the staleness threshold.
+                        job = get_job(changed['file']) or changed
+                        yield f"data: {json.dumps({'job': job})}\n\n"
                 except GeneratorExit:
                     pass
                 finally:
@@ -318,6 +332,8 @@ def register_app_routes(app):
                     if r:
                         r.close()
             else:
+                # No Redis: fall back to polling. The job list is small, and
+                # this path only runs when pubsub is unavailable.
                 while True:
                     time.sleep(3)
                     raw, counts = _format_jobs(_load_jobs())

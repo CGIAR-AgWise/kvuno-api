@@ -18,8 +18,25 @@ document.getElementById('job-search').addEventListener('input', function () {
 });
 
 source.addEventListener('message', function (e) {
-  const data = JSON.parse(e.data);
-  allJobs = data.jobs || [];
+  let data;
+  try { data = JSON.parse(e.data); } catch (err) { return; }
+
+  if (data.job) {
+    // Delta: one job changed. Update it in place instead of re-rendering the
+    // whole list, which the server used to have to re-read for every tick.
+    const j = data.job;
+    const i = allJobs.findIndex(function (x) { return x.file === j.file; });
+    if (i === -1) {
+      // New job appeared (or we missed a snapshot) — take the cheap way out.
+      allJobs.unshift(j);
+    } else {
+      allJobs[i] = j;
+    }
+    allJobs.sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });
+  } else {
+    // Full snapshot, sent once on connect.
+    allJobs = data.jobs || [];
+  }
   renderJobs(allJobs);
   highlightJob();
 });
