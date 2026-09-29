@@ -228,9 +228,14 @@ def create_app():
                 'Content-Security-Policy',
                 "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                 "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
-                "img-src 'self' data: https://tile.openstreetmap.org; "
+                # Tiles are served from a./b./c. subdomains (see explore.js
+                # tileLayer('https://{s}.tile.openstreetmap.org/...')). A CSP host
+                # without a wildcard matches only that exact host, so the
+                # subdomain form is required — keep the bare host too, since
+                # '*.host' does not match 'host' itself.
+                "img-src 'self' data: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; "
                 "font-src 'self' https://cdn.jsdelivr.net; "
-                "connect-src 'self' https://tile.openstreetmap.org https://cdn.jsdelivr.net; "
+                "connect-src 'self' https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://cdn.jsdelivr.net; "
                 "frame-ancestors 'none';"
             )
         return response
