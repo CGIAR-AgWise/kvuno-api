@@ -2,9 +2,11 @@
 name = "kvuno-api"
 version = "1.0.0"
 description = """
-Flask REST API for processing agricultural RDS files containing crop planting data.
-Ingests, deduplicates, and serves optimized sowing date information via a filterable,
-paginated API with spatial query support.
+Flask API for CGIAR AgWISE crop planting data. Ingests agricultural RDS and
+Parquet files, deduplicates them by checksum, and serves optimised sowing
+recommendations through a filterable, paginated API with PostGIS spatial
+queries. Uploads are converted to Parquet on arrival; ingestion runs through
+Celery with resumable, checkpointed batch processing.
 """
 authors = [
     { name = "masgeek", email = "barsamms@gmail.com" }
@@ -33,6 +35,7 @@ dependencies = [
     "redis (>=6.0,<7.0)",
     "bcrypt (>=5.0.0,<6.0.0)",
     "psycopg[binary] (>=3.3.6,<4.0.0)",
+    "pyarrow (>=20.0.0,<26.0.0)"
 ]
 
 [project.scripts]

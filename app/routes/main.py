@@ -1,18 +1,19 @@
 import json
 import os
+import shutil
 import time
 import uuid
 
-import pandas as pd
-import pyreadr
 from flask import abort, redirect, jsonify, render_template, request, Response, stream_with_context
 
 from pathlib import Path
 
 from app.auth import require_auth
-from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED
+from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, MAX_FILE_SIZE
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation
+from app.utils.preview import FileTooLarge, build_preview, iter_chunks
+from app.utils.rds_to_parquet import convert_for_ingestion
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
@@ -38,22 +39,6 @@ COLUMN_ALIASES = {
 }
 
 CHUNK_DIR = os.path.join(DATA_DIR, '.chunks')
-
-
-def _read_columns(path: str, ext: str):
-    if ext == '.parquet':
-        return pd.read_parquet(path, nrows=0).columns.tolist()
-    data = pyreadr.read_r(path)
-    return data[None].columns.tolist()
-
-
-def _read_rows(path: str, ext: str, n: int = 5):
-    if ext == '.parquet':
-        df = pd.read_parquet(path, nrows=n)
-    else:
-        data = pyreadr.read_r(path)
-        df = data[None].head(n)
-    return json.loads(df.to_json(orient='records'))
 
 
 def _chunk_path(identifier: str, number: int):
@@ -170,31 +155,45 @@ def register_app_routes(app):
         unique_name = f"{uuid.uuid4().hex}{ext}"
         dest = os.path.join(DATA_DIR, unique_name)
 
+        # Bound the merge as we go. Without this the endpoint accepted chunks of
+        # any size — the UI cap is client-side only — so one request could fill
+        # the disk and then block on a full-file RDS parse below.
         try:
             with open(dest, 'wb') as out:
-                for i in range(1, total_chunks + 1):
-                    p = _chunk_path(identifier, i)
-                    with open(p, 'rb') as inp:
-                        out.write(inp.read())
+                for block in iter_chunks(identifier, _chunk_path, total_chunks, MAX_FILE_SIZE):
+                    out.write(block)
+        except FileTooLarge as e:
+            shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
+            if os.path.exists(dest):
+                os.remove(dest)
+            return jsonify(error=str(e)), 413
         except FileNotFoundError:
+            if os.path.exists(dest):
+                os.remove(dest)
             return jsonify(error="Missing chunk — upload may have failed"), 400
 
         # clean up chunk dir
-        import shutil
         shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
 
+        # Convert RDS -> Parquet once, here. An RDS is re-parsed in full by both
+        # the preview below and again by the worker; a Parquet answers both from
+        # the footer plus one batch. Falls back to the RDS if conversion fails.
+        stored = convert_for_ingestion(dest)
+        ext = os.path.splitext(stored)[1].lower()
+
         meta = {"original_name": filename}
-        with open(dest + '.meta.json', 'w') as f:
+        with open(stored + '.meta.json', 'w') as f:
             json.dump(meta, f)
 
         try:
-            columns = _read_columns(dest, ext)
-            rows = _read_rows(dest, ext)
+            preview = build_preview(stored, ext)
         except Exception as e:
-            os.remove(dest)
+            for p in (stored, stored + '.meta.json'):
+                if os.path.exists(p):
+                    os.remove(p)
             return jsonify(error=f"Failed to read file: {e}"), 400
 
-        return jsonify(file=unique_name, columns=columns, rows=rows)
+        return jsonify(file=os.path.basename(stored), **preview)
 
     @app.route('/ui/process', methods=['POST'])
     @require_auth
