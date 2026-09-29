@@ -7,7 +7,7 @@ import os
 import gunicorn
 
 bind_ip = os.getenv('bind_ip', '0.0.0.0')
-bind_port = os.getenv('bind_port', '5000')
+bind_port = os.getenv('bind_port', '80')
 bind = '{0}:{1}'.format(bind_ip, bind_port)
 capture_output = True
 accesslog = 'logs/gunicorn-access.log'
