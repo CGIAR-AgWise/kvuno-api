@@ -247,6 +247,10 @@
         const q = buildQuery();
         const p = new URLSearchParams(q);
         p.set('format', fmt);
+        // The export endpoint is paginated server-side like the rest of the API,
+        // so request the ceiling explicitly. Without this the download silently
+        // contains only the first 100 rows.
+        p.set('per_page', PAGE_CAP);
         const url = '/api/v1/planting-data/export?' + p.toString();
         const a = document.createElement('a');
         a.href = url;
@@ -254,6 +258,8 @@
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
+        showToast('Export limited to ' + PAGE_CAP + ' rows — narrow the filters to ' +
+            'export a specific subset.', 'warning');
     }
 
     // ── Event wiring ────────────────────────────────────────────
@@ -328,6 +334,37 @@
         }
     });
 
+    // ── Pagination helpers ─────────────────────────────────────
+    // Every collection endpoint is now paginated server-side (100/page, 500
+    // max). These walk the pages and accumulate so the UI still renders a
+    // complete set instead of silently showing only the first page.
+
+    const PAGE_CAP = 500;
+    const MAX_PAGES = 200;   // hard stop: 200 * 500 = 100k rows
+
+    async function fetchAllPages(url, key, params) {
+        const all = [];
+        let page = 1;
+        let pages = 1;
+        let total = 0;
+        do {
+            const p = new URLSearchParams(params ? params.toString() : '');
+            p.set('page', page);
+            p.set('per_page', PAGE_CAP);
+            const resp = await fetch(url + '?' + p.toString());
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            (data[key] || []).forEach(function (row) { all.push(row); });
+            total = data.total || 0;
+            pages = data.pages || 1;
+            page += 1;
+        } while (page <= pages && page <= MAX_PAGES);
+        // Surfaced so the UI can admit the map is showing a sample, not the
+        // whole set, when a dataset exceeds the hard stop.
+        return { rows: all, total: total, truncated: all.length < total };
+    }
+
     function showHeatmap() {
         const p = new URLSearchParams();
         forEachFilter(function (key, el) {
@@ -337,13 +374,9 @@
             p.set('coordinates', filters.lon.value + ',' + filters.lat.value);
         }
 
-        fetch('/api/v1/planting-data/coordinates?' + p.toString())
-            .then(function (r) {
-                return r.json();
-            })
-            .then(function (data) {
-                if (data.error) throw new Error(data.error);
-                const points = (data.coordinates || []).map(function (c) {
+        fetchAllPages('/api/v1/planting-data/coordinates', 'coordinates', p)
+            .then(function (res) {
+                const points = res.rows.map(function (c) {
                     return [c.lat, c.lon, 1];
                 });
                 if (!points.length) {
@@ -358,6 +391,10 @@
                 map.fitBounds(points.map(function (p) {
                     return [p[0], p[1]];
                 }), {padding: [20, 20], maxZoom: 10});
+                if (res.truncated) {
+                    showToast('Showing ' + res.rows.length.toLocaleString() + ' of ' +
+                        res.total.toLocaleString() + ' points.', 'warning');
+                }
             })
             .catch(function (err) {
                 showToast('Heatmap error: ' + err.message, 'danger');
@@ -404,13 +441,9 @@
             if (el.value) p.set(key, el.value);
         });
 
-        fetch('/api/v1/planting-data/clusters?' + p.toString())
-            .then(function (r) {
-                return r.json();
-            })
-            .then(function (data) {
-                if (data.error) throw new Error(data.error);
-                const items = data.clusters || [];
+        fetchAllPages('/api/v1/planting-data/clusters', 'clusters', p)
+            .then(function (res) {
+                const items = res.rows;
                 if (!items.length) {
                     showToast('No cluster data.', 'warning');
                     return;
@@ -450,35 +483,51 @@
 
     // ── Load filter options ─────────────────────────────────────
 
-    function loadFilterOptions() {
-        fetch('/api/v1/planting-data/filters')
-            .then(function (r) {
-                return r.json();
-            })
-            .then(function (data) {
-                if (data.error) return;
-                const map = {
-                    country: 'f-country',
-                    province: 'f-province',
-                    variety: 'f-variety',
-                    season_type: 'f-season'
-                };
-                Object.keys(map).forEach(function (key) {
-                    const sel = document.getElementById(map[key]);
-                    if (!sel) return;
+    const FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type'];
 
-                    const vals = data[key] || [];
-                    sel.innerHTML = '<option value="">All</option>';
-                    vals.forEach(function (v) {
-                        const opt = document.createElement('option');
-                        opt.value = String(v);
-                        opt.textContent = String(v);
-                        sel.appendChild(opt);
-                    });
+    async function loadFilterOptions() {
+        // Each column is paginated independently by the server, so page until
+        // the deepest column is exhausted rather than trusting any single page.
+        const acc = { country: [], province: [], variety: [], season_type: [] };
+        let page = 1;
+        let pages = 1;
+        try {
+            do {
+                const resp = await fetch('/api/v1/planting-data/filters?page=' + page +
+                    '&per_page=' + PAGE_CAP);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                if (data.error) return;
+                FILTER_COLUMNS.forEach(function (key) {
+                    (data[key] || []).forEach(function (v) { acc[key].push(v); });
                 });
-            })
-            .catch(function () {
+                const reported = Object.values(data.pages || {});
+                pages = reported.length ? Math.max.apply(null, reported) : 1;
+                page += 1;
+            } while (page <= pages && page <= MAX_PAGES);
+        } catch (e) {
+            return;
+        }
+
+        const map = {
+            country: 'f-country',
+            province: 'f-province',
+            variety: 'f-variety',
+            season_type: 'f-season'
+        };
+        Object.keys(map).forEach(function (key) {
+            const sel = document.getElementById(map[key]);
+            if (!sel) return;
+
+            const vals = acc[key] || [];
+            sel.innerHTML = '<option value="">All</option>';
+            vals.forEach(function (v) {
+                const opt = document.createElement('option');
+                opt.value = String(v);
+                opt.textContent = String(v);
+                sel.appendChild(opt);
             });
+        });
     }
 
     // ── Init ────────────────────────────────────────────────────
