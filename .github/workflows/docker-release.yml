@@ -61,6 +61,7 @@ jobs:
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.prod.dockerfile
+      app_version: ${{ github.ref_name }}
       image_name: ghcr.io/cgiar-agwise/kvuno-api
       branch_ref: refs/tags/${{ github.ref_name }}
       branch_name: ${{ github.ref_name }}
@@ -72,6 +73,7 @@ jobs:
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.worker
+      app_version: ${{ github.ref_name }}
       image_name: ghcr.io/cgiar-agwise/kvuno-worker
       branch_ref: refs/tags/${{ github.ref_name }}
       branch_name: ${{ github.ref_name }}

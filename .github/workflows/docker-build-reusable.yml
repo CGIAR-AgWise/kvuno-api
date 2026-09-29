@@ -19,6 +19,11 @@ on:
         required: false
         type: string
         default: ''
+      app_version:
+        required: false
+        type: string
+        default: '0.0.0-dev'
+        description: Reported by /health and the OpenAPI Info block
 
 
 jobs:
@@ -61,6 +66,7 @@ jobs:
         with:
           context: .
           file: ${{ inputs.dockerfile }}
+          build-args: APP_VERSION=${{ inputs.app_version }}
           push: true
           provenance: false
           tags: ${{ steps.docker_tags.outputs.tags }}
