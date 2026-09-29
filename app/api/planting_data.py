@@ -9,6 +9,7 @@ from app.auth import require_auth
 from app.cache import api_cache
 from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_DATA
 from app.dto.data_filters import PlantingDataFilter
+from app.dto.pagination import get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
 from app.rate_limit import limiter
 from app.repo.planting_recommendation import PlantingRecommendationRepo
@@ -47,6 +48,10 @@ EXPORT_COLUMNS = ['country', 'province', 'lon', 'lat', 'variety', 'season_type',
 
 class CoordinatesResponse(BaseModel):
     coordinates: list[dict] = Field(default=[], description="Array of {lat, lon} objects")
+    total: int = Field(0, description="Total matching coordinate pairs")
+    pages: int = Field(0, description="Total number of pages")
+    current_page: int = Field(1, description="Current page number")
+    per_page: int = Field(100, description="Points per page")
 
 
 class ClusterItem(BaseModel):
@@ -58,6 +63,9 @@ class ClusterItem(BaseModel):
 class ClustersResponse(BaseModel):
     clusters: list[ClusterItem] = Field(default=[], description="Spatially aggregated clusters")
     total: int = Field(0, description="Total points represented")
+    pages: int = Field(0, description="Total number of cluster pages")
+    current_page: int = Field(1, description="Current page number")
+    per_page: int = Field(100, description="Clusters per page")
 
 
 class FiltersResponse(BaseModel):
@@ -65,27 +73,26 @@ class FiltersResponse(BaseModel):
     province: list[str] = Field(default=[], description="Distinct province values")
     variety: list[str] = Field(default=[], description="Distinct variety values")
     season_type: list[str] = Field(default=[], description="Distinct season_type values")
+    totals: dict[str, int] = Field(default={}, description="Distinct value count per column")
+    pages: dict[str, int] = Field(default={}, description="Total pages per column")
+    current_page: int = Field(1, description="Current page number")
+    per_page: int = Field(100, description="Distinct values per column per page")
 
 
 MAX_PER_PAGE = 500
 
 
-def _clamp_per_page(value: int) -> int:
-    return max(1, min(value, MAX_PER_PAGE))
-
-
 @public_api.get('',
          responses={200: PlantingRecommendationResponse, 401: Unauthorized},
          summary="Query planting recommendation data",
-         description="Return paginated planting recommendation records with optional filters (country, province, variety, season_type, date range, coordinates).",
+         description="Return paginated planting recommendation records with optional filters (country, province, variety, season_type, date range, coordinates). Defaults to 100 records per page, capped at 500.",
          security=[])
 @limiter.limit(RATE_LIMIT_DATA)
 def get_data(query: PlantingDataFilter):
-    page = max(1, int(request.args.get('page', default=1, type=int)))
-    per_page = _clamp_per_page(int(request.args.get('per_page', default=50, type=int)))
+    pagination = get_pagination()
 
     try:
-        paginated_data = repo.get_paginated_data(query, page, per_page)
+        paginated_data = repo.get_paginated_data(query, pagination.page, pagination.per_page)
 
         records = [PlantingRecommendationRecord(
             id=item.id,
@@ -120,14 +127,23 @@ FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type']
 @protected_api.get('/filters',
          responses={200: FiltersResponse, 401: Unauthorized},
          summary="Get distinct filter values",
-         description="Return distinct values for country, province, variety, and season_type columns for use in filter dropdowns.")
+         description="Return distinct values for country, province, variety, and season_type columns for use in filter dropdowns. Each column is paginated independently; `totals` reports the distinct count per column so a client can keep paging until it has them all.")
 @require_auth
 @limiter.limit(RATE_LIMIT_DATA)
 @api_cache('filters', ttl=300)
 def get_filter_options():
+    pagination = get_pagination()
     try:
-        values = repo.get_distinct_values(FILTER_COLUMNS)
-        return values, 200
+        values = repo.get_distinct_values(
+            FILTER_COLUMNS, limit=pagination.per_page, offset=pagination.offset
+        )
+        totals = repo.count_distinct_values(FILTER_COLUMNS)
+        pages = {
+            col: ((totals.get(col, 0) + pagination.per_page - 1) // pagination.per_page)
+            for col in FILTER_COLUMNS
+        }
+        return {**values, 'totals': totals, 'pages': pages,
+                'current_page': pagination.page, 'per_page': pagination.per_page}, 200
     except Exception as e:
         logger.error(f"Error fetching filter options: {e}")
         return {'error': str(e)}, 500
@@ -136,14 +152,19 @@ def get_filter_options():
 @protected_api.get('/coordinates',
          responses={200: CoordinatesResponse, 401: Unauthorized},
          summary="Get map coordinates for data points",
-         description="Return an array of {lat, lon} objects matching the specified filters.")
+         description="Return an array of {lat, lon} objects matching the specified filters, paginated server-side. Defaults to 100 points per page, capped at 500.")
 @require_auth
 @limiter.limit(RATE_LIMIT_DATA)
 @api_cache('coordinates', ttl=120)
 def get_coordinates(query: PlantingDataFilter):
+    pagination = get_pagination()
     try:
-        points = repo.get_coordinates(query)
-        return {"coordinates": [{"lat": lat, "lon": lon} for lat, lon in points]}, 200
+        total = repo.count_coordinates(query)
+        points = repo.get_coordinates(query, limit=pagination.per_page, offset=pagination.offset)
+        return {
+            "coordinates": [{"lat": lat, "lon": lon} for lat, lon in points],
+            **pagination.envelope(total),
+        }, 200
     except Exception as e:
         logger.error(f"Error retrieving coordinates: {e}")
         return {'error': str(e)}, 500
@@ -152,11 +173,12 @@ def get_coordinates(query: PlantingDataFilter):
 @protected_api.get('/clusters',
          responses={200: ClustersResponse, 401: Unauthorized},
          summary="Get spatially clustered data points",
-         description="Aggregate data points into spatial clusters at the given zoom level for map rendering.")
+         description="Aggregate data points into spatial clusters at the given zoom level for map rendering, paginated server-side. Densest clusters are returned first.")
 @require_auth
 @limiter.limit(RATE_LIMIT_DATA)
 @api_cache('clusters', ttl=120)
 def get_clusters(query: PlantingDataFilter):
+    pagination = get_pagination()
     try:
         zoom = int(request.args.get('zoom', 5))
         ne_lat = float(request.args.get('ne_lat', 90))
@@ -164,9 +186,14 @@ def get_clusters(query: PlantingDataFilter):
         sw_lat = float(request.args.get('sw_lat', -90))
         sw_lng = float(request.args.get('sw_lng', -180))
 
-        clusters = repo.get_clusters(query, zoom, ne_lat, ne_lng, sw_lat, sw_lng)
+        clusters = repo.get_clusters(query, zoom, ne_lat, ne_lng, sw_lat, sw_lng,
+                                     limit=pagination.per_page, offset=pagination.offset)
+        # `total` is points represented, not cluster count, so it keeps its
+        # existing meaning; the cluster page count describes this page only.
         total = sum(c['count'] for c in clusters)
-        return {"clusters": clusters, "total": total}, 200
+        return {"clusters": clusters, "total": total,
+                "current_page": pagination.page, "per_page": pagination.per_page,
+                "pages": max(1, (total + pagination.per_page - 1) // pagination.per_page)}, 200
     except Exception as e:
         logger.error(f"Error fetching clusters: {e}")
         return {'error': str(e)}, 500
@@ -179,14 +206,15 @@ def _row_to_dict(row):
 @protected_api.get('/export',
          responses={200: {"content": {"text/csv": {}, "application/json": {}}}, 401: Unauthorized},
          summary="Export filtered data",
-         description="Download filtered planting recommendation data as CSV (default) or JSON.")
+         description="Download filtered planting recommendation data as CSV (default) or JSON. Paginated server-side like the other data endpoints: 100 rows by default, 500 maximum. To export a full dataset, request successive pages and concatenate them.")
 @require_auth
 @limiter.limit(RATE_LIMIT_DATA)
 def export_data(query: PlantingDataFilter):
     fmt = request.args.get('format', 'csv')
+    pagination = get_pagination()
 
     try:
-        rows = repo.get_filtered_data(query)
+        rows = repo.get_filtered_data(query).limit(pagination.per_page).offset(pagination.offset)
 
         if fmt == 'json':
             def generate_json():
