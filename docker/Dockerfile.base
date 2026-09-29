@@ -48,14 +48,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Install curl, run the official installer pinned to POETRY_VERSION, remove
-# curl again, and verify the exact version, all in one layer.
+# curl again, verify the exact version and resolved path, and symlink into
+# /usr/local/bin (which is on the default PATH) so `poetry` resolves even in an
+# image that overwrites PATH without appending to it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && curl -fsSL https://install.python-poetry.org | python3 - --version "${POETRY_VERSION}" \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/* \
+    && ln -sf "${POETRY_HOME}/bin/poetry" /usr/local/bin/poetry \
     && installed="$(poetry --version)" \
     && case "${installed}" in \
          *"version ${POETRY_VERSION})"*) ;; \
          *) echo "expected poetry ${POETRY_VERSION}, got: ${installed}" >&2; exit 1 ;; \
-       esac
+       esac \
+    && echo "poetry: ${installed}" \
+    && echo "poetry path: $(command -v poetry)" \
+    && echo "poetry home: ${POETRY_HOME}" \
+    && echo "PATH: ${PATH}"
