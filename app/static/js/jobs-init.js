@@ -41,6 +41,26 @@ source.addEventListener('message', function (e) {
   highlightJob();
 });
 
+// Rows/sec and a finish estimate, from the job's original start time. Only
+// meaningful while running: the clock restarts whenever a job resumes.
+function rateInfo(j) {
+  if (j.status !== 'processing') return '';
+  var total = j.total || 0, current = j.current || 0, started = j.started_at || 0;
+  if (!started || !total || !current) return '';
+  var elapsed = (Date.now() / 1000) - started;
+  if (elapsed < 5) return '';            // too short to be meaningful
+  var perSec = current / elapsed;
+  if (!(perSec > 0)) return '';
+  var remainSec = Math.round((total - current) / perSec);
+  if (remainSec < 0) return '';
+  function fmt(s) {
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    return (s / 3600).toFixed(1) + 'h';
+  }
+  return perSec.toLocaleString(undefined, {maximumFractionDigits: 0}) + ' rows/s, ~' + fmt(remainSec) + ' left';
+}
+
 function filtered(jobs) {
   return jobs.filter(function (j) {
     if (activeFilter !== 'all' && j.status !== activeFilter) return false;
@@ -83,6 +103,7 @@ function renderJobs(jobs) {
     + '<span><span class="badge bg-success rounded-pill">' + (counts.completed || 0) + '</span> completed</span>'
     + '<span><span class="badge bg-primary rounded-pill">' + (counts.processing || 0) + '</span> processing</span>'
     + '<span><span class="badge bg-danger rounded-pill">' + (counts.error || 0) + '</span> failed</span>'
+    + '<span><span class="badge bg-warning rounded-pill">' + (counts.stale || 0) + '</span> stalled</span>'
     + '<span class="text-muted ms-auto">' + visible.length + ' / ' + jobs.length + ' shown</span>'
     + '</div>';
 
@@ -102,7 +123,9 @@ function renderJobs(jobs) {
       + '<td><span class="badge rounded-pill bg-' + badge.color + '">' + badge.label + '</span></td>'
       + '<td class="text-nowrap small text-muted">' + fmtCur + ' / ' + fmtTot + '</td>'
       + '<td style="min-width:140px;"><div class="progress" style="height:6px;"><div class="progress-bar' + anim + '" role="progressbar" style="width:' + barW + '%;background-color:' + badge.bar + '"></div></div></td>'
-      + '<td class="small text-muted">' + escHtml(j.message || '') + '</td>'
+      + '<td class="small text-muted">' + escHtml(j.message || '')
+      + (rateInfo(j) ? '<div class="text-muted" style="font-size:.75rem">' + escHtml(rateInfo(j)) + '</div>' : '')
+      + '</td>'
       + '<td class="small text-muted text-nowrap">' + time + '</td>'
       + ((j.status === 'error' || j.status === 'stale') ? '<td><button class="btn btn-outline-' + (j.status === 'stale' ? 'warning' : 'danger') + ' btn-sm retry-btn" data-file="' + escHtml(j.file) + '">Retry</button></td>' : '<td></td>')
       + '</tr>';
