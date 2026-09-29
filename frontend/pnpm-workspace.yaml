@@ -1,0 +1,5 @@
+# pnpm 12 reads build-script approvals from here, not package.json. esbuild
+# needs its postinstall to place the platform-native binary that Vite shells
+# out to; without this, `pnpm install` fails with ERR_PNPM_IGNORED_BUILDS.
+allowBuilds:
+  esbuild: true
