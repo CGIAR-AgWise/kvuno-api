@@ -286,6 +286,7 @@ There is no Postgres volume to back up here — the database is external (see §
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Uploads accepted but never processed | `HOUSEKEEPING_ENABLED` unset/false and no worker | Set `HOUSEKEEPING_ENABLED=true` and start the `worker` service |
 | 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
+| `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
 | Port 5000 already in use | Another service on port 5000 | Stop it, or remap with `ports: - "5001:5000"` |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |
 | `manifest unknown` on pull | Tag not built yet, or wrong `TAG` | Tags come from the Docker Build workflow; check what exists under the `CGIAR-AgWise` org |
