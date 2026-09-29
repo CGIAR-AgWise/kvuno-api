@@ -286,57 +286,95 @@ def register_app_routes(app):
     @app.route('/ui/jobs/events', methods=['GET'])
     @require_auth
     def ui_jobs_events():
+        # A comment line, ignored by EventSource but seen by reverse proxies.
+        # Proxies commonly drop an idle connection, and a job list can be silent
+        # for minutes, so this is what keeps the stream alive.
+        KEEPALIVE = ': keepalive\n\n'
+        POLL_SECONDS = 15
+
+        def snapshot():
+            raw, counts = _format_jobs(_load_jobs())
+            return f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+
         def generate():
             # Full snapshot on connect, then one message per changed job.
             # The pubsub payload IS the job record, so a client no longer
             # re-reads the whole keyspace on every progress write.
             from app.services.progress_store import get_job
-            raw, counts = _format_jobs(_load_jobs())
-            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+            yield snapshot()
 
-            use_redis = True
-            r = None
             pubsub = None
+            r = None
             try:
                 from redis import Redis
+                # No socket_timeout here. A subscription is supposed to block
+                # indefinitely; a 2s read timeout made the connection raise
+                # TimeoutError whenever a job list was simply quiet. The wait is
+                # bounded by get_message() instead.
                 r = Redis.from_url(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-                                   socket_connect_timeout=2, socket_timeout=2)
+                                   socket_connect_timeout=2, socket_timeout=None,
+                                   health_check_interval=30)
                 r.ping()
-                pubsub = r.pubsub()
+                pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe('jobs:updates')
             except Exception:
-                use_redis = False
+                pubsub = None
 
-            if use_redis and pubsub:
-                try:
-                    for message in pubsub.listen():
-                        if message['type'] != 'message':
-                            continue
-                        try:
-                            changed = json.loads(message['data'])
-                        except (ValueError, TypeError):
-                            changed = None
-                        if not changed or 'file' not in changed:
-                            continue
-                        # Prefer the published record, but re-read if it looks
-                        # stale now — the message may have been in flight when
-                        # a job crossed the staleness threshold.
-                        job = get_job(changed['file']) or changed
-                        yield f"data: {json.dumps({'job': job})}\n\n"
-                except GeneratorExit:
-                    pass
-                finally:
-                    if pubsub:
-                        pubsub.unsubscribe()
-                        pubsub.close()
-                    if r:
-                        r.close()
-            else:
-                # No Redis: fall back to polling. The job list is small, and
-                # this path only runs when pubsub is unavailable.
+            def polling():
+                # Used when pubsub is unavailable or the connection drops. The
+                # job list is small, so polling is acceptable as a fallback.
                 while True:
                     time.sleep(3)
-                    raw, counts = _format_jobs(_load_jobs())
-                    yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                    yield snapshot()
+
+            if pubsub is not None:
+                last_sent = time.time()
+                try:
+                    while True:
+                        # get_message(timeout=...) returns None on idle rather
+                        # than blocking the socket, so keepalives and error
+                        # handling stay under our control.
+                        message = pubsub.get_message(timeout=1.0)
+                        if message is not None and message.get('type') == 'message':
+                            try:
+                                changed = json.loads(message['data'])
+                            except (ValueError, TypeError):
+                                changed = None
+                            if changed and 'file' in changed:
+                                # Prefer the stored record: the published message
+                                # may have been in flight when a job crossed the
+                                # staleness threshold.
+                                job = get_job(changed['file']) or changed
+                                yield f"data: {json.dumps({'job': job})}\n\n"
+                                last_sent = time.time()
+                        elif time.time() - last_sent >= POLL_SECONDS:
+                            yield KEEPALIVE
+                            last_sent = time.time()
+                except GeneratorExit:
+                    raise
+                except Exception:
+                    # A dropped or erroring subscription must not 500 the
+                    # response; degrade to polling instead.
+                    yield snapshot()
+                    try:
+                        yield from polling()
+                    except GeneratorExit:
+                        raise
+                finally:
+                    try:
+                        pubsub.unsubscribe()
+                        pubsub.close()
+                    except Exception:
+                        pass
+                    if r is not None:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+            else:
+                try:
+                    yield from polling()
+                except GeneratorExit:
+                    raise
 
         return Response(stream_with_context(generate()), mimetype='text/event-stream')
