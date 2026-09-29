@@ -1,0 +1,53 @@
+/* A thin layer over Bootstrap 5. The old Jinja UI used a hand-rolled
+   "material"-ish look; these tokens keep the new app visually familiar
+   without carrying over the old stylesheets wholesale. */
+:root {
+  --kvuno-bg: #f6f7f9;
+  --kvuno-border: #e3e6ea;
+}
+
+body {
+  background: var(--kvuno-bg);
+}
+
+.kvuno-card {
+  background: #fff;
+  border: 1px solid var(--kvuno-border);
+  border-radius: 0.5rem;
+}
+
+.kvuno-toast-stack {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1080;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 24rem;
+}
+
+.kvuno-toast {
+  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.12);
+  margin: 0;
+}
+
+.kvuno-map {
+  height: calc(100vh - 12rem);
+  min-height: 24rem;
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+
+.kvuno-status {
+  font-variant-numeric: tabular-nums;
+}
+
+.kvuno-truncate {
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: bottom;
+}
