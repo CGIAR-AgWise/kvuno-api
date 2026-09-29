@@ -17,10 +17,17 @@ RUN --mount=type=cache,target=/root/.cache/pypoetry \
 
 FROM python:3.14-slim AS runtime
 
+# Set by CI from the git tag (or branch name for dev builds); see
+# .github/workflows/docker-build-reusable.yml. Surfaces in /health and the
+# OpenAPI Info block via app/config.py.
+ARG APP_VERSION=0.0.0-dev
+
+ENV APP_VERSION=${APP_VERSION}
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH" \
-    HOME=/app
+    HOME=/app \
+    SERVER_PORT=80
 
 # Match these to your host user (id -u / id -g) so bind-mounted files keep
 # correct ownership. Defaults are the common single-user Linux/macOS 1000.
@@ -41,7 +48,7 @@ RUN chmod +x /app/docker/entrypoint.sh
 
 USER app
 
-EXPOSE 5000
+EXPOSE 80
 
 # Applies pending Alembic migrations, then execs the CMD below. Set
 # RUN_MIGRATIONS=false to skip.
