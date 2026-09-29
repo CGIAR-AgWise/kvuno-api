@@ -1,88 +1,74 @@
 name: Docker Build (branches)
 
-# Branch builds. Releases are handled by docker-release.yml.
+# Branch builds, triggered by UnitTests completing — never on a raw push.
 #
 #   develop -> api (dev server) + worker, tagged :develop
 #   main    -> api (gunicorn production image) ONLY
 #
-# Triggered by `push`, not by `workflow_run` of UnitTests. A workflow_run that
-# fires from a forked pull request gets a read-only GITHUB_TOKEN, and the push
-# then fails with "denied: permission_denied: read_package". A push to these
-# branches cannot come from a fork, so the token keeps packages: write.
-# Trade-off: images build on the push itself, not after UnitTests reports green.
-# main is protected, so it only advances through a reviewed PR anyway.
+# Because the trigger is workflow_run, images are only ever built from a commit
+# whose UnitTests run succeeded. There is no gate job to wait on: the workflow
+# fires after UnitTests has already finished, and each job below re-checks
+# `conclusion == 'success'` before running.
+#
+# ⚠️ In a workflow_run context, `github.ref` / `github.ref_name` / `github.sha`
+# describe the DEFAULT branch, not the branch that ran the checks. Every
+# expression below therefore uses `github.event.workflow_run.*`. Using `github.ref`
+# here silently means the develop jobs never match, and would pass
+# `refs/heads/main` to the tagger and label a develop build `production`.
+#
+# ⚠️ A workflow_run fired from a pull request in a FORK gets a read-only
+# GITHUB_TOKEN, and the push then fails with
+# "denied: permission_denied: read_package". Same-repo branches are unaffected.
+# If you push to develop/main from a fork, that is why nothing publishes.
 
 on:
   workflow_run:
     workflows: ["UnitTests"]
     types: [completed]
 
-
 permissions:
+  # Declared once for the whole workflow. Every scope not listed here is set
+  # to `none`.
   contents: read
   packages: write
 
 concurrency:
-  group: kvuno-${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  group: kvuno-${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
 jobs:
-  # UnitTests runs on the same push, so the two workflows start together and
-  # the build has to wait rather than depend. This blocks until UnitTests
-  # reports a conclusion for this exact commit, then gates the image jobs.
-  gate:
-    name: Wait for UnitTests
-    if: >-
-      github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    outputs:
-      passed: ${{ steps.gate.outputs.passed }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - id: gate
-        uses: ./.github/actions/wait-for-checks
-        with:
-          workflow: UnitTests
-          timeout: '1800'
-
-      - name: Fail if checks did not pass
-        if: steps.gate.outputs.passed != 'true'
-        run: |
-          echo "::error::UnitTests did not pass for ${{ github.sha }} — refusing to build images"
-          echo "::error::conclusion: ${{ steps.gate.outputs.conclusion }}"
-          echo "::error::run: ${{ steps.gate.outputs.url }}"
-          exit 1
-
   build-api-dev:
-    needs: [ gate ]
-    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: ${{ github.ref }}
-      branch_name: ${{ github.ref_name }}
-      commit_sha: ${{ github.sha }}
+      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      commit_sha: ${{ github.event.workflow_run.head_sha }}
 
   build-worker-dev:
-    needs: [ gate ]
-    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/develop'
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'develop'
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.worker
       image_name: ghcr.io/cgiar-agwise/kvuno-worker
-      branch_ref: ${{ github.ref }}
-      branch_name: ${{ github.ref_name }}
-      commit_sha: ${{ github.sha }}
+      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      commit_sha: ${{ github.event.workflow_run.head_sha }}
 
   build-api-prod:
-    needs: [ gate ]
-    if: needs.gate.outputs.passed == 'true' && github.ref == 'refs/heads/main'
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'main'
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.prod.dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: ${{ github.ref }}
-      branch_name: ${{ github.ref_name }}
-      commit_sha: ${{ github.sha }}
+      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      commit_sha: ${{ github.event.workflow_run.head_sha }}
