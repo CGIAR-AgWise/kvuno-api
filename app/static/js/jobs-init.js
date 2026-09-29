@@ -36,7 +36,7 @@ function filtered(jobs) {
 }
 
 function countByStatus(jobs) {
-  var c = { completed: 0, processing: 0, error: 0, unknown: 0 };
+  var c = { completed: 0, processing: 0, error: 0, stale: 0, unknown: 0 };
   jobs.forEach(function (j) { c[j.status] = (c[j.status] || 0) + 1; });
   return c;
 }
@@ -45,6 +45,8 @@ const STATUS = {
   processing: { color: 'primary',  bar: '#0d6efd', label: 'Processing' },
   completed:  { color: 'success',  bar: '#198754', label: 'Completed' },
   error:      { color: 'danger',   bar: '#dc3545', label: 'Failed' },
+  // Worker stopped reporting (crash, OOM kill, restart). Not running.
+  stale:      { color: 'warning',  bar: '#fd7e14', label: 'Stalled' },
   unknown:    { color: 'secondary', bar: '#6c757d', label: 'Pending' },
 };
 
@@ -85,7 +87,7 @@ function renderJobs(jobs) {
       + '<td style="min-width:140px;"><div class="progress" style="height:6px;"><div class="progress-bar' + anim + '" role="progressbar" style="width:' + barW + '%;background-color:' + badge.bar + '"></div></div></td>'
       + '<td class="small text-muted">' + escHtml(j.message || '') + '</td>'
       + '<td class="small text-muted text-nowrap">' + time + '</td>'
-      + (j.status === 'error' ? '<td><button class="btn btn-outline-danger btn-sm retry-btn" data-file="' + escHtml(j.file) + '">Retry</button></td>' : '<td></td>')
+      + ((j.status === 'error' || j.status === 'stale') ? '<td><button class="btn btn-outline-' + (j.status === 'stale' ? 'warning' : 'danger') + ' btn-sm retry-btn" data-file="' + escHtml(j.file) + '">Retry</button></td>' : '<td></td>')
       + '</tr>';
   }).join('');
 
@@ -146,7 +148,7 @@ function showJobDetail(file) {
         + '<dt class="col-sm-4">Last updated</dt><dd class="col-sm-8">' + time + '</dd>'
         + '</dl>';
       body.innerHTML = html;
-      if (data.status === 'error') {
+      if (data.status === 'error' || data.status === 'stale') {
         var btn = document.getElementById('detail-retry-btn');
         btn.classList.remove('d-none');
         btn.onclick = function () {

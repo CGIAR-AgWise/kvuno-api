@@ -51,7 +51,7 @@ def _load_jobs():
 
 
 def _format_jobs(raw):
-    counts = {'completed': 0, 'processing': 0, 'error': 0, 'unknown': 0}
+    counts = {'completed': 0, 'processing': 0, 'error': 0, 'stale': 0, 'unknown': 0}
     for j in raw:
         st = j.get('status', 'unknown')
         counts[st] = counts.get(st, 0) + 1

@@ -3,12 +3,43 @@ Progress storage with Redis primary and DB fallback.
 
 Redis keys: ``job:{stem}`` → JSON with status/current/total/message/mtime
 Pub/sub channel: ``jobs:updates`` → stem published on each change
+
+Stuck jobs
+----------
+A worker that dies (OOM-killed, container restarted, unhandled crash) never
+writes a terminal status, so its job entry would sit at ``processing``
+forever. Celery's ``autoretry_for=(Exception,)`` makes this worse: the task
+is retried silently up to 10 times, and if every attempt dies the entry is
+just abandoned.
+
+Two guards, since neither alone is sufficient:
+
+- **TTL on the key** so abandoned entries eventually expire instead of
+  accumulating in Redis indefinitely.
+- **Staleness detection on read** (``mark_stale``), using the ``mtime`` that
+  every write already records. A job still claiming to be ``processing``
+  whose mtime is older than ``JOB_STALE_AFTER_SECONDS`` is reported as
+  ``stale`` — it cannot be genuinely in progress if nothing has written to it
+  in that long. This is the part that actually fixes the stuck UI, since the
+  TTL alone would just make jobs vanish.
 """
 import json
 import os
 import time
 
 PROGRESS_CHANNEL = 'jobs:updates'
+
+# How long a job may go without reporting before we call it abandoned. Long
+# enough to cover a slow batch insert, short enough that a dead worker is
+# noticed while someone is still looking at the page.
+STALE_AFTER_SECONDS = int(os.getenv('JOB_STALE_AFTER_SECONDS', '1800'))
+
+# Keys expire on their own so a crashed run cannot leak entries forever.
+# Well beyond any legitimate job, since jobs are also listed in the UI.
+KEY_TTL_SECONDS = int(os.getenv('JOB_PROGRESS_TTL_SECONDS', str(7 * 24 * 3600)))
+
+# Statuses that mean "a worker is or should be working on this".
+ACTIVE_STATUSES = {'processing'}
 
 
 def _redis_client():
@@ -20,6 +51,31 @@ def _redis_client():
         return None
 
 
+def mark_stale(job: dict, now: float | None = None) -> dict:
+    """Downgrade an abandoned `processing` job to `stale`.
+
+    Returns the job, modified in place. Terminal statuses are left alone —
+    a completed job from last week is history, not a stuck job.
+    """
+    now = now if now is not None else time.time()
+    if job.get('status') not in ACTIVE_STATUSES:
+        return job
+
+    last_seen = job.get('mtime') or 0
+    age = now - last_seen
+    if age <= STALE_AFTER_SECONDS:
+        return job
+
+    job['status'] = 'stale'
+    job['stale_since'] = last_seen
+    job['age_seconds'] = int(age)
+    job['message'] = (
+        f"No progress for {int(age // 60)} min — the worker stopped reporting. "
+        f"This job did not finish; re-run it."
+    )
+    return job
+
+
 def save_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
     stem = os.path.basename(file_path)
     payload = {"status": status, "current": current, "total": total, "message": message, "mtime": time.time()}
@@ -27,7 +83,11 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
     r = _redis_client()
     if r is not None:
         try:
-            r.set(f"job:{stem}", json.dumps(payload))
+            key = f"job:{stem}"
+            r.set(key, json.dumps(payload))
+            # Refresh the expiry on every write, so an active job never
+            # disappears mid-run.
+            r.expire(key, KEY_TTL_SECONDS)
             r.publish(PROGRESS_CHANNEL, stem)
             return
         except Exception:
@@ -46,13 +106,13 @@ def load_all_jobs():
                 if data:
                     job = json.loads(data)
                     job['file'] = key.decode() if isinstance(key, bytes) else key.split(':', 1)[1]
-                    jobs.append(job)
+                    jobs.append(mark_stale(job))
             jobs.sort(key=lambda j: j.get('mtime', 0), reverse=True)
             return jobs
         except Exception:
             pass
 
-    return _db_load_all()
+    return [mark_stale(j) for j in _db_load_all()]
 
 
 def delete_job(stem: str):
