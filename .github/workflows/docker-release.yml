@@ -2,10 +2,8 @@ name: Docker Release
 
 # Release builds, triggered by any tag push.
 #
-# This is a separate workflow from docker-build.yml on purpose: UnitTests only
-# runs on pull_request and workflow_dispatch, so its `workflow_run` trigger can
-# never fire for a tag push. A `push: tags` trigger is required, and keeping it
-# in its own file means neither workflow needs compound branching.
+# Separate from docker-build.yml so neither needs compound branching: branch
+# builds key off refs/heads, release builds off refs/tags.
 #
 # Produces a complete deployable pair:
 #   kvuno-api    <- docker/Dockerfile.prod.dockerfile
@@ -22,6 +20,15 @@ on:
     tags:
       - '*'
 
+permissions:
+  # Declared once for the whole workflow. Every scope not listed here is set
+  # to `none`, so the gate needs actions: read and the image jobs need
+  # packages: write — they are in the same block because this repo is small
+  # and all of the executing code is ours.
+  contents: read
+  actions: read
+  packages: write
+
 jobs:
   # A tag is usually cut from an already-tested commit, but UnitTests also runs
   # on the tag push itself. Gate on its conclusion so a release never
@@ -29,14 +36,11 @@ jobs:
   gate:
     name: Wait for UnitTests
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      - uses: actions/checkout@v7
-
+      # No checkout: the gate only queries the GitHub API via `gh`, which is
+      # preinstalled on the runner and authenticates from ${{ github.token }}.
       - id: gate
         uses: ./.github/actions/wait-for-checks
         with:
@@ -55,9 +59,6 @@ jobs:
     needs: [ gate ]
     if: needs.gate.outputs.passed == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
-    permissions:
-      contents: read
-      packages: write
     with:
       dockerfile: docker/Dockerfile.prod.dockerfile
       image_name: ghcr.io/cgiar-agwise/kvuno-api
@@ -69,9 +70,6 @@ jobs:
     needs: [ gate ]
     if: needs.gate.outputs.passed == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
-    permissions:
-      contents: read
-      packages: write
     with:
       dockerfile: docker/Dockerfile.worker
       image_name: ghcr.io/cgiar-agwise/kvuno-worker
