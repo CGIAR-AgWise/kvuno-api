@@ -61,6 +61,36 @@ def _format_jobs(raw):
     return raw, counts
 
 
+def _describe_duplicate(file_path: str) -> dict | None:
+    """Describe a previously-ingested file with the same content, if any.
+
+    Returns None, or {status, original_filename, processed_at, offset} where
+    status is 'processed' (already fully ingested, re-running is a no-op) or
+    'partial' (interrupted, re-running resumes from that row).
+    """
+    try:
+        from app.utils import calculate_file_checksum
+        from app.repo.file_import import FileImportRepo
+
+        checksum = calculate_file_checksum(file_path, logger)
+        if not checksum:
+            return None
+        existing = FileImportRepo().get_by_checksum(checksum)
+        if existing is None:
+            return None
+        return {
+            'status': 'processed' if existing.offset is None else 'partial',
+            'original_filename': existing.original_filename or existing.file_name,
+            'processed_at': existing.processed_at.isoformat() if existing.processed_at else None,
+            'offset': existing.offset,
+        }
+    except Exception:
+        # A failed lookup must not block the upload; the worker still
+        # guards, so the worst case is the old behaviour.
+        logger.warning('Duplicate check failed', exc_info=True)
+        return None
+
+
 def register_app_routes(app):
     """
     Register routes for the Flask application.
@@ -205,7 +235,15 @@ def register_app_routes(app):
                     os.remove(p)
             return jsonify(error=f"Failed to read file: {e}"), 400
 
-        return jsonify(file=os.path.basename(stored), **preview)
+        # Dedupe check. The worker already skips a file whose checksum is
+        # fully processed, but that happens *after* the job is enqueued, so the
+        # user was told "Processing started" and then nothing happened. Checking
+        # here — the file is on disk and already being read for the preview —
+        # lets the UI say so up front and skip the work.
+        duplicate = _describe_duplicate(stored)
+
+        return jsonify(file=os.path.basename(stored), duplicate=duplicate, **preview)
+
 
     @app.route('/ui/process', methods=['POST'])
     @require_auth
