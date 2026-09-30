@@ -411,13 +411,6 @@ export function fetchCoordinatesBulk(
   )
 }
 
-export const fetchCoordinates = (params: URLSearchParams, signal?: AbortSignal) =>
-  cached(
-    'coords:' + params.toString(),
-    () => fetchAllPages<LatLon>('/api/v1/planting-data/coordinates', 'coordinates', params, signal),
-    AGGREGATE_TTL_MS,
-  )
-
 export const fetchClusters = (params: URLSearchParams, signal?: AbortSignal) =>
   cached(
     'clusters:' + params.toString(),

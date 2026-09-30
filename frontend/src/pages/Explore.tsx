@@ -6,13 +6,12 @@ import 'leaflet.markercluster/dist/MarkerCluster.css'
 import 'leaflet.heat'
 import {
   fetchClusters,
-  fetchCoordinates,
   fetchCoordinatesBulk,
   fetchFilters,
   fetchPlantingRecords,
   MAX_PER_PAGE,
 } from '../api'
-import type { Cluster, FilterColumns, LatLon, PlantingRecord } from '../api'
+import type { Cluster, FilterColumns, PlantingRecord } from '../api'
 import Pagination from '../components/Pagination'
 import { useToast } from '../context/ToastContext'
 import { invalidateAll } from '../lib/cache'
@@ -527,17 +526,22 @@ function MapView({
     for (const [key, value] of Object.entries(filters)) if (value) query.set(key, value)
 
     if (mode === 'heatmap') {
-      void fetchCoordinates(query, controller.signal)
+      // The bulk sample, NOT /coordinates paged at 500 rows per request. That
+      // walk was still wired to the heatmap and cost 4,566 requests on this
+      // dataset, so the layer exhausted the rate limit long before it rendered
+      // (HTTP 429 on page 1 of thousands). A random sample of the filtered set
+      // is the right input for a heatmap anyway — it encodes density, and every
+      // point carries weight 1 regardless of how many rows matched.
+      void fetchCoordinatesBulk(query, controller.signal)
         .then((res) => {
-          if (!res.rows.length) {
+          if (!res.lats.length) {
             toast.push('No coordinate data to show.', 'warning')
             return
           }
-          const points: [number, number, number][] = (res.rows as LatLon[]).map((c) => [
-            c.lat,
-            c.lon,
-            1,
-          ])
+          const points: [number, number, number][] = []
+          for (let i = 0; i < res.lats.length; i += 1) {
+            points.push([res.lats[i], res.lons[i], 1])
+          }
           const layer = L.heatLayer(points, {
             radius: 20,
             blur: 15,
@@ -551,12 +555,12 @@ function MapView({
           )
           if (res.truncated) {
             toast.push(
-              'Showing ' +
-                res.rows.length.toLocaleString() +
-                ' of ' +
+              'Heatmap built from a random sample of ' +
+                res.lats.length.toLocaleString() +
+                ' points from ' +
                 res.total.toLocaleString() +
-                ' points.',
-              'warning',
+                ' matches.',
+              'info',
             )
           }
         })
