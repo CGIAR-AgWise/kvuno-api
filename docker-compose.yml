@@ -60,12 +60,36 @@ services:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
       # host 5000 -> container 80 (the app's default port)
-      - "5000:80"
+      - "127.0.0.1:5000:80"
     # The app listens on port 80 but the container runs as the non-root `app`
     # user, and ports below 1024 are privileged on Linux. Without this the
     # process dies with Permission denied at bind time.
     cap_add:
       - NET_BIND_SERVICE
+    networks:
+      - dokploy-network
+      - internal
+
+  # React SPA + nginx. Serves the built bundle and reverse-proxies /api and
+  # the remaining /ui/* endpoints to the api service, so the browser sees a
+  # single origin and no CORS preflight is needed in production.
+  web:
+    container_name: kvuno-web
+    hostname: kvuno-web
+    image: ghcr.io/cgiar-agwise/kvuno-web:${TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:80"
+    # Wait for the API to actually serve, not merely to start: /health only
+    # passes once the DB is reachable, and the API applies migrations on boot.
+    # nginx re-resolves anyway, but starting first just produces a burst of
+    # 502s on the first page load.
+    depends_on:
+      api:
+        condition: service_healthy
     networks:
       - dokploy-network
       - internal
