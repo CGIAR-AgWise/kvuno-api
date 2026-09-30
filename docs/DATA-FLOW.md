@@ -6,6 +6,23 @@ This document describes the two main data flows in KVuno API: **ingestion** (RDS
 
 ---
 
+## 0. Request Path — Browser to API
+
+The frontend is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with
+Vite and pnpm and served by **nginx**; Flask renders no HTML. nginx reverse-proxies
+`/api`, `/ui`, and `/health` to the `api` service, so the browser talks to one origin
+and the bearer token never crosses one. Everything below is what happens *after* that
+proxy hop — the flows are otherwise unchanged by the move to React.
+
+| Layer | Value |
+|---|---|
+| SPA | `frontend/` (React 18, react-router 6, TypeScript), routes `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Edge | nginx — serves the bundle, reverse-proxies `/api`, `/ui`, `/health` to `api:80` |
+| API | Flask — JSON only; SSE through `/ui/jobs/events` with buffering disabled |
+| Async | Celery worker, same as §1 |
+
+---
+
 ## 1. Ingestion Flow — RDS File Processing
 
 RDS/Parquet files containing crop planting data are either uploaded through the UI/API (into `static/data/`, or `HOUSEKEEPING_DATA_DIR` if set) or downloaded from remote sources (`REMOTE_RDS_URLS`). They are then processed either by a Celery task (`worker` service) or by the standalone `housekeeping.py` CLI.
@@ -307,6 +324,7 @@ Index: `idx_user_tokens_token`.
 | API | `app/api/user.py` | Register, login, logout, token management |
 | Auth | `app/auth.py` | `require_auth` — Bearer header or `token` cookie |
 | Cache | `app/cache.py` | `@api_cache` / `invalidate_cache` (Redis, no-op if unavailable) |
-| Routes | `app/routes/main.py` | `/` redirect, `/health`, all `/ui/*` pages, resumable upload endpoints, SSE stream |
+| Routes | `app/routes/main.py` | `/` redirect (`SPA_ROOT_URL`), `/health`, the JSON `/ui/*` endpoints, resumable upload, SSE stream |
+| Frontend | `frontend/` | React + TypeScript SPA (Vite/pnpm), served by nginx; the UI is not in this repo's Python layer |
 | App | `app/__init__.py` | `create_app()` — OpenAPI factory, CORS, rate limiter, security headers, DB init |
 | Config | `app/config.py` | Constants + `build_db_url()`; **raises at import if `DB_USER`/`DB_PASSWORD`/`DB_NAME` are unset** (no `DB_URL`) |

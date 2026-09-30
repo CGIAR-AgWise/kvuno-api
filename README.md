@@ -17,8 +17,9 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
-- **Login & Registration UI** — Web forms at `/ui/login` and `/ui/register`
-- **Token Management** — List and revoke tokens at `/ui/tokens`
+- **React Frontend** — Standalone Vite + React 18 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx
+- **Login & Registration UI** — SPA routes `/login` and `/register`
+- **Token Management** — List and revoke tokens at the SPA route `/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
 
@@ -36,6 +37,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | Background Tasks | Celery + Redis (Kombu transport) |
 | Logging | loguru |
 | Serving | Waitress (dev) / Gunicorn (prod) |
+| Frontend | React 18 + TypeScript, Vite 6, pnpm, react-router 6; served by nginx |
 | Containerization | Docker + docker-compose |
 | CI/CD | GitHub Actions |
 
@@ -70,18 +72,29 @@ kvuno/
 │   │   ├── file_import.py    # FileImport repository
 │   │   └── import_conflict.py# ImportConflict repository
 │   ├── routes/
-│   │   └── main.py           # HTML /ui/* routes, resumable upload, /health
+│   │   └── main.py           # JSON /ui/* endpoints, resumable upload, SSE, /health
 │   ├── services/
 │   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
 │   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
 │   │   └── watch_handler.py  # watchdog directory watcher
-│   ├── templates/            # Jinja pages (base, jobs, upload, explore, quality, login…)
-│   ├── static/               # css/ js/ favicon served by Flask
+│   ├── static/               # css/ favicon served by Flask
 │   └── utils/
 │       ├── logging.py        # SharedLogger (loguru wrapper)
 │       ├── downloader.py     # RDSDownloader (auth, SSRF guards)
 │       ├── rds_to_parquet.py # RDS → Parquet batch converter
 │       └── migration_utils.py# Dialect-aware column utilities
+│
+├── frontend/                 # React SPA (Vite + TypeScript, built with pnpm)
+│   ├── src/
+│   │   ├── App.tsx           # Client-side routes (lazy-loaded, code-split)
+│   │   ├── api.ts            # Typed fetch client for /api and /ui
+│   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens
+│   │   ├── components/       # Layout, Pagination
+│   │   ├── context/          # AuthContext, ToastContext
+│   │   └── hooks/            # useJobStream (SSE)
+│   ├── Dockerfile            # node build stage → nginx runtime
+│   ├── nginx.conf            # Serves the SPA, reverse-proxies /api, /ui, /health
+│   └── pnpm-lock.yaml
 │
 ├── alembic/                  # Database migration scripts
 │   └── versions/             # Migration versions
@@ -92,7 +105,7 @@ kvuno/
 ├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
 │
 ├── .env.example              # Environment variable template
-├── docker-compose.yml        # Multi-service Docker setup (base, api, worker)
+├── docker-compose.yml        # Multi-service Docker setup (base, api, web, worker)
 ├── docker/
 │   ├── Dockerfile.base           # Shared builder base: Python 3.14 + pinned Poetry
 │   ├── Dockerfile                # Dev API image (python3 run.py)
@@ -178,13 +191,28 @@ python dev_worker.py     # auto-selects --pool solo on Windows, prefork elsewher
 
 The API will be available at `http://localhost:5000` (host) and the Swagger UI at `http://localhost:5000/api-docs`. The container listens on port 80 internally; compose maps host 5000 to it.
 
+The API container serves **no HTML** — the pages live in the `frontend/` SPA. Start the Vite dev server alongside it (see [Frontend Architecture](#frontend-architecture)); the Flask container still owns the JSON endpoints the SPA calls.
+
 Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Celery worker.
 
 Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker automatically.
 
+### Frontend Architecture
+
+The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with **Vite** and **pnpm**, and served by **nginx** — the Flask app renders no pages. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is **same-origin**: no CORS preflight, and the bearer token never crosses origins. The remaining `/ui/*` JSON endpoints (resumable upload, `/ui/process`, `/ui/columns`, jobs SSE) still run on Flask and are reached through that proxy. Routes are code-split with `React.lazy`, so the heavy pages (Explore pulls in Leaflet, markercluster, and the heat layer) do not weigh down the initial bundle. `vite dev` proxies the same paths to `localhost:80`, so local development is same-origin too.
+
+| Layer | Value |
+|---|---|
+| Framework | React 18 + react-router 6 + TypeScript 5.7 |
+| Build tool | Vite 6 (`tsc -b && vite build`), package manager pnpm |
+| Page routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Runtime | nginx (SPA + reverse proxy) |
+| Dev server | `pnpm dev` in `frontend/` — Vite on `:5173`, proxying to Flask on `:80` |
+| Image | `ghcr.io/cgiar-agwise/kvuno-web` (`frontend/Dockerfile`, node build → nginx runtime) |
+
 ### Docker Deployment
 
-`docker-compose.yml` defines three services: `base` (build-only, never started), `api` (Flask dev server), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `5000` to it.
+`docker-compose.yml` defines four services: `base` (build-only, never started), `api` (Flask dev server), `web` (nginx serving the React SPA on host port `${WEB_PORT:-8080}`), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `5000` to it. Open the UI at `http://localhost:8080`, not at the API port.
 
 Database migrations are applied by the `api` container's entrypoint before the server starts — there is no separate migration service. Set `RUN_MIGRATIONS=false` to skip, which is what you want if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
@@ -212,6 +240,9 @@ docker compose up -d api
 
 # API + worker
 docker compose up -d api worker
+
+# SPA only (API + web), no background processing
+docker compose up -d api web
 ```
 
 ### Container Images (GHCR)
@@ -225,6 +256,7 @@ Images are published to GitHub Container Registry, not Docker Hub:
 | `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
 | any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
 | any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
+| any tag | `ghcr.io/cgiar-agwise/kvuno-web` | `frontend/Dockerfile` (nginx + React bundle) | `:latest`, `:<tag>`, `:production` |
 
 Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
 
@@ -334,7 +366,7 @@ python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('st
 
 ### Authentication
 
-All UI routes (`/ui/*`) and most API routes require authentication. Obtain a token via:
+All `/ui/*` JSON endpoints and most API routes require authentication. Obtain a token via:
 
 ```bash
 curl -X POST http://localhost:5000/api/v1/users/login \
@@ -350,29 +382,30 @@ curl http://localhost:5000/api/v1/planting-data/ \
   -H "Authorization: Bearer 1|a1b2c3d4e5f6..."
 ```
 
-Or use the web UI at `/ui/login` to sign in — the token is stored as a cookie for browser navigation.
+Or sign in through the SPA at `/login` — the token is stored as a cookie for browser navigation. An unauthenticated browser hitting a protected endpoint is redirected to `SPA_LOGIN_PATH` (default `/login`); API clients still get a `401` JSON body.
 
 ### API Endpoints
 
+> Rows marked *SPA route* are client-side React routes served by nginx — Flask has no HTML endpoints. In production nginx reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so the browser sees a single origin.
+
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | — | Redirects to `/ui/jobs` |
+| `GET` | `/` | — | Redirects to `SPA_ROOT_URL` (default `/`) |
 | `GET` | `/health` | — | Health check with database status |
-| `GET` | `/ui/login` | — | Login page |
-| `GET` | `/ui/register` | — | Registration page |
-| `GET` | `/ui/jobs` | Required | Job list |
+| `GET` | `/login`, `/register` | — | SPA routes — login and registration pages (nginx) |
+| `GET` | `/jobs` | Required | SPA route — job list (nginx) |
+| `GET` | `/explore` | Required | SPA route — map explorer (nginx) |
+| `GET` | `/upload` | Required | SPA route — file upload (nginx) |
+| `GET` | `/quality` | Required | SPA route — data quality dashboard (nginx) |
+| `GET` | `/tokens` | Required | SPA route — token management (nginx) |
 | `GET` | `/ui/jobs/data` | Required | JSON: job list |
 | `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
-| `GET` | `/ui/upload` | Required | File upload UI (resumable.js) |
 | `POST` | `/ui/upload/resumable` | Required | Receive one upload chunk (resumable.js) |
 | `GET` | `/ui/upload/resumable` | Required | Chunk probe — 200 if exists, 204 otherwise |
 | `POST` | `/ui/upload/complete` | Required | Merge chunks, return columns + sample rows |
 | `POST` | `/ui/process` | Required | Save column mapping and start ingestion |
 | `GET` | `/ui/progress/<file_name>` | Required | Per-file progress JSON |
-| `GET` | `/ui/explore` | Required | Map explorer |
-| `GET` | `/ui/quality` | Required | Data quality dashboard |
 | `GET` | `/ui/columns` | Required | Mappable DB columns + aliases |
-| `GET` | `/ui/tokens` | Required | Token management |
 | `POST` | `/api/v1/users/register` | — | Register a new account |
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
@@ -470,7 +503,10 @@ Key environment variables (see `.env.example`):
 | `RATE_LIMIT_DEFAULT_DAILY` | Same, daily | `5000` | |
 | `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs | `0` | |
 | `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
-| `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000` | |
+| `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173` | |
+| `SPA_ROOT_URL` | Target of the `GET /` redirect | `/` | |
+| `SPA_LOGIN_PATH` | Where `require_auth` sends an unauthenticated browser | `/login` | |
+| `WEB_PORT` | Host port for the `web` (nginx SPA) compose service | `8080` | |
 | `FLASK_DEBUG` | Enable debug mode | `false` | |
 | `SERVER_HOST` | Bind address | `0.0.0.0` | |
 | `SERVER_PORT` | Bind port for the dev server | `80` | |
@@ -510,11 +546,11 @@ Key environment variables (see `.env.example`):
 
 GitHub Actions workflows:
 
-- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, then `pytest` on Python 3.13 and 3.14 (test job depends on lint)
+- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, a `frontend` job running `pnpm install` + `pnpm run build` in `frontend/`, then `pytest` on Python 3.13 and 3.14 (test job depends on lint and frontend)
 - **Version Bumping** — Automated version tags on main
 - **Auto PR** — Creates release PRs from version bumps
 - **TODO Scanner** — Scans codebase for TODO/FIXME markers
-- **Docker Build** — Builds and pushes images to GHCR after PR Checks pass (dev image on `develop`, prod + worker on `main`; see [Container Images](#container-images-ghcr))
+- **Docker Build** — Builds and pushes images to GHCR after PR Checks pass (dev image + `kvuno-web` on `develop`, prod + worker on `main`, all three on tags; see [Container Images](#container-images-ghcr))
 
 > `pyproject.toml` pins Python `>=3.13,<4.0`; the Docker images use `python:3.14-slim`.
 
