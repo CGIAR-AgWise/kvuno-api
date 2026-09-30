@@ -68,6 +68,15 @@ class ClustersResponse(BaseModel):
     per_page: int = Field(100, description="Clusters per page")
 
 
+class CompactCoordinatesResponse(BaseModel):
+    lats: list[float] = Field(default=[], description="Flat array of latitudes, index-aligned with `lons`")
+    lons: list[float] = Field(default=[], description="Flat array of longitudes, index-aligned with `lats`")
+    total: int = Field(0, description="Total matching coordinate pairs")
+    pages: int = Field(0, description="Total number of pages")
+    current_page: int = Field(1, description="Current page number")
+    per_page: int = Field(100, description="Points per page")
+
+
 class FiltersResponse(BaseModel):
     country: list[str] = Field(default=[], description="Distinct country values")
     province: list[str] = Field(default=[], description="Distinct province values")
@@ -152,15 +161,26 @@ def get_filter_options():
 @protected_api.get('/coordinates',
          responses={200: CoordinatesResponse, 401: Unauthorized},
          summary="Get map coordinates for data points",
-         description="Return an array of {lat, lon} objects matching the specified filters, paginated server-side. Defaults to 100 points per page, capped at 500.")
+         description="Return an array of {lat, lon} objects matching the specified filters, paginated server-side. Defaults to 100 points per page, capped at 500. "
+                     "Pass format=compact for two flat arrays (`lats`/`lons`) instead, which is about 40% smaller on the wire and lets a client fill typed arrays directly.")
 @require_auth
 @limiter.limit(RATE_LIMIT_DATA)
 @api_cache('coordinates', ttl=120)
 def get_coordinates(query: PlantingDataFilter):
     pagination = get_pagination()
+    compact = request.args.get('format', '').lower() == 'compact'
     try:
         total = repo.count_coordinates(query)
         points = repo.get_coordinates(query, limit=pagination.per_page, offset=pagination.offset)
+        if compact:
+            # Two flat lists rather than a list of objects. ~40% less JSON, and
+            # no intermediate object per point for the client to allocate and
+            # discard before copying into a typed array.
+            return {
+                "lats": [lat for lat, _ in points],
+                "lons": [lon for _, lon in points],
+                **pagination.envelope(total),
+            }, 200
         return {
             "coordinates": [{"lat": lat, "lon": lon} for lat, lon in points],
             **pagination.envelope(total),

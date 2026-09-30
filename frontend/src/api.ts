@@ -354,6 +354,75 @@ export function fetchFilters(signal?: AbortSignal): Promise<FilterColumns> {
   return walk().then(() => acc).catch(() => acc)
 }
 
+/**
+ * Coordinates as typed arrays.
+ *
+ * A plain `{lat, lon}` object costs roughly an order of magnitude more in the
+ * JS heap than the two numbers it holds — for a multi-million-row dataset that
+ * is hundreds of MB of objects that exist only to be read once and drawn. Two
+ * Float32Arrays hold the same values in 8 bytes per point, and `lats[i]`/`lons[i]`
+ * is all the render loop needs. float32 is ample: ~7 significant digits covers
+ * any coordinate, and sub-metre precision is irrelevant here.
+ *
+ * The `format=compact` response is two flat lists, so there is no per-point
+ * object allocated at any point in the pipeline.
+ */
+export interface CoordinateBuffers {
+  lats: Float32Array
+  lons: Float32Array
+  total: number
+  /** True when MAX_PAGES stopped the walk before the set was exhausted. */
+  truncated: boolean
+}
+
+async function fetchCoordinateBuffers(
+  params: URLSearchParams,
+  signal?: AbortSignal,
+): Promise<CoordinateBuffers> {
+  const merged = new URLSearchParams(params.toString())
+  merged.set('format', 'compact')
+  let page = 1
+  let pages = 1
+  let total = 0
+  const lats: number[] = []
+  const lons: number[] = []
+
+  do {
+    merged.set('page', String(page))
+    merged.set('per_page', String(MAX_PER_PAGE))
+    const body = await request<{ lats?: number[]; lons?: number[] } & Partial<PageMeta>>(
+      '/api/v1/planting-data/coordinates',
+      { params: merged, signal },
+    )
+    const pageLats = body.lats ?? []
+    const pageLons = body.lons ?? []
+    for (let i = 0; i < pageLats.length; i += 1) {
+      lats.push(pageLats[i])
+      lons.push(pageLons[i])
+    }
+    total = body.total ?? 0
+    pages = body.pages ?? 1
+    page += 1
+  } while (page <= pages && page <= MAX_PAGES)
+
+  return {
+    lats: Float32Array.from(lats),
+    lons: Float32Array.from(lons),
+    total,
+    truncated: lats.length < total,
+  }
+}
+
+export const fetchCoordinatesBuffered = (
+  params: URLSearchParams,
+  signal?: AbortSignal,
+) =>
+  cached(
+    'coords-buf:' + params.toString(),
+    () => fetchCoordinateBuffers(params, signal),
+    AGGREGATE_TTL_MS,
+  )
+
 export const fetchCoordinates = (params: URLSearchParams, signal?: AbortSignal) =>
   cached(
     'coords:' + params.toString(),

@@ -7,6 +7,7 @@ import 'leaflet.heat'
 import {
   fetchClusters,
   fetchCoordinates,
+  fetchCoordinatesBuffered,
   fetchFilters,
   fetchPlantingRecords,
   MAX_PER_PAGE,
@@ -15,6 +16,7 @@ import type { Cluster, FilterColumns, LatLon, PlantingRecord } from '../api'
 import Pagination from '../components/Pagination'
 import { useToast } from '../context/ToastContext'
 import { invalidateAll } from '../lib/cache'
+import { createPointCloud } from '../lib/pointCloud'
 
 type LayerMode = 'points' | 'heatmap' | 'clusters'
 
@@ -368,12 +370,19 @@ function MapView({
   const markersRef = useRef<L.LayerGroup | null>(null)
   const clusterRef = useRef<L.LayerGroup | null>(null)
   const heatRef = useRef<L.Layer | null>(null)
+  const cloudRef = useRef<L.Layer | null>(null)
   const toast = useToast()
 
   // Create once.
   useEffect(() => {
     if (!container.current || mapRef.current) return
-    const map = L.map(container.current).setView([-12, 28], 5)
+    // preferCanvas is the enabling change for plotting many points. The default
+    // renderer is SVG, which creates one DOM node per vector layer — roughly a
+    // gigabyte of DOM for a multi-million-row dataset, which crashes the tab
+    // regardless of how the data is stored. A canvas renderer draws all of them
+    // into a single element. It does not reduce the number of Leaflet layer
+    // objects, so the typed-array change below is what handles the heap.
+    const map = L.map(container.current, { preferCanvas: true }).setView([-12, 28], 5)
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; OpenStreetMap',
       maxZoom: 18,
@@ -438,22 +447,44 @@ function MapView({
     const controller = new AbortController()
     const query = new URLSearchParams()
     for (const [key, value] of Object.entries(filters)) if (value) query.set(key, value)
-    void fetchCoordinates(query, controller.signal)
+    void fetchCoordinatesBuffered(query, controller.signal)
       .then((res) => {
         markers.clearLayers()
         bounds.length = 0
-        for (const c of res.rows) {
-          addPoint(
-            Number.parseFloat(String(c.lat)),
-            Number.parseFloat(String(c.lon)),
-            '',
+        const { lats, lons } = res
+
+        // One canvas layer for every point. Adding a circleMarker per point
+        // would put a Leaflet layer object back on the heap for each row, which
+        // is the thing typed arrays were meant to avoid.
+        if (cloudRef.current) {
+          map.removeLayer(cloudRef.current)
+          cloudRef.current = null
+        }
+        cloudRef.current = createPointCloud(lats, lons, { radius: 2 })
+        map.addLayer(cloudRef.current)
+
+        // Fit to the returned extent, computed from the arrays rather than by
+        // building a bounds list of Leaflet points.
+        if (lats.length > 0) {
+          let minLat = Infinity
+          let maxLat = -Infinity
+          let minLon = Infinity
+          let maxLon = -Infinity
+          for (let i = 0; i < lats.length; i += 1) {
+            if (lats[i] < minLat) minLat = lats[i]
+            if (lats[i] > maxLat) maxLat = lats[i]
+            if (lons[i] < minLon) minLon = lons[i]
+            if (lons[i] > maxLon) maxLon = lons[i]
+          }
+          map.fitBounds(
+            L.latLngBounds(L.latLng(minLat, minLon), L.latLng(maxLat, maxLon)),
+            { padding: [20, 20], maxZoom: 12 },
           )
         }
-        fit()
         if (res.truncated) {
           toast.push(
             'Plotted ' +
-              res.rows.length.toLocaleString() +
+              lats.length.toLocaleString() +
               ' of ' +
               res.total.toLocaleString() +
               ' points — partial set.',
@@ -474,6 +505,10 @@ function MapView({
     if (heatRef.current) {
       map.removeLayer(heatRef.current)
       heatRef.current = null
+    }
+    if (cloudRef.current && mode !== 'points') {
+      map.removeLayer(cloudRef.current)
+      cloudRef.current = null
     }
     if (clusterRef.current) {
       map.removeLayer(clusterRef.current)
