@@ -277,12 +277,23 @@ def create_app():
     # first few requests exhaust everyone's budget. ProxyFix makes Werkzeug
     # read the real client IP from the forwarded headers.
     #
-    # Only enable this when a trusted proxy sets those headers — otherwise a
-    # client can spoof X-Forwarded-For and bypass the limiter entirely.
-    # PROXY_FIX_HOPS counts proxies in front of the app: 1 for a single nginx.
-    if os.getenv('PROXY_FIX_HOPS', '0').isdigit() and int(os.getenv('PROXY_FIX_HOPS', '0')) > 0:
+    # PROXY_FIX_HOPS counts trusted proxies in front of the app: 1 for the
+    # single nginx that serves the SPA, 2 if there is also a CDN in front.
+    #
+    # This defaults to 1 because the deployment now has that nginx by default.
+    # Without it, get_remote_address() returns the proxy's own IP, so every
+    # user shares one rate-limit bucket — which is a denial of service on our
+    # own limiter, not just inaccurate logging.
+    #
+    # ⚠️ The tradeoff: ProxyFix trusts the forwarded headers unconditionally, so
+    # if this app is ever exposed WITHOUT a proxy in front, a client can send
+    # its own X-Forwarded-For and evade every rate limit. Set PROXY_FIX_HOPS=0
+    # in that case — running `python run.py` straight onto a public port is
+    # the scenario to watch for.
+    _hops = os.getenv('PROXY_FIX_HOPS', '1')
+    if _hops.isdigit() and int(_hops) > 0:
         from werkzeug.middleware.proxy_fix import ProxyFix
-        hops = int(os.getenv('PROXY_FIX_HOPS', '0'))
+        hops = int(_hops)
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops)
         from app.utils.logging import SharedLogger
         SharedLogger().get_logger().info(f"ProxyFix enabled for {hops} proxy hop(s)")
