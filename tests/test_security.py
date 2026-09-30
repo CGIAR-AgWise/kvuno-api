@@ -357,34 +357,92 @@ class TestPaginationBounds:
                                        'current_page': 3, 'per_page': 100}
 
 
-class TestAuthPages:
-    def test_login_page_renders(self):
-        from app import create_app
-        app = create_app()
-        with app.test_client() as c:
-            resp = c.get('/ui/login')
-            assert resp.status_code == 200
-            assert b'Sign in' in resp.data
-            assert b'Register' in resp.data
+class TestNoServerRenderedPages:
+    """The UI is a separate React SPA; this container serves only the API.
 
-    def test_register_page_renders(self):
+    These routes used to render Jinja templates. They must now be gone, so a
+    stale link cannot silently serve a page whose scripts and data contract no
+    longer match the SPA.
+    """
+
+    RETIRED = ['/ui/login', '/ui/register', '/ui/jobs', '/ui/explore',
+               '/ui/upload', '/ui/quality', '/ui/tokens']
+
+    def test_retired_pages_are_404(self):
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/register')
+            for path in self.RETIRED:
+                assert c.get(path).status_code == 404, path
+
+    def test_root_without_spa_url_returns_a_pointer(self):
+        """No redirect loop.
+
+        Defaulting SPA_ROOT_URL to '/' would point the browser back at this
+        same service, which redirects again forever. With it unset the root
+        must answer with a pointer instead.
+        """
+        from app import create_app
+        app = create_app()
+        with app.test_client() as c:
+            resp = c.get('/')
             assert resp.status_code == 200
-            assert b'Create an account' in resp.data
-            assert b'Sign in' in resp.data
+            assert resp.is_json
+            assert resp.get_json()['service'] == 'kvuno-api'
+
+    def test_root_redirects_to_configured_spa(self, monkeypatch):
+        from app import create_app
+        monkeypatch.setenv('SPA_ROOT_URL', 'http://127.0.0.1:5001')
+        app = create_app()
+        with app.test_client() as c:
+            resp = c.get('/')
+            assert resp.status_code == 302
+            assert resp.location == 'http://127.0.0.1:5001'
+
+    def test_endpoints_the_spa_needs_are_still_registered(self):
+        """Only the HTML pages were retired; the SPA's endpoints must remain.
+
+        These are the paths the React app calls. Losing one would surface as a
+        404 in the browser rather than a failure here, so assert on the URL map.
+        """
+        from app import create_app
+        app = create_app()
+        adapter = app.url_map.bind('')
+        # (path, method) — several are POST-only, and match() defaults to GET.
+        needed = [
+            ('/ui/columns', 'GET'),
+            ('/ui/jobs/data', 'GET'),
+            ('/ui/jobs/events', 'GET'),
+            ('/ui/progress/report.parquet', 'GET'),
+            ('/ui/process', 'POST'),
+            ('/ui/upload/complete', 'POST'),
+            ('/ui/upload/resumable', 'POST'),
+        ]
+        for path, method in needed:
+            assert adapter.match(path, method=method), f'{method} {path} is gone'
+
+    def test_protected_spa_endpoints_still_require_auth(self):
+        """Retiring the pages must not have relaxed auth on what remains."""
+        from app import create_app
+        app = create_app()
+        with app.test_client() as c:
+            assert c.get('/ui/columns').status_code == 401
+            assert c.get('/ui/jobs/data').status_code == 401
 
 
 class TestRequireAuth:
     def test_redirects_browser_to_login(self):
+        """A browser hitting a protected endpoint is bounced to the SPA login.
+
+        The SPA owns the login route, so the redirect target is expressed as a
+        query param the SPA reads rather than a server-rendered page.
+        """
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/jobs', headers={'Accept': 'text/html'})
+            resp = c.get('/ui/columns', headers={'Accept': 'text/html'})
             assert resp.status_code == 302
-            assert resp.location.startswith('/ui/login?next=')
+            assert resp.location.startswith('/login?next=')
 
     def test_returns_401_for_api_client(self):
         from app import create_app
