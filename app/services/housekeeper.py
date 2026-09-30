@@ -721,9 +721,16 @@ def process_file_async(file_path: str, app=None):
     """Enqueue a single file for processing via Celery (non-blocking).
 
     Used by the upload API endpoint.
+
+    ``file_path`` is coerced to ``str`` here, at the Celery boundary, rather
+    than trusted from callers. Both call sites build a ``pathlib.Path`` (and
+    both are annotated ``str``, which nothing checked), and Celery serialises
+    task arguments as JSON — so a ``Path`` reached the broker and failed with
+    "Object of type WindowsPath is not JSON serializable". The upload still
+    returned 200, so the file was stored and silently never ingested.
     """
     from app.tasks import process_file_task
-    _enqueue_or_warn(process_file_task, file_path=file_path)
+    _enqueue_or_warn(process_file_task, file_path=str(file_path))
 
 
 def process_pending(app=None):

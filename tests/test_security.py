@@ -532,3 +532,44 @@ class TestCookieAuth:
             assert user is not None
             assert user.id == 1
             assert user.username == "cookie_user"
+
+
+class TestCeleryArgumentSerialisation:
+    """Task arguments are JSON-serialised before publishing.
+
+    Both call sites of process_file_async build a pathlib.Path while the
+    signature says str, and nothing checked. Celery then failed to publish with
+    "Object of type WindowsPath is not JSON serializable" — and because the
+    enqueue happens after the response is prepared, the upload still returned
+    200. The file was stored and silently never ingested.
+    """
+
+    def test_path_argument_is_coerced_to_str(self):
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+
+        def fake_enqueue(task, **kwargs):
+            captured.update(kwargs)
+            json.dumps(kwargs)  # what Celery does before publishing
+
+        with patch('app.services.housekeeper._enqueue_or_warn', fake_enqueue):
+            process_file_async(file_path=Path('/tmp/data/sample.parquet'))
+
+        assert isinstance(captured['file_path'], str)
+        assert captured['file_path'] == str(Path('/tmp/data/sample.parquet'))
+
+    def test_str_argument_passes_through_unchanged(self):
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+        with patch('app.services.housekeeper._enqueue_or_warn',
+                   lambda task, **kw: captured.update(kw)):
+            process_file_async(file_path='/tmp/data/sample.parquet')
+        assert captured['file_path'] == '/tmp/data/sample.parquet'
