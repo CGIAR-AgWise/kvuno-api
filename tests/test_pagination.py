@@ -212,3 +212,51 @@ class TestListEndpointsDefaultTo100:
         query.limit.assert_called_once_with(100)
         # Ordered, so paging is stable rather than arbitrary.
         query.order_by.assert_called_once()
+
+
+class TestCountQueriesDropOrdering:
+    """A COUNT(*) must not carry an ORDER BY.
+
+    Postgres rejects the whole statement when a sort column is neither
+    aggregated nor in a GROUP BY: "column planting_recommendations.id must
+    appear in the GROUP BY clause". This broke /coordinates with a 500 while
+    /planting-data and /quality/conflicts kept working, because flask-sqlalchemy
+    paginate() counts via Query.count() — which strips ordering automatically —
+    whereas the coordinate count used with_entities(func.count()).scalar(),
+    which does not.
+    """
+
+    def test_count_coordinates_emits_no_order_by(self):
+        from app.repo.planting_recommendation import PlantingRecommendationRepo
+        from app.dto.data_filters import PlantingDataFilter
+
+        captured = {}
+
+        class Recorder:
+            def __getattr__(self, _name):
+                def call(*args, **kwargs):
+                    return self
+
+                return call
+
+            def order_by(self, *args):
+                captured['order_by'] = args
+                return self
+
+            def scalar(self):
+                return 7
+
+        repo = PlantingRecommendationRepo()
+        # Replace the session with a recorder so the emitted statement is
+        # inspected without a live database.
+        original = repo._get_session
+        repo._get_session = lambda: Recorder()
+        try:
+            filters = PlantingDataFilter(sort_col='variety', sort_dir='desc')
+            count = repo.count_coordinates(filters)
+        finally:
+            repo._get_session = original
+
+        assert count == 7
+        # order_by(None) must be called, which is how the ordering is dropped.
+        assert captured.get('order_by') == (None,)

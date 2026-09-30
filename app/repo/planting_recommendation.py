@@ -118,13 +118,19 @@ class PlantingRecommendationRepo:
 
         Counted separately from the page query so the client learns the real
         size of the set instead of inferring it from a short final page.
+
+        Uses ``_apply_filters`` and clears any ordering rather than going
+        through ``get_filtered_data``. An ORDER BY carried into a COUNT(*)
+        makes Postgres reject the whole statement — "column id must appear in
+        the GROUP BY clause or be used in an aggregate function" — because the
+        sort column is not aggregated and there is no GROUP BY to satisfy.
+        Ordering is meaningless for a count anyway.
         """
-        query = self.get_filtered_data(filters)
-        query = query.with_entities(func.count()).filter(
+        query = self._apply_filters(filters).filter(
             PlantingRecommendation.lat.isnot(None),
             PlantingRecommendation.lon.isnot(None),
         )
-        return query.scalar() or 0
+        return query.order_by(None).with_entities(func.count()).scalar() or 0
 
     def get_clusters(self, filters: PlantingDataFilter, zoom: int,
                      ne_lat: float, ne_lng: float,
