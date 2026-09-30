@@ -4,6 +4,7 @@ import type { Job } from '../api'
 import { STATUSES, useJobStream } from '../hooks/useJobStream'
 import type { StatusFilter } from '../hooks/useJobStream'
 import { useToast } from '../context/ToastContext'
+import RunPanel from '../components/RunPanel'
 
 interface StatusMeta {
   color: string
@@ -119,6 +120,14 @@ export default function Jobs() {
         </span>
       </div>
 
+      <div className="row g-3">
+        <div className="col-lg-4 order-lg-2">
+          <div className="kvuno-card p-3 h-100">
+            <h2 className="h6 mb-2">Runs</h2>
+            <RunPanel />
+          </div>
+        </div>
+        <div className="col-lg-8 order-lg-1">
       <div className="kvuno-card p-3">
         {visible.length === 0 ? (
           <p className="text-muted text-center py-5 mb-0">No matching jobs.</p>
@@ -174,7 +183,17 @@ export default function Jobs() {
                         </div>
                       </td>
                       <td className="small text-muted">
-                        {job.message}
+                        {job.error || job.message}
+                        {job.error && job.message && (
+                          <div className="text-muted" style={{ fontSize: '.75rem' }}>
+                            {job.message}
+                          </div>
+                        )}
+                        {(job.attempts ?? 0) > 1 && (
+                          <div className="text-muted" style={{ fontSize: '.75rem' }}>
+                            attempt {job.attempts}
+                          </div>
+                        )}
                         {rate && (
                           <div className="text-muted" style={{ fontSize: '.75rem' }}>
                             {rate}
@@ -206,6 +225,8 @@ export default function Jobs() {
             </table>
           </div>
         )}
+      </div>
+        </div>
       </div>
 
       {detail && <JobDetail job={detail} onClose={() => setDetail(null)} onRetry={retry} />}
@@ -255,8 +276,18 @@ function JobDetail({
                     />
                   </div>
                 </dd>
-                <dt className="col-sm-4">Message</dt>
-                <dd className="col-sm-8">{job.message || '—'}</dd>
+                <dt className="col-sm-4">{job.error ? 'Error' : 'Message'}</dt>
+                <dd className="col-sm-8" style={{ whiteSpace: 'pre-wrap' }}>
+                  {job.error || job.message || '—'}
+                </dd>
+                <dt className="col-sm-4">Attempts</dt>
+                <dd className="col-sm-8">{job.attempts ?? 1}</dd>
+                {job.worker && (
+                  <>
+                    <dt className="col-sm-4">Worker</dt>
+                    <dd className="col-sm-8">{job.worker}</dd>
+                  </>
+                )}
               </dl>
             </div>
             <div className="modal-footer">

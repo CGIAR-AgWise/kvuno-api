@@ -257,8 +257,41 @@ export interface Job {
   current?: number
   total?: number
   message?: string
+  /** Failure detail, kept separate from `message` by the server. */
+  error?: string
+  /** Which ingestion run this file belongs to, if any. */
+  run_id?: number | null
+  attempts?: number
+  worker?: string
   mtime?: number
   started_at?: number
+}
+
+export interface RunCounts {
+  total: number
+  processing: number
+  completed: number
+  error: number
+  stale: number
+}
+
+/** One ingestion batch: everything submitted together. */
+export interface Run {
+  id: number
+  label: string
+  source: string
+  /**
+   * Derived server-side from the run's jobs, not stored. A run is finished
+   * only once none of its jobs are still in flight, so it cannot be left
+   * claiming to be running after the work completed.
+   */
+  status: 'pending' | 'running' | 'completed' | 'error' | 'partial' | 'stale'
+  total_files: number
+  initiated_by?: string
+  created_at: number
+  finished_at: number
+  counts: RunCounts
+  rows: { current: number; total: number }
 }
 
 export interface TokenInfo {
@@ -269,6 +302,13 @@ export interface TokenInfo {
 }
 
 /* ── Endpoints ────────────────────────────────────────────────── */
+
+export function fetchRuns(limit = 20, signal?: AbortSignal): Promise<Run[]> {
+  return request<{ runs: Run[] }>('/ui/jobs/runs', {
+    params: { limit },
+    signal,
+  }).then((body) => body.runs ?? [])
+}
 
 export function fetchPlantingRecords(
   params: URLSearchParams,
