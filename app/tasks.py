@@ -38,5 +38,12 @@ def process_pending_task(self):
     app = _get_worker_app()
     with app.app_context():
         from app.services.housekeeper import load_rds_to_db, set_app, DATA_DIR, housekeeping_settings
+        from app.config import HOUSEKEEPING_MAX_WORKERS
         set_app(app)
-        load_rds_to_db(data_folder=DATA_DIR, **housekeeping_settings())
+        # max_workers is load_rds_to_db-only; housekeeping_settings() omits it
+        # because the same dict also feeds process_file and watch_directory.
+        load_rds_to_db(
+            data_folder=DATA_DIR,
+            max_workers=HOUSEKEEPING_MAX_WORKERS,
+            **housekeeping_settings(),
+        )

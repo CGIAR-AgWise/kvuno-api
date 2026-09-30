@@ -246,3 +246,43 @@ class TestRedisHashDecoding:
         assert job['status'] == 'processing'
         assert job['current'] == 0
         assert job['started_at'] == 0
+
+
+class TestHousekeepingSettingsContract:
+    """housekeeping_settings() is splatted into three callables.
+
+    They do not share a signature, so a parameter only one of them accepts
+    raises TypeError in the other two. max_workers belongs to load_rds_to_db's
+    thread pool; including it broke process_file and watch_directory, failing
+    every Celery ingest with "process_file() got an unexpected keyword argument".
+    """
+
+    CONSUMERS = ('process_file', 'load_rds_to_db', 'watch_directory')
+
+    def test_every_consumer_accepts_the_shared_settings(self):
+        import inspect
+        from app.services import housekeeper
+
+        settings = housekeeper.housekeeping_settings()
+        for name in self.CONSUMERS:
+            fn = getattr(housekeeper, name)
+            params = inspect.signature(fn).parameters
+            accepts_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            unknown = [k for k in settings if k not in params]
+            assert not unknown or accepts_kwargs, (
+                f'{name} would raise TypeError for {unknown}'
+            )
+
+    def test_max_workers_is_not_in_the_shared_settings(self):
+        from app.services.housekeeper import housekeeping_settings
+        assert 'max_workers' not in housekeeping_settings()
+
+    def test_max_workers_is_still_reachable_for_the_batch_task(self):
+        """Dropping it from the shared dict must not silently disable the pool."""
+        from app.config import HOUSEKEEPING_MAX_WORKERS
+        import inspect
+        from app.services.housekeeper import load_rds_to_db
+        assert 'max_workers' in inspect.signature(load_rds_to_db).parameters
+        assert isinstance(HOUSEKEEPING_MAX_WORKERS, int)

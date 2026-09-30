@@ -68,12 +68,20 @@ def set_app(app_instance):
 # ── Settings ───────────────────────────────────────────────────
 
 def housekeeping_settings() -> dict:
-    """Return current housekeeping parameters (read from centralized config)."""
+    """Return the housekeeping parameters shared by every entry point.
+
+    Deliberately excludes ``max_workers``. Only ``load_rds_to_db`` — the
+    multi-file thread-pool orchestrator — has a thread pool; ``process_file``
+    (one file) and ``watch_directory`` (one file per event) have nothing to
+    parallelise. This dict is splatted into all three, so including it here
+    raised ``TypeError: process_file() got an unexpected keyword argument
+    'max_workers'`` and failed every Celery ingest. Pass it explicitly at the
+    ``load_rds_to_db`` call sites instead.
+    """
     return {
         'batch_size': HOUSEKEEPING_BATCH_SIZE,
         'chunk_size': HOUSEKEEPING_CHUNK_SIZE,
         'checkpoint_interval': HOUSEKEEPING_CHECKPOINT_INTERVAL,
-        'max_workers': HOUSEKEEPING_MAX_WORKERS,
     }
 
 
@@ -763,4 +771,9 @@ def cli_run(args):
         watch_directory(data_folder, dry_run=args.dry_run, **settings)
     else:
         with _get_app().app_context():
-            load_rds_to_db(data_folder=data_folder, dry_run=args.dry_run, **settings)
+            load_rds_to_db(
+                data_folder=data_folder,
+                dry_run=args.dry_run,
+                max_workers=HOUSEKEEPING_MAX_WORKERS,
+                **settings,
+            )
