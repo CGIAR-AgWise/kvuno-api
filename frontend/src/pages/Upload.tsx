@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import Resumable from 'resumablejs'
 import { completeUpload, fetchDBColumns, startProcessing } from '../api'
+import type { DuplicateInfo } from '../api'
 import { useToast } from '../context/ToastContext'
 
 interface ColumnOption {
@@ -20,6 +22,15 @@ interface CompletedFile {
   columns: string[]
   rows: Record<string, unknown>[]
   columnMap: Record<string, string>
+  /**
+   * Set when this file's content was already ingested. The worker skips a
+   * fully-processed duplicate as a no-op, so submitting it wastes a job and
+   * shows a spinner that resolves to nothing. Surfaced so the user is told
+   * before that happens rather than after.
+   */
+  duplicate: DuplicateInfo | null
+  /** User opted in to re-ingest a known duplicate. */
+  reprocess: boolean
 }
 
 type Phase = 'idle' | 'uploading' | 'mapping' | 'submitting' | 'done'
@@ -46,6 +57,7 @@ interface TypedResumable {
 
 export default function Upload() {
   const toast = useToast()
+  const navigate = useNavigate()
   const [dbColumns, setDbColumns] = useState<ColumnOption[]>(EMPTY)
   const [aliases, setAliases] = useState<Record<string, string>>({})
   const [files, setFiles] = useState<CompletedFile[]>([])
@@ -128,6 +140,8 @@ export default function Upload() {
               columns: data.columns,
               rows: data.rows ?? [],
               columnMap: {},
+              duplicate: data.duplicate ?? null,
+              reprocess: false,
             },
           ])
           setPhase('mapping')
@@ -163,12 +177,20 @@ export default function Upload() {
     )
   }
 
+  /** Files that will actually be submitted: duplicates are opt-in only. */
+  const queue = files.filter((f) => !f.duplicate || f.reprocess)
+  const skipped = files.filter((f) => f.duplicate && !f.reprocess)
+
   async function processAll() {
+    if (queue.length === 0) {
+      toast.push('Nothing to process — every file is already ingested.', 'warning')
+      return
+    }
     setPhase('submitting')
     setError('')
     let ok = 0
     let fail = 0
-    for (const file of filesRef.current) {
+    for (const file of queue) {
       try {
         await startProcessing(file.file, file.columnMap)
         ok += 1
@@ -182,6 +204,13 @@ export default function Upload() {
       toast.push('All ' + ok + ' file(s) sent for processing.', 'success')
     } else {
       toast.push(ok + ' submitted, ' + fail + ' failed.', 'danger')
+    }
+    // Hand off to the jobs overview so progress is visible. A short delay
+    // first: the toast and the disabled button state are the confirmation the
+    // user just did something, and a client-side route change does not reload
+    // the SPA, so the toast survives.
+    if (ok > 0) {
+      window.setTimeout(() => navigate('/jobs'), 1200)
     }
   }
 
@@ -222,6 +251,50 @@ export default function Upload() {
                 <h3 className="h6 mb-0 kvuno-truncate">{file.name}</h3>
                 <span className="badge text-bg-secondary">{file.columns.length} columns</span>
               </div>
+              {file.duplicate && (
+                <div
+                  className={
+                    'alert alert-' + (file.reprocess ? 'warning' : 'secondary') + ' py-2 px-3 mb-2 small'
+                  }
+                >
+                  <div className="fw-semibold">
+                    {file.duplicate.status === 'processed'
+                      ? 'Already ingested — this file will be skipped.'
+                      : 'Partially ingested — processing will resume at row ' +
+                        (file.duplicate.offset ?? 0).toLocaleString() +
+                        '.'}
+                  </div>
+                  <div className="text-muted">
+                    Same content as{' '}
+                    <span className="fw-semibold">{file.duplicate.original_filename}</span>
+                    {file.duplicate.processed_at
+                      ? ', processed ' + new Date(file.duplicate.processed_at).toLocaleString()
+                      : ''}
+                    .
+                  </div>
+                  <div className="form-check mt-1">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      id={'reprocess-' + file.key}
+                      checked={file.reprocess}
+                      onChange={(e) =>
+                        setFiles((current) =>
+                          current.map((f) =>
+                            f.key === file.key ? { ...f, reprocess: e.target.checked } : f,
+                          ),
+                        )
+                      }
+                    />
+                    <label
+                      className="form-check-label"
+                      htmlFor={'reprocess-' + file.key}
+                    >
+                      Process it anyway
+                    </label>
+                  </div>
+                </div>
+              )}
               <div className="table-responsive">
                 <table className="table table-sm mb-0">
                   <thead className="table-light">
@@ -263,13 +336,28 @@ export default function Upload() {
               </div>
             </div>
           ))}
+          {skipped.length > 0 && (
+            <p className="small text-muted mb-2">
+              {skipped.length} file(s) already ingested and excluded. Tick
+              &ldquo;Process it anyway&rdquo; on a file to include it.
+            </p>
+          )}
           <div className="d-flex gap-2">
             <button
               className="btn btn-primary"
-              disabled={phase === 'submitting'}
+              disabled={phase === 'submitting' || queue.length === 0}
+              title={
+                queue.length === 0
+                  ? 'Every file here is already ingested. Tick "Process it anyway" to override.'
+                  : undefined
+              }
               onClick={() => void processAll()}
             >
-              {phase === 'submitting' ? 'Submitting…' : 'Process ' + files.length + ' file(s)'}
+              {phase === 'submitting'
+                ? 'Submitting…'
+                : skipped.length > 0
+                  ? 'Process ' + queue.length + ' of ' + files.length + ' file(s)'
+                  : 'Process ' + files.length + ' file(s)'}
             </button>
             <a className="btn btn-outline-secondary" href="/jobs">
               Go to jobs

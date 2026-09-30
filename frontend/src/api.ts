@@ -514,9 +514,26 @@ export function startProcessing(file: string, columnMap: Record<string, string>)
   return request<{ msg?: string }>('/ui/process', { method: 'POST', body: { file, column_map: columnMap } })
 }
 
+/**
+ * A previously-ingested file with identical content.
+ *
+ * 'processed' means the worker would skip it as a no-op; 'partial' means a
+ * previous run was interrupted and re-running resumes from that row rather
+ * than starting over.
+ */
+export interface DuplicateInfo {
+  status: 'processed' | 'partial'
+  original_filename: string
+  processed_at: string | null
+  offset: number | null
+}
+
 export function completeUpload(identifier: string, totalChunks: number, filename: string) {
-  return request<{ file: string; columns: string[]; rows: Record<string, unknown>[]; error?: string }>(
-    '/ui/upload/complete',
-    { method: 'POST', body: { identifier, totalChunks, filename } },
-  )
+  return request<{
+    file: string
+    columns: string[]
+    rows: Record<string, unknown>[]
+    duplicate: DuplicateInfo | null
+    error?: string
+  }>('/ui/upload/complete', { method: 'POST', body: { identifier, totalChunks, filename } })
 }
