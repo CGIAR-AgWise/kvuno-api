@@ -73,6 +73,35 @@ def test_reports_truncation_at_the_cap(client):
     assert body['returned'] == 10
 
 
+def test_default_cap_is_a_small_sample(client):
+    """The map needs a density impression, not the whole dataset.
+
+    2.28M points is ~55 MB of JSON and renders as a solid blob; 5,000 shows the
+    shape of the distribution for ~120 KB.
+    """
+    from app.api import planting_data
+
+    assert planting_data.COORDINATES_BULK_MAX_ROWS == 5000
+    with patch.object(planting_data, 'repo', _repo(2_282_356, [(1.0, 2.0)] * 5000)):
+        body = client.get('/api/v1/planting-data/coordinates/all').get_json()
+    assert body['returned'] == 5000
+    assert body['total'] == 2_282_356
+    assert body['truncated'] is True
+
+
+def test_rows_are_sampled_not_the_first_n(client):
+    """LIMIT alone returns the first N by id, which is geographically clumped
+    when data was ingested grouped by region — a misleading map rather than a
+    sparse one. The bulk endpoint must ask for a random sample.
+    """
+    from app.api import planting_data
+
+    repo = _repo(10, [])
+    with patch.object(planting_data, 'repo', repo):
+        client.get('/api/v1/planting-data/coordinates/all')
+    assert repo.get_coordinates.call_args.kwargs.get('sample') is True
+
+
 def test_cap_is_respected_and_bounded(client):
     from app.api import planting_data
 

@@ -102,7 +102,18 @@ class PlantingRecommendationRepo:
         query = self.get_filtered_data(filters)
         return query.paginate(page=page, per_page=per_page, error_out=False)
 
-    def get_coordinates(self, filters: PlantingDataFilter, limit: int, offset: int = 0) -> list:
+    def get_coordinates(self, filters: PlantingDataFilter, limit: int, offset: int = 0,
+                        sample: bool = False) -> list:
+        """Rows for the map, newest-ordered unless ``sample`` is set.
+
+        With ``sample`` the row order is randomised before the LIMIT, so a
+        capped map is a representative sample of the whole dataset. Plain
+        LIMIT/OFFSET would return the *first* N by id, and since ingested data
+        tends to arrive grouped by region or season, that slice is usually
+        geographically clumped — which makes a sampled map look misleading
+        rather than sparse. Costs a sort of the filtered set, which is why it
+        is opt-in and the result is cached.
+        """
         query = self.get_filtered_data(filters)
         query = query.with_entities(
             PlantingRecommendation.lat,
@@ -111,6 +122,8 @@ class PlantingRecommendationRepo:
             PlantingRecommendation.lat.isnot(None),
             PlantingRecommendation.lon.isnot(None),
         )
+        if sample:
+            query = query.order_by(func.random())
         return query.limit(limit).offset(offset).all()
 
     def count_coordinates(self, filters: PlantingDataFilter) -> int:

@@ -100,10 +100,14 @@ class FiltersResponse(BaseModel):
 
 MAX_PER_PAGE = 500
 
-# Hard ceiling for the single-response coordinates endpoint. Far above the
-# per-page cap on purpose, and still bounded: this returns every point as two
-# flat arrays, so the response is tens of MB at the limit.
-COORDINATES_BULK_MAX_ROWS = int(os.getenv('COORDINATES_BULK_MAX_ROWS', '500000'))
+# Hard ceiling for the single-response coordinates endpoint.
+#
+# Deliberately small. The map is a density impression, not a data dump, and a
+# dense plot of hundreds of thousands of dots reads as a solid blob — 5,000
+# points is enough to show the shape of the distribution and costs ~120 KB.
+# The rows returned are a random sample of the whole filtered set, not the
+# first N, so the sample is representative however the data was ingested.
+COORDINATES_BULK_MAX_ROWS = int(os.getenv('COORDINATES_BULK_MAX_ROWS', '5000'))
 
 
 @public_api.get('',
@@ -218,7 +222,9 @@ def get_coordinates_all(query: PlantingDataFilter):
     cap = max(1, min(COORDINATES_BULK_MAX_ROWS, MAX_PER_PAGE * 1000))
     try:
         total = repo.count_coordinates(query)
-        points = repo.get_coordinates(query, limit=cap, offset=0)
+        # sample=True: a random subset rather than the first N by id, which
+        # would be geographically clumped if data arrived grouped by region.
+        points = repo.get_coordinates(query, limit=cap, offset=0, sample=True)
         return {
             "lats": [lat for lat, _ in points],
             "lons": [lon for _, lon in points],
