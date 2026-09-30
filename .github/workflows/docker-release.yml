@@ -67,6 +67,19 @@ jobs:
       branch_name: ${{ github.ref_name }}
       commit_sha: ${{ github.sha }}
 
+  build-web-release:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      context: ./frontend
+      dockerfile: Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-web
+      app_version: ${{ github.ref_name }}
+      branch_ref: refs/tags/${{ github.ref_name }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+
   build-worker-release:
     needs: [ gate ]
     if: needs.gate.outputs.passed == 'true'

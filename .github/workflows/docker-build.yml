@@ -50,6 +50,25 @@ jobs:
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
 
+  build-web-dev:
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'develop'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      # The SPA is a separate build context: its Dockerfile needs only
+      # frontend/, not the whole repo.
+      context: ./frontend
+      dockerfile: Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-web
+      app_version: ${{ github.ref_name }}-dev
+      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      commit_sha: ${{ github.event.workflow_run.head_sha }}
+
   build-worker-dev:
     if: >
       github.event.workflow_run.conclusion == 'success'
