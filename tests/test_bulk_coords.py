@@ -34,9 +34,11 @@ def no_cache():
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     import app.auth as auth
-    auth.get_current_user = lambda: MagicMock(id=1)
+    # monkeypatch, not a bare assignment: overwriting the module attribute
+    # persists for the whole session and leaks into later tests.
+    monkeypatch.setattr(auth, 'get_current_user', lambda: MagicMock(id=1))
     return create_app().test_client()
 
 
@@ -82,7 +84,7 @@ def test_cap_is_respected_and_bounded(client):
     assert repo.get_coordinates.call_args.kwargs['offset'] == 0
 
 
-def test_requires_authentication(client):
+def test_requires_authentication(client, monkeypatch):
     import app.auth as auth
-    auth.get_current_user = lambda: None
+    monkeypatch.setattr(auth, 'get_current_user', lambda: None)
     assert client.get('/api/v1/planting-data/coordinates/all').status_code == 401
