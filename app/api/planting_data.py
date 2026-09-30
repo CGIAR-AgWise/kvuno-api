@@ -1,13 +1,14 @@
 import csv
 import io
 import json
+import os
 
 from flask import request, Response, stream_with_context
 from flask_openapi3 import Tag, APIBlueprint
 
 from app.auth import require_auth
 from app.cache import api_cache
-from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_DATA
+from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_COORDINATES_BULK, RATE_LIMIT_DATA
 from app.dto.data_filters import PlantingDataFilter
 from app.dto.pagination import get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
@@ -77,6 +78,15 @@ class CompactCoordinatesResponse(BaseModel):
     per_page: int = Field(100, description="Points per page")
 
 
+class BulkCoordinatesResponse(BaseModel):
+    lats: list[float] = Field(default=[], description="Flat array of latitudes, index-aligned with `lons`")
+    lons: list[float] = Field(default=[], description="Flat array of longitudes, index-aligned with `lats`")
+    total: int = Field(0, description="Total matching coordinate pairs")
+    returned: int = Field(0, description="Pairs actually returned, capped by COORDINATES_BULK_MAX_ROWS")
+    truncated: bool = Field(0, description="True when the cap was hit, so the map is a sample")
+    cap: int = Field(0, description="The cap that was applied")
+
+
 class FiltersResponse(BaseModel):
     country: list[str] = Field(default=[], description="Distinct country values")
     province: list[str] = Field(default=[], description="Distinct province values")
@@ -89,6 +99,11 @@ class FiltersResponse(BaseModel):
 
 
 MAX_PER_PAGE = 500
+
+# Hard ceiling for the single-response coordinates endpoint. Far above the
+# per-page cap on purpose, and still bounded: this returns every point as two
+# flat arrays, so the response is tens of MB at the limit.
+COORDINATES_BULK_MAX_ROWS = int(os.getenv('COORDINATES_BULK_MAX_ROWS', '500000'))
 
 
 @public_api.get('',
@@ -187,6 +202,33 @@ def get_coordinates(query: PlantingDataFilter):
         }, 200
     except Exception as e:
         logger.error(f"Error retrieving coordinates: {e}")
+        return {'error': str(e)}, 500
+
+
+@protected_api.get('/coordinates/all',
+         responses={200: BulkCoordinatesResponse, 401: Unauthorized},
+         summary="Get every matching coordinate pair in one response",
+         description="Return all matching coordinate pairs as two flat arrays (`lats`/`lons`) in a SINGLE request, capped at COORDINATES_BULK_MAX_ROWS. "
+                     "Paging /coordinates to reach the same data costs one request per 500 rows, which at 2M+ rows means thousands of round trips and exhausts the rate limit long before the map finishes. "
+                     "`truncated` reports whether the cap was reached, so the UI can say the map is a sample rather than implying completeness.")
+@require_auth
+@limiter.limit(RATE_LIMIT_COORDINATES_BULK)
+@api_cache('coordinates_bulk', ttl=120)
+def get_coordinates_all(query: PlantingDataFilter):
+    cap = max(1, min(COORDINATES_BULK_MAX_ROWS, MAX_PER_PAGE * 1000))
+    try:
+        total = repo.count_coordinates(query)
+        points = repo.get_coordinates(query, limit=cap, offset=0)
+        return {
+            "lats": [lat for lat, _ in points],
+            "lons": [lon for _, lon in points],
+            "total": total,
+            "returned": len(points),
+            "truncated": len(points) < total,
+            "cap": cap,
+        }, 200
+    except Exception as e:
+        logger.error(f"Error retrieving bulk coordinates: {e}")
         return {'error': str(e)}, 500
 
 

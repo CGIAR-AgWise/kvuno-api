@@ -77,6 +77,10 @@ RATE_LIMIT_REGISTER = os.getenv('RATE_LIMIT_REGISTER', '10 per hour')
 RATE_LIMIT_LOGIN = os.getenv('RATE_LIMIT_LOGIN', '20 per hour')
 RATE_LIMIT_UPLOAD = os.getenv('RATE_LIMIT_UPLOAD', '10 per hour')
 RATE_LIMIT_DATA = os.getenv('RATE_LIMIT_DATA', '120 per minute')
+# The bulk coordinates endpoint is one request instead of a page walk, so it
+# gets its own, looser limit: 4,566 sequential requests at the per-page limit
+# could never finish, while a single capped response is cheap by comparison.
+RATE_LIMIT_COORDINATES_BULK = os.getenv('RATE_LIMIT_COORDINATES_BULK', '20 per minute')
 # Backstop applied to every route without its own limit (UI pages, health).
 # Deliberately generous: raising this is the fix when legitimate users start
 # seeing 429s, since it is the limit that HTML page loads consume.
