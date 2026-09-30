@@ -8,12 +8,14 @@ import {
   fetchClusters,
   fetchCoordinates,
   fetchFilters,
+  fetchAllPlantingRecords,
   fetchPlantingRecords,
   MAX_PER_PAGE,
 } from '../api'
 import type { Cluster, FilterColumns, LatLon, PlantingRecord } from '../api'
 import Pagination from '../components/Pagination'
 import { useToast } from '../context/ToastContext'
+import { invalidateAll } from '../lib/cache'
 
 type LayerMode = 'points' | 'heatmap' | 'clusters'
 
@@ -36,6 +38,10 @@ export default function Explore() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [mode, setMode] = useState<LayerMode>('points')
+  // Off by default: loading everything is ceil(total/500) sequential requests
+  // and renders the whole result set in the DOM.
+  const [loadAll, setLoadAll] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
 
   // Filter dropdowns page per column, so load them all up front.
   useEffect(() => {
@@ -62,7 +68,8 @@ export default function Explore() {
     const controller = new AbortController()
     setLoading(true)
     setError('')
-    void fetchPlantingRecords(params, controller.signal)
+    const fetcher = loadAll ? fetchAllPlantingRecords : fetchPlantingRecords
+    void fetcher(params, controller.signal)
       .then((data) => {
         setRecords(data.data ?? [])
         setMeta({
@@ -77,11 +84,26 @@ export default function Explore() {
       })
       .finally(() => setLoading(false))
     return () => controller.abort()
-  }, [params])
+  }, [params, loadAll, reloadKey])
 
   function updateFilter(key: keyof typeof EMPTY_FILTERS, value: string) {
     setFilters((f) => ({ ...f, [key]: value }))
     setPage(1)
+  }
+
+  function toggleLoadAll(next: boolean) {
+    setLoadAll(next)
+    setPage(1)
+    if (next) {
+      toast.push(
+        'Loading every matching record. This walks the server in pages and ' +
+          'may take a while on a large dataset.',
+        'warning',
+      )
+    } else {
+      // Switching modes must not show a page-5 slice of a different result set.
+      invalidateAll()
+    }
   }
 
   function toggleSort(col: string) {
@@ -159,28 +181,12 @@ export default function Explore() {
         </div>
       </div>
 
-      <div className="kvuno-card p-3 mb-3">
-        <MapView mode={mode} records={records} filters={filters} />
-        <div className="btn-group btn-group-sm mt-2" role="group" aria-label="Map layer">
-          {(
-            [
-              ['points', 'bi-geo-alt', 'Points'],
-              ['heatmap', 'bi-fire', 'Heatmap'],
-              ['clusters', 'bi-diagram-3', 'Clusters'],
-            ] as const
-          ).map(([value, icon, label]) => (
-            <button
-              key={value}
-              className={'btn ' + (mode === value ? 'btn-primary' : 'btn-outline-secondary')}
-              onClick={() => setMode(value)}
-            >
-              <i className={'bi ' + icon + ' me-1'} />
-              {label}
-            </button>
-          ))}
-        </div>
-      </div>
-
+      {/* Table left, map right. The map is a reference for the rows, so keeping
+          both on screen means scanning a page of rows no longer means scrolling
+          down and back up. Below `lg` the columns stack, where two side-by-side
+          panes would leave neither usable. */}
+      <div className="row g-3">
+        <div className="col-lg-7 order-2 order-lg-1">
       <div className="kvuno-card p-3">
         <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
           <span className="text-muted small">
@@ -188,6 +194,20 @@ export default function Explore() {
             {loading && ' · loading…'}
           </span>
           <div className="ms-auto d-flex gap-2">
+            <div className="form-check form-switch d-flex align-items-center gap-2 mb-0">
+              <input
+                className="form-check-input mt-0"
+                type="checkbox"
+                role="switch"
+                id="load-all"
+                checked={loadAll}
+                onChange={(e) => toggleLoadAll(e.target.checked)}
+                disabled={loading}
+              />
+              <label className="form-check-label small text-nowrap" htmlFor="load-all">
+                Load all
+              </label>
+            </div>
             <select
               className="form-select form-select-sm"
               style={{ width: 'auto' }}
@@ -197,6 +217,8 @@ export default function Explore() {
                 setPage(1)
               }}
               aria-label="Rows per page"
+              disabled={loadAll}
+              title={loadAll ? 'Ignored while loading every record' : undefined}
             >
               {[50, 100, 200, 500].map((n) => (
                 <option key={n} value={n}>
@@ -204,6 +226,20 @@ export default function Explore() {
                 </option>
               ))}
             </select>
+            <button
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => {
+                invalidateAll()
+                // Bump a counter so the effect re-runs even when page is
+                // unchanged — invalidating the cache alone changes no state.
+                setReloadKey((n) => n + 1)
+                toast.push('Cache cleared — refetching.', 'info')
+              }}
+              title="Clear cached responses and refetch"
+            >
+              <i className="bi bi-arrow-clockwise me-1" />
+              Refresh
+            </button>
             <button className="btn btn-outline-secondary btn-sm" onClick={() => exportAs('csv')}>
               <i className="bi bi-filetype-csv me-1" />
               CSV
@@ -217,8 +253,8 @@ export default function Explore() {
 
         {error && <div className="alert alert-danger">{error}</div>}
 
-        <div className="table-responsive">
-          <table className="table table-hover align-middle mb-0">
+        <div className="table-responsive kvuno-table-scroll">
+          <table className="table table-hover align-middle mb-0 sticky-top">
             <thead className="table-light">
               <tr>
                 {(
@@ -271,17 +307,47 @@ export default function Explore() {
         </div>
 
         <div className="d-flex align-items-center mt-3">
-          <Pagination
-            page={meta.current_page}
-            pages={meta.pages}
-            onChange={(next) => {
-              setPage(next)
-              window.scrollTo({ top: 0, behavior: 'smooth' })
-            }}
-          />
+          {!loadAll && (
+            <Pagination
+              page={meta.current_page}
+              pages={meta.pages}
+              onChange={(next) => {
+                setPage(next)
+                window.scrollTo({ top: 0, behavior: 'smooth' })
+              }}
+            />
+          )}
           <span className="text-muted small">
             Page {meta.current_page} of {meta.pages}
           </span>
+        </div>
+      </div>
+        </div>
+
+        <div className="col-lg-5 order-1 order-lg-2">
+          <div className="kvuno-card p-3">
+            <div className="kvuno-map mb-2">
+              <MapView mode={mode} records={records} filters={filters} />
+            </div>
+            <div className="btn-group btn-group-sm w-100" role="group" aria-label="Map layer">
+              {(
+                [
+                  ['points', 'bi-geo-alt', 'Points'],
+                  ['heatmap', 'bi-fire', 'Heatmap'],
+                  ['clusters', 'bi-diagram-3', 'Clusters'],
+                ] as const
+              ).map(([value, icon, label]) => (
+                <button
+                  key={value}
+                  className={'btn ' + (mode === value ? 'btn-primary' : 'btn-outline-secondary')}
+                  onClick={() => setMode(value)}
+                >
+                  <i className={'bi ' + icon + ' me-1'} />
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>

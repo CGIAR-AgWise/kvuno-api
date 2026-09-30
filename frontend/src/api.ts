@@ -12,6 +12,16 @@
  * (`vite dev` proxies too), so paths are absolute-from-root.
  */
 
+import { cached } from './lib/cache'
+
+/**
+ * Cache lifetimes. Short by default so a page reload still reflects newly
+ * ingested data; the two expensive aggregations are held a little longer
+ * because recomputing them costs the server real work.
+ */
+const LIST_TTL_MS = 30_000
+const AGGREGATE_TTL_MS = 120_000
+
 /** The metadata block every paginated response carries. */
 export interface PageMeta {
   total: number
@@ -314,7 +324,52 @@ export function fetchPlantingRecords(
   params: URLSearchParams,
   signal?: AbortSignal,
 ): Promise<{ data: PlantingRecord[] } & PageMeta> {
-  return request('/api/v1/planting-data', { params, signal })
+  const key = 'planting:' + params.toString()
+  return cached(key, () => request('/api/v1/planting-data', { params, signal }), LIST_TTL_MS)
+}
+
+/**
+ * Every matching record, in one call, by walking the server's pages.
+ *
+ * The server caps each page at MAX_PER_PAGE, so this is ceil(total/500)
+ * sequential requests. Only worth it for a narrow filter set — the UI says so
+ * when the result set is large, and the walk stops at MAX_PAGES.
+ */
+export function fetchAllPlantingRecords(
+  params: URLSearchParams,
+  signal?: AbortSignal,
+): Promise<{ data: PlantingRecord[] } & PageMeta> {
+  const key = 'planting-all:' + params.toString()
+  return cached(
+    key,
+    async () => {
+      const merged = new URLSearchParams(params.toString())
+      merged.delete('page')
+      merged.delete('per_page')
+      const collected: PlantingRecord[] = []
+      let page = 1
+      let pages = 1
+      let total = 0
+      let current = 1
+      let perPage = MAX_PER_PAGE
+      do {
+        merged.set('page', String(page))
+        merged.set('per_page', String(MAX_PER_PAGE))
+        const body = await request<{ data: PlantingRecord[] } & Partial<PageMeta>>(
+          '/api/v1/planting-data',
+          { params: merged, signal },
+        )
+        collected.push(...(body.data ?? []))
+        total = body.total ?? 0
+        pages = body.pages ?? 1
+        current = body.current_page ?? page
+        perPage = body.per_page ?? MAX_PER_PAGE
+        page += 1
+      } while (page <= pages && page <= MAX_PAGES)
+      return { data: collected, total, pages, current_page: current, per_page: perPage }
+    },
+    AGGREGATE_TTL_MS,
+  )
 }
 
 export function fetchFilters(signal?: AbortSignal): Promise<FilterColumns> {
@@ -344,10 +399,18 @@ export function fetchFilters(signal?: AbortSignal): Promise<FilterColumns> {
 }
 
 export const fetchCoordinates = (params: URLSearchParams, signal?: AbortSignal) =>
-  fetchAllPages<LatLon>('/api/v1/planting-data/coordinates', 'coordinates', params, signal)
+  cached(
+    'coords:' + params.toString(),
+    () => fetchAllPages<LatLon>('/api/v1/planting-data/coordinates', 'coordinates', params, signal),
+    AGGREGATE_TTL_MS,
+  )
 
 export const fetchClusters = (params: URLSearchParams, signal?: AbortSignal) =>
-  fetchAllPages<Cluster>('/api/v1/planting-data/clusters', 'clusters', params, signal)
+  cached(
+    'clusters:' + params.toString(),
+    () => fetchAllPages<Cluster>('/api/v1/planting-data/clusters', 'clusters', params, signal),
+    AGGREGATE_TTL_MS,
+  )
 
 export const fetchConflicts = (
   params: URLSearchParams,
