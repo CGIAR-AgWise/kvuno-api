@@ -30,8 +30,9 @@ The pages are a standalone **React 18 + TypeScript SPA** in `frontend/`, built w
 **Vite** and **pnpm** and served by **nginx**. Flask renders no HTML — it only exposes
 JSON. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`,
 `/ui`, and `/health` to the `api` service, so production is **same-origin** and no
-CORS preflight is needed; `vite dev` proxies the same paths to Flask on `:80`, so
-local development matches it. Routes are code-split with `React.lazy`, which keeps
+CORS preflight is needed; `vite dev` proxies the same paths to the API
+(`VITE_DEV_PROXY_TARGET`, default `http://127.0.0.1:5000` to match the compose
+`api` service), so local development matches it. Routes are code-split with `React.lazy`, which keeps
 Leaflet, markercluster, and the heat layer out of the initial bundle.
 
 | Layer | Value |

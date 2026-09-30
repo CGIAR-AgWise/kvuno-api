@@ -197,9 +197,31 @@ Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Cele
 
 Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker automatically.
 
+### Startup checks (preflight)
+
+Before doing any work, both the API and the worker verify their dependencies and exit non-zero if a **required** one is unreachable, so the container is restarted rather than booting into a state where every request fails. Implemented in `app/utils/preflight.py` and run from `docker/entrypoint.sh` (API), `docker/entrypoint.worker.sh` (worker), and `run.py`.
+
+| Dependency | API | Worker |
+|---|---|---|
+| Database | always required | always required |
+| Redis | required only when `HOUSEKEEPING_ENABLED=true` | always required |
+
+Redis is optional for the API because with housekeeping off, progress is stored in PostgreSQL and nothing is enqueued — that is a supported configuration. A Celery worker with no broker is useless under any configuration, so it always requires Redis.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PREFLIGHT_ENABLED` | `true` | Set `false` to skip the check entirely |
+| `PREFLIGHT_RETRIES` | `30` | Attempts before giving up |
+| `PREFLIGHT_DELAY_SECONDS` | `2` | Wait between attempts (60s total tolerance) |
+| `PREFLIGHT_TIMEOUT_SECONDS` | `3` | Per-probe connect timeout |
+
+`run.py` is the one exception to fail-fast: with `FLASK_DEBUG=true` it logs a warning and starts anyway, so local development is not blocked by a database or broker that is not running. Containers still refuse to start, because the entrypoint check is independent of it.
+
+---
+
 ### Frontend Architecture
 
-The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with **Vite** and **pnpm**, and served by **nginx** — the Flask app renders no pages. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is **same-origin**: no CORS preflight, and the bearer token never crosses origins. The remaining `/ui/*` JSON endpoints (resumable upload, `/ui/process`, `/ui/columns`, jobs SSE) still run on Flask and are reached through that proxy. Routes are code-split with `React.lazy`, so the heavy pages (Explore pulls in Leaflet, markercluster, and the heat layer) do not weigh down the initial bundle. `vite dev` proxies the same paths to `localhost:80`, so local development is same-origin too.
+The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with **Vite** and **pnpm**, and served by **nginx** — the Flask app renders no pages. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is **same-origin**: no CORS preflight, and the bearer token never crosses origins. The remaining `/ui/*` JSON endpoints (resumable upload, `/ui/process`, `/ui/columns`, jobs SSE) still run on Flask and are reached through that proxy. Routes are code-split with `React.lazy`, so the heavy pages (Explore pulls in Leaflet, markercluster, and the heat layer) do not weigh down the initial bundle. `vite dev` proxies the same paths to the API, so local development is same-origin too. The target defaults to `http://127.0.0.1:5000` — the compose `api` service publishes host `5000` → container `80` — and is overridable with `VITE_DEV_PROXY_TARGET` (see `frontend/.env.example`).
 
 | Layer | Value |
 |---|---|
@@ -207,7 +229,7 @@ The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with 
 | Build tool | Vite 6 (`tsc -b && vite build`), package manager pnpm |
 | Page routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
 | Runtime | nginx (SPA + reverse proxy) |
-| Dev server | `pnpm dev` in `frontend/` — Vite on `:5173`, proxying to Flask on `:80` |
+| Dev server | `pnpm dev` in `frontend/` — Vite on `:5173`, proxying to the API at `VITE_DEV_PROXY_TARGET` (default `http://127.0.0.1:5000`) |
 | Image | `ghcr.io/cgiar-agwise/kvuno-web` (`frontend/Dockerfile`, node build → nginx runtime) |
 
 ### Docker Deployment

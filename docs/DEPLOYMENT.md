@@ -39,7 +39,7 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 
 > **The browser talks to `web`, not `api`.** nginx reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is same-origin: no CORS preflight and the bearer token never crosses origins. Point users at `http://localhost:${WEB_PORT:-8080}`; the API port is for `/api-docs` and direct API calls. nginx must be reachable by the browser for the SPA to load at all — the Flask container alone serves no HTML.
 
-> **Postgres and Redis are no longer compose services.** They are expected to be running elsewhere (or added back via an override file), and `DB_HOST` / `CELERY_BROKER_URL` must point at whatever is reachable. The `api` and `worker` services also no longer declare `depends_on`. If you need the full stack locally, bring your own `postgis/postgis:17-3.5` and `redis:7-alpine`, or add a `docker-compose.override.yml`. (`web` is the exception: it declares `depends_on: api` so the proxy target exists when nginx starts.)
+> **Postgres and Redis are no longer compose services.** They are expected to be running elsewhere (or added back via an override file), and `DB_HOST` / `CELERY_BROKER_URL` must point at whatever is reachable. The `api` and `worker` services also no longer declare `depends_on`. If you need the full stack locally, bring your own `postgis/postgis:17-3.5` and `redis:7-alpine`, or add a `docker-compose.override.yml`. (`web` is the exception: it declares `depends_on: api` with `condition: service_healthy`, so nginx does not start until the API's `/health` check passes — which is after migrations have run. The API images define that HEALTHCHECK.)
 
 `api` and `worker` both bind-mount `${DATA_DIR:-./data}` at `/app/static/data`.
 
@@ -94,6 +94,45 @@ DB_NAME=agwise_api
 
 ## 3. Running
 
+### Startup checks (preflight)
+
+Both the API and the worker verify their dependencies before doing any work and exit
+non-zero if a **required** one is unreachable, so the container runtime restarts them
+instead of leaving an instance that answers every request with an error. The logic is
+in `app/utils/preflight.py`; it runs from `docker/entrypoint.sh` (API),
+`docker/entrypoint.worker.sh` (worker), and `run.py`.
+
+| Dependency | API | Worker |
+|---|---|---|
+| Database | always required | always required |
+| Redis | only when `HOUSEKEEPING_ENABLED=true` | always required |
+
+A worker with no broker is useless under any configuration, so it always requires Redis.
+The API does not: with housekeeping off, progress is stored in PostgreSQL and nothing is
+enqueued. On success you will see:
+
+```
+[entrypoint] checking dependencies...
+[preflight] database: connected
+[preflight] all required dependencies ready (api)
+```
+
+Tune with `PREFLIGHT_RETRIES` (30), `PREFLIGHT_DELAY_SECONDS` (2) — 60s of tolerance
+for a slow-starting database — and `PREFLIGHT_TIMEOUT_SECONDS` (3). Set
+`PREFLIGHT_ENABLED=false` to skip entirely.
+
+`run.py` is the deliberate exception: with `FLASK_DEBUG=true` it warns and starts
+anyway, so local development is not blocked by a database or Redis that is not running.
+Containers still refuse to start, because the entrypoint check runs independently.
+
+> **The worker image now has an entrypoint.** It previously ran `celery` directly as its
+> CMD, so a missing broker produced a worker that idled forever — indistinguishable from
+> "no work is arriving". `docker/entrypoint.worker.sh` runs the check and then `exec`s
+> Celery, so it becomes PID 1 and receives SIGTERM. The worker still never migrates; the
+> API owns the schema.
+
+---
+
 ### First-time startup
 
 ```bash
@@ -119,17 +158,47 @@ docker compose logs -f web
 ```
 
 In development you can skip the image entirely and run the Vite dev server, which
-proxies the same paths to Flask — no build, no nginx, hot reload:
+proxies the same paths to the API — no build, no nginx, hot reload:
 
 ```bash
 cd frontend
 pnpm install
-pnpm dev              # Vite on http://localhost:5173, proxying /api, /ui, /health to localhost:80
+pnpm dev              # Vite on http://localhost:5173
 ```
 
 Run `python run.py` (or `docker compose up -d api`) first, since the dev server only
 proxies — it does not serve the API. `CORS_ORIGINS` already allows the Vite port
 (`http://localhost:5173`, `http://127.0.0.1:5173`) by default.
+
+**The dev proxy target is configurable, and the default is easy to get wrong.** It
+points at `http://127.0.0.1:5000`, which is where the compose `api` service publishes
+its container port 80. Set `VITE_DEV_PROXY_TARGET` in `frontend/.env.local` if your API
+listens elsewhere — for example `http://127.0.0.1:80` when you run `python run.py`
+directly instead of through compose. A mismatch shows up as Vite logging
+`http proxy error: /api/...` with `ECONNREFUSED`; the SPA loads but every API call
+fails. See `frontend/.env.example`.
+
+> ### Why nginx does not use an `upstream` block
+>
+> `frontend/nginx.conf` deliberately avoids `upstream { server api:80; }`. nginx resolves
+> an `upstream` **once, when it loads its config**, and Docker assigns the API's IP at
+> container start — so a restarted API (new IP) leaves nginx dialling an address where
+> nothing is listening. Every request then fails with
+> `connect() failed (111: Connection refused)` even though the API is perfectly healthy.
+>
+> Instead the hostname goes in a variable and nginx re-resolves per request:
+>
+> ```nginx
+> resolver 127.0.0.11 valid=10s ipv6=off;   # Docker's embedded DNS
+> set $api_upstream http://api:80;
+> proxy_pass $api_upstream$request_uri;
+> ```
+>
+> `$request_uri` is required: when `proxy_pass` contains a variable, nginx stops
+> appending the URI automatically, and the paginated endpoints need their query string.
+> `127.0.0.11` is correct inside Docker only — change it for a non-Docker deployment.
+> This is the single most likely cause of a SPA that loads but whose API calls all
+> return 502.
 
 ### Normal start/stop
 

@@ -1,3 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Local dev overrides. .env.example is committed as the template.
+.env
+.env.local
