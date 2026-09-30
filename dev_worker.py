@@ -15,6 +15,17 @@ load_dotenv()
 
 
 def main():
+    # Fail fast if the broker or database is down. A Celery worker that starts
+    # without Redis does not crash — it sits there retrying forever, which
+    # looks identical to "no work is arriving". Exiting non-zero instead lets
+    # the container runtime restart it.
+    from app.utils.preflight import run_preflight
+
+    if run_preflight("worker") != 0:
+        print("Worker startup check failed — required dependencies are unreachable.",
+              file=sys.stderr)
+        sys.exit(1)
+
     argv = [
         "celery",
         "-A", "app.celery_app",
