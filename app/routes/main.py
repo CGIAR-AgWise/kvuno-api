@@ -13,7 +13,10 @@ from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, MAX_FILE_SIZ
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation
 from app.utils.preview import FileTooLarge, build_preview, iter_chunks
+from app.utils.logging import SharedLogger
 from app.utils.rds_to_parquet import convert_for_ingestion
+
+logger = SharedLogger().get_logger()
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
@@ -261,6 +264,30 @@ def register_app_routes(app):
     def ui_jobs_data():
         jobs = _load_jobs()
         return jsonify(jobs=jobs)
+
+    @app.route('/ui/jobs/runs', methods=['GET'])
+    @require_auth
+    def ui_jobs_runs():
+        """Recent ingestion runs with aggregate progress, newest first.
+
+        Progress is tracked per file, so without this a multi-file upload
+        reported N unrelated jobs and there was no way to see how the batch as
+        a whole was doing.
+        """
+        from app.services.progress_store import list_runs
+        try:
+            limit = int(request.args.get('limit', default=20))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            return jsonify(runs=list_runs(limit=max(1, min(limit, 100))))
+        except Exception:
+            # Progress reporting is observability, not the product. If the
+            # table is missing (migrations not yet run) or the database is
+            # briefly unavailable, report no runs rather than returning 500 and
+            # making the jobs page look broken.
+            logger.warning("Unable to load processing runs", exc_info=True)
+            return jsonify(runs=[])
 
     # ── Auth UI ────────────────────────────────────────────────
 

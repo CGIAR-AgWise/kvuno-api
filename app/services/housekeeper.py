@@ -9,6 +9,7 @@ import gc
 import json
 import os
 import signal
+import socket
 import threading
 import time
 
@@ -155,9 +156,21 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
     return default_map
 
 
-def _write_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
+def _write_progress(file_path: str, status: str, current: int, total: int, message: str = "",
+                    run_id: int | None = None, error: str | None = None):
+    """Record progress for one file.
+
+    ``run_id`` groups the files submitted together so the UI can report batch
+    progress; ``error`` is stored separately from ``message`` so routine
+    progress updates cannot erase why a job failed.
+    """
     from app.services.progress_store import save_progress
-    save_progress(file_path, status, current, total, message)
+    save_progress(
+        file_path, status, current, total, message,
+        run_id=run_id, error=error,
+        worker=os.getenv('HOSTNAME') or socket.gethostname(),
+        original_filename=os.path.basename(file_path),
+    )
 
 
 # ── DB helpers ─────────────────────────────────────────────────
@@ -338,6 +351,7 @@ def process_file(
     chunk_size: int = 10000,
     checkpoint_interval: int = 50,
     dry_run: bool = False,
+    run_id: int | None = None,
 ):
     """
     Processes a single file by reading its contents in chunks, converting data to
@@ -345,6 +359,9 @@ def process_file(
     Supports resumable processing via checkpoint-based commits.
 
     Accepts both ``.RDS`` (via pyreadr) and ``.parquet`` files.
+
+    ``run_id`` associates this file with a :class:`ProcessingRun` so a batch of
+    files submitted together can be tracked and reported as a unit.
     """
     start_time = time.time()
     file_name = os.path.basename(file_path)
@@ -408,7 +425,7 @@ def process_file(
                 num_rows = len(data)
                 chunk_source = _iter_frame_chunks(data, resume_offset, chunk_size)
 
-            _write_progress(file_path, 'processing', resume_offset, num_rows, 'Processing…')
+            _write_progress(file_path, 'processing', resume_offset, num_rows, 'Processing…', run_id=run_id)
 
             if resume_offset >= num_rows:
                 logger.warning(f"File {file_name} offset ({resume_offset}) >= total rows ({num_rows}), skipping")
@@ -495,7 +512,7 @@ def process_file(
 
                     if not shutdown_requested:
                         last_committed_row = chunk_end
-                        _write_progress(file_path, 'processing', last_committed_row, num_rows)
+                        _write_progress(file_path, 'processing', last_committed_row, num_rows, run_id=run_id)
 
                     if batches_since_checkpoint >= checkpoint_interval and not shutdown_requested:
                         session.commit()
@@ -506,7 +523,7 @@ def process_file(
                         break
 
             except BaseException:
-                _write_progress(file_path, 'error', last_committed_row, num_rows, "Interrupted")
+                _write_progress(file_path, 'error', last_committed_row, num_rows, "Interrupted", run_id=run_id, error="Interrupted")
                 pbar.close()
                 session.rollback()
                 raise
@@ -535,17 +552,17 @@ def process_file(
                 )
             else:
                 file_import_repo.upsert_offset(checksum, file_name, num_rows, original_filename)
-                _write_progress(file_path, 'completed', num_rows, num_rows, "Done")
+                _write_progress(file_path, 'completed', num_rows, num_rows, "Done", run_id=run_id)
                 logger.info(f"File {file_name} fully processed and recorded")
 
             if failed_batches:
                 logger.warning(f"File {file_name} processed with {failed_batches} failed batch(es)")
 
         except FileNotFoundError as e:
-            _write_progress(file_path, 'error', 0, 0, str(e))
+            _write_progress(file_path, 'error', 0, 0, str(e), run_id=run_id, error=str(e))
             logger.error(f"Failed to process file {file_name}: {e}")
         except Exception as e:
-            _write_progress(file_path, 'error', 0, 0, str(e))
+            _write_progress(file_path, 'error', 0, 0, str(e), run_id=run_id, error=str(e))
             logger.error(f"Unexpected error processing file {file_name}: {e}")
         finally:
             elapsed_time = time.time() - start_time
