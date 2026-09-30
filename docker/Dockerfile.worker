@@ -27,4 +27,10 @@ RUN chown app:app /app
 
 USER app
 
+# Verifies database + Redis reachability before Celery starts, then execs CMD.
+# A worker without a broker would otherwise idle forever instead of failing.
+COPY --chown=app:app docker/entrypoint.worker.sh /app/docker/entrypoint.worker.sh
+RUN chmod +x /app/docker/entrypoint.worker.sh
+ENTRYPOINT ["/app/docker/entrypoint.worker.sh"]
+
 CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
