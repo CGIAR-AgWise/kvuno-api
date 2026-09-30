@@ -9,6 +9,11 @@ on:
       image_name:
         required: true
         type: string
+      context:
+        required: false
+        type: string
+        # The SPA builds from ./frontend; the Python images from the repo root.
+        default: '.'
       branch_ref:
         required: true
         type: string
@@ -64,7 +69,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           build-args: APP_VERSION=${{ inputs.app_version }}
           push: true
