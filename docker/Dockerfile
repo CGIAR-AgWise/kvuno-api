@@ -50,6 +50,12 @@ USER app
 
 EXPOSE 80
 
+# /health reports the DB connection status, so it only passes once the app can
+# actually serve. The `web` (nginx) service gates on this via
+# `depends_on: condition: service_healthy`, so it does not start proxying to an
+# API that is still applying migrations.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=40s --retries=5     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
+
 # Applies pending Alembic migrations, then execs the CMD below. Set
 # RUN_MIGRATIONS=false to skip.
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
