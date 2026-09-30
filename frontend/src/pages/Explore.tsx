@@ -95,9 +95,9 @@ export default function Explore() {
     setLoadAll(next)
     if (next) {
       toast.push(
-        'Map will plot every matching point, not just the current page. ' +
-          'On a large dataset this is many rows and may take a while.',
-        'warning',
+        'Map will plot a random sample of matching points instead of only ' +
+          "the current page's rows.",
+        'info',
       )
     }
   }
@@ -319,7 +319,7 @@ export default function Explore() {
                   onChange={(e) => toggleLoadAll(e.target.checked)}
                 />
                 <label className="form-check-label small text-nowrap" htmlFor="load-all">
-                  All points
+                  Sample
                 </label>
               </div>
             </div>
@@ -482,15 +482,15 @@ function MapView({
           )
         }
         if (res.truncated) {
+          // Be explicit: this is a random sample, not a clipped view of the
+          // first N rows. "Plotted 5,000 of 2,282,356" alone reads as a bug.
           toast.push(
-            'Plotted ' +
+            'Showing a random sample of ' +
               lats.length.toLocaleString() +
-              ' of ' +
+              ' points from ' +
               res.total.toLocaleString() +
-              ' points — the map is capped at ' +
-              lats.length.toLocaleString() +
-              '. Narrow the filters for full detail.',
-            'warning',
+              ' matches. Narrow the filters for full detail.',
+            'info',
           )
         }
       })
