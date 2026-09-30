@@ -182,7 +182,13 @@ def create_app():
     # app.config['OPENAPI_HTML_STRING'] = '<!DOCTYPE html><script>window.location.href="swagger"</script>'
 
     # Enable Cross-Origin Resource Sharing (CORS)
-    cors_origins = os.getenv('CORS_ORIGINS', 'http://127.0.0.1:5000')
+    # In production nginx proxies /api and /ui to this app, so the browser sees
+    # one origin and CORS is unused. These defaults only matter when the SPA
+    # runs on its own dev server (`vite dev`, port 5173).
+    cors_origins = os.getenv(
+        'CORS_ORIGINS',
+        'http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173',
+    )
     origins = [o.strip() for o in cors_origins.split(',') if o.strip()]
     CORS(app, origins=origins, supports_credentials=True)
 

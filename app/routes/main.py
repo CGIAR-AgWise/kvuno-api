@@ -4,7 +4,7 @@ import shutil
 import time
 import uuid
 
-from flask import abort, redirect, jsonify, render_template, request, Response, stream_with_context
+from flask import abort, redirect, jsonify, request, Response, stream_with_context
 
 from pathlib import Path
 
@@ -69,12 +69,26 @@ def register_app_routes(app):
     @app.route('/')
     def index():
         """
-        Route for the root URL.
+        Point browsers at the SPA.
 
-        Returns:
-            Response: Redirect to the upload UI.
+        The UI is a separate React app served by its own nginx container; this
+        service renders no HTML. Redirecting to '/' by default would point the
+        browser back at *this* service, which redirects again — an infinite
+        loop, reported as ERR_TOO_MANY_REDIRECTS or ERR_SOCKET_NOT_CONNECTED.
+
+        So SPA_ROOT_URL must name the SPA's actual origin. When it is unset,
+        return a small JSON pointer instead of a redirect.
         """
-        return redirect('/ui/jobs')
+        spa_root = os.getenv('SPA_ROOT_URL', '').strip()
+        if not spa_root:
+            return jsonify({
+                'service': 'kvuno-api',
+                'message': 'This service does not serve the web UI. '
+                           'Set SPA_ROOT_URL to the SPA origin, or open the web container.',
+                'api_docs': '/api-docs',
+                'health': '/health',
+            }), 200
+        return redirect(spa_root, code=302)
 
     @app.route('/health', methods=['GET'])
     def health_check():
@@ -97,11 +111,6 @@ def register_app_routes(app):
 
     # ── Upload UI ──────────────────────────────────────────────
 
-    @app.route('/ui/upload', methods=['GET'])
-    @require_auth
-    def upload_ui():
-        max_size = int(os.getenv('MAX_FILE_SIZE_MB', '20'))
-        return render_template('upload.html', max_file_size=max_size * 1024 * 1024, active_nav='upload')
 
     @app.route('/ui/upload/resumable', methods=['GET'])
     @require_auth
@@ -247,26 +256,6 @@ def register_app_routes(app):
         except (json.JSONDecodeError, OSError) as e:
             return jsonify(status='error', current=0, total=0, message=str(e))
 
-    @app.route('/ui/jobs', methods=['GET'])
-    @require_auth
-    def ui_jobs_html():
-        return render_template('jobs.html', active_nav='jobs')
-
-    @app.route('/ui/explore', methods=['GET'])
-    @require_auth
-    def ui_explore():
-        return render_template('explore.html', active_nav='explore')
-
-    @app.route('/ui/tokens', methods=['GET'])
-    @require_auth
-    def ui_tokens():
-        return render_template('tokens.html', active_nav='tokens')
-
-    @app.route('/ui/quality', methods=['GET'])
-    @require_auth
-    def ui_quality():
-        return render_template('quality.html', active_nav='quality')
-
     @app.route('/ui/jobs/data', methods=['GET'])
     @require_auth
     def ui_jobs_data():
@@ -274,14 +263,6 @@ def register_app_routes(app):
         return jsonify(jobs=jobs)
 
     # ── Auth UI ────────────────────────────────────────────────
-
-    @app.route('/ui/login', methods=['GET'])
-    def ui_login():
-        return render_template('login.html')
-
-    @app.route('/ui/register', methods=['GET'])
-    def ui_register():
-        return render_template('register.html')
 
     @app.route('/ui/jobs/events', methods=['GET'])
     @require_auth
