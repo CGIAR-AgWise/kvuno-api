@@ -8,7 +8,6 @@ import {
   fetchClusters,
   fetchCoordinates,
   fetchFilters,
-  fetchAllPlantingRecords,
   fetchPlantingRecords,
   MAX_PER_PAGE,
 } from '../api'
@@ -68,8 +67,7 @@ export default function Explore() {
     const controller = new AbortController()
     setLoading(true)
     setError('')
-    const fetcher = loadAll ? fetchAllPlantingRecords : fetchPlantingRecords
-    void fetcher(params, controller.signal)
+    void fetchPlantingRecords(params, controller.signal)
       .then((data) => {
         setRecords(data.data ?? [])
         setMeta({
@@ -84,7 +82,7 @@ export default function Explore() {
       })
       .finally(() => setLoading(false))
     return () => controller.abort()
-  }, [params, loadAll, reloadKey])
+  }, [params, reloadKey])
 
   function updateFilter(key: keyof typeof EMPTY_FILTERS, value: string) {
     setFilters((f) => ({ ...f, [key]: value }))
@@ -93,16 +91,12 @@ export default function Explore() {
 
   function toggleLoadAll(next: boolean) {
     setLoadAll(next)
-    setPage(1)
     if (next) {
       toast.push(
-        'Loading every matching record. This walks the server in pages and ' +
-          'may take a while on a large dataset.',
+        'Map will plot every matching point, not just the current page. ' +
+          'On a large dataset this is many rows and may take a while.',
         'warning',
       )
-    } else {
-      // Switching modes must not show a page-5 slice of a different result set.
-      invalidateAll()
     }
   }
 
@@ -194,20 +188,6 @@ export default function Explore() {
             {loading && ' · loading…'}
           </span>
           <div className="ms-auto d-flex gap-2">
-            <div className="form-check form-switch d-flex align-items-center gap-2 mb-0">
-              <input
-                className="form-check-input mt-0"
-                type="checkbox"
-                role="switch"
-                id="load-all"
-                checked={loadAll}
-                onChange={(e) => toggleLoadAll(e.target.checked)}
-                disabled={loading}
-              />
-              <label className="form-check-label small text-nowrap" htmlFor="load-all">
-                Load all
-              </label>
-            </div>
             <select
               className="form-select form-select-sm"
               style={{ width: 'auto' }}
@@ -217,8 +197,6 @@ export default function Explore() {
                 setPage(1)
               }}
               aria-label="Rows per page"
-              disabled={loadAll}
-              title={loadAll ? 'Ignored while loading every record' : undefined}
             >
               {[50, 100, 200, 500].map((n) => (
                 <option key={n} value={n}>
@@ -307,16 +285,14 @@ export default function Explore() {
         </div>
 
         <div className="d-flex align-items-center mt-3">
-          {!loadAll && (
-            <Pagination
-              page={meta.current_page}
-              pages={meta.pages}
-              onChange={(next) => {
-                setPage(next)
-                window.scrollTo({ top: 0, behavior: 'smooth' })
-              }}
-            />
-          )}
+          <Pagination
+            page={meta.current_page}
+            pages={meta.pages}
+            onChange={(next) => {
+              setPage(next)
+              window.scrollTo({ top: 0, behavior: 'smooth' })
+            }}
+          />
           <span className="text-muted small">
             Page {meta.current_page} of {meta.pages}
           </span>
@@ -327,7 +303,23 @@ export default function Explore() {
         <div className="col-lg-5 order-1 order-lg-2">
           <div className="kvuno-card p-3">
             <div className="kvuno-map mb-2">
-              <MapView mode={mode} records={records} filters={filters} />
+              <MapView mode={mode} records={records} filters={filters} loadAll={loadAll} />
+            </div>
+            <div className="d-flex align-items-center justify-content-between gap-2 mb-2">
+              <span className="small text-muted">Map layer</span>
+              <div className="form-check form-switch d-flex align-items-center gap-2 mb-0">
+                <input
+                  className="form-check-input mt-0"
+                  type="checkbox"
+                  role="switch"
+                  id="load-all"
+                  checked={loadAll}
+                  onChange={(e) => toggleLoadAll(e.target.checked)}
+                />
+                <label className="form-check-label small text-nowrap" htmlFor="load-all">
+                  All points
+                </label>
+              </div>
             </div>
             <div className="btn-group btn-group-sm w-100" role="group" aria-label="Map layer">
               {(
@@ -363,10 +355,13 @@ function MapView({
   mode,
   records,
   filters,
+  loadAll,
 }: {
   mode: LayerMode
   records: PlantingRecord[]
   filters: typeof EMPTY_FILTERS
+  /** Plot every matching point instead of only the table's current page. */
+  loadAll: boolean
 }) {
   const container = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<L.Map | null>(null)
@@ -393,17 +388,19 @@ function MapView({
     }
   }, [])
 
-  // Points follow the table's current page.
+  // Points. Off `loadAll` these come from the table's current page, which is
+  // cheap but caps the map at one page. On, they come from the coordinates
+  // endpoint, which the client walks page by page (and the cache serves
+  // repeat visits), so the map shows the whole filtered set.
   useEffect(() => {
     const map = mapRef.current
     const markers = markersRef.current
     if (!map || !markers || mode !== 'points') return
     markers.clearLayers()
     const bounds: [number, number][] = []
-    for (const r of records) {
-      const lat = Number.parseFloat(String(r.lat))
-      const lon = Number.parseFloat(String(r.lon))
-      if (Number.isNaN(lat) || Number.isNaN(lon)) continue
+
+    const addPoint = (lat: number, lon: number, label: string) => {
+      if (Number.isNaN(lat) || Number.isNaN(lon)) return
       const marker = L.circleMarker([lat, lon], {
         radius: 5,
         fillColor: '#1976d2',
@@ -411,20 +408,63 @@ function MapView({
         weight: 1,
         fillOpacity: 0.8,
       })
-      marker.bindTooltip(
-        (r.country || '') +
-          ' - ' +
-          (r.variety || '') +
-          '<br/>Date: ' +
-          (r.opt_date || '') +
-          '<br/>Option: ' +
-          (r.planting_option || ''),
-      )
+      if (label) marker.bindTooltip(label)
       markers.addLayer(marker)
       bounds.push([lat, lon])
     }
-    if (bounds.length) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 12 })
-  }, [records, mode])
+
+    const fit = () => {
+      if (bounds.length) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 12 })
+    }
+
+    if (!loadAll) {
+      for (const r of records) {
+        addPoint(
+          Number.parseFloat(String(r.lat)),
+          Number.parseFloat(String(r.lon)),
+          (r.country || '') +
+            ' - ' +
+            (r.variety || '') +
+            '<br/>Date: ' +
+            (r.opt_date || '') +
+            '<br/>Option: ' +
+            (r.planting_option || ''),
+        )
+      }
+      fit()
+      return
+    }
+
+    const controller = new AbortController()
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries(filters)) if (value) query.set(key, value)
+    void fetchCoordinates(query, controller.signal)
+      .then((res) => {
+        markers.clearLayers()
+        bounds.length = 0
+        for (const c of res.rows) {
+          addPoint(
+            Number.parseFloat(String(c.lat)),
+            Number.parseFloat(String(c.lon)),
+            '',
+          )
+        }
+        fit()
+        if (res.truncated) {
+          toast.push(
+            'Plotted ' +
+              res.rows.length.toLocaleString() +
+              ' of ' +
+              res.total.toLocaleString() +
+              ' points — partial set.',
+            'warning',
+          )
+        }
+      })
+      .catch(() => undefined)
+
+    return () => controller.abort()
+  }, [records, mode, loadAll, toast])
 
   // Heatmap and clusters are their own server-side aggregations.
   useEffect(() => {
