@@ -112,8 +112,30 @@ def mark_stale(job: dict, now: float | None = None) -> dict:
     return job
 
 
+def _decode_hash(h: dict) -> dict:
+    """Normalise a Redis hash to str keys and values.
+
+    The client is built without ``decode_responses``, so ``hgetall`` returns
+    ``{b'status': b'processing', ...}``. Looking those up with a str key misses
+    every field, which silently degraded a job to ``status='unknown'`` with
+    zero rows — so the Jobs page showed every job as "Pending" while ingestion
+    was running normally, and the rows/sec + ETA never appeared either because
+    ``started_at`` was read the same way.
+    """
+    out = {}
+    for key, value in h.items():
+        if isinstance(key, (bytes, bytearray)):
+            key = key.decode('utf-8', 'replace')
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode('utf-8', 'replace')
+        out[key] = value
+    return out
+
+
 def _to_job(stem: str, h: dict) -> dict:
     """Normalise a hash into the shape the API and UI expect."""
+    h = _decode_hash(h)
+
     def _num(key, default=0):
         raw = h.get(key)
         try:

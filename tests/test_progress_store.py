@@ -204,3 +204,45 @@ class TestMarkStaleStillWorks:
         old = time.time() - (ps.STALE_AFTER_SECONDS + 10)
         for status in ('completed', 'error'):
             assert ps.mark_stale({'status': status, 'mtime': old})['status'] == status
+
+
+class TestRedisHashDecoding:
+    """Redis returns bytes unless decode_responses is set.
+
+    The progress client is built without it, so hgetall yields
+    {b'status': b'processing', ...}. Looking those up with str keys misses every
+    field, which silently degraded a job to status='unknown' with zero rows —
+    so the Jobs page showed everything as "Pending" while ingestion ran fine,
+    and started_at was lost too, which is why the rate/ETA never appeared.
+    """
+
+    def test_bytes_hash_is_decoded(self):
+        raw = {
+            b'status': b'processing',
+            b'current': b'605000',
+            b'total': b'2025504',
+            b'message': b'halfway',
+            b'mtime': b'1790762111.7',
+            b'started_at': b'1790761795.6',
+        }
+        job = ps._to_job('x.parquet', raw)
+        assert job['status'] == 'processing'
+        assert job['current'] == 605000
+        assert job['total'] == 2025504
+        assert job['message'] == 'halfway'
+        # started_at drives the rows/sec and ETA; it must survive.
+        assert job['started_at'] == 1790761795
+
+    def test_str_hash_still_works(self):
+        job = ps._to_job('x.parquet', {
+            'status': 'completed', 'current': '10', 'total': '10',
+            'message': 'Done', 'mtime': '1.0', 'started_at': '0.5',
+        })
+        assert job['status'] == 'completed'
+        assert job['current'] == 10
+
+    def test_missing_fields_still_default(self):
+        job = ps._to_job('x.parquet', {b'status': b'processing'})
+        assert job['status'] == 'processing'
+        assert job['current'] == 0
+        assert job['started_at'] == 0
