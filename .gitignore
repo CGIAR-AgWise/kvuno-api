@@ -15,3 +15,4 @@ node_modules/
 .aider*
 .venv-linux
 session-ses*
+frontend/dist/
