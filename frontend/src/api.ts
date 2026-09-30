@@ -375,53 +375,41 @@ export interface CoordinateBuffers {
   truncated: boolean
 }
 
-async function fetchCoordinateBuffers(
+/**
+ * Every matching coordinate pair in ONE request, as typed arrays.
+ *
+ * This replaces the page-walk the map used to do. Paging /coordinates reaches
+ * the same data at one request per 500 rows, so a 200k-point map is 400 requests
+ * and a full 2.2M-row dataset is 4,566 — which exhausts the per-endpoint rate
+ * limit after ~2.6% of the data and can never complete. The server caps this
+ * at COORDINATES_BULK_MAX_ROWS (default 500k) so the response stays bounded.
+ *
+ * `truncated` means the cap was hit and the map is a sample; the UI says so
+ * rather than implying the map is complete.
+ */
+export function fetchCoordinatesBulk(
   params: URLSearchParams,
   signal?: AbortSignal,
 ): Promise<CoordinateBuffers> {
-  const merged = new URLSearchParams(params.toString())
-  merged.set('format', 'compact')
-  let page = 1
-  let pages = 1
-  let total = 0
-  const lats: number[] = []
-  const lons: number[] = []
-
-  do {
-    merged.set('page', String(page))
-    merged.set('per_page', String(MAX_PER_PAGE))
-    const body = await request<{ lats?: number[]; lons?: number[] } & Partial<PageMeta>>(
-      '/api/v1/planting-data/coordinates',
-      { params: merged, signal },
-    )
-    const pageLats = body.lats ?? []
-    const pageLons = body.lons ?? []
-    for (let i = 0; i < pageLats.length; i += 1) {
-      lats.push(pageLats[i])
-      lons.push(pageLons[i])
-    }
-    total = body.total ?? 0
-    pages = body.pages ?? 1
-    page += 1
-  } while (page <= pages && page <= MAX_PAGES)
-
-  return {
-    lats: Float32Array.from(lats),
-    lons: Float32Array.from(lons),
-    total,
-    truncated: lats.length < total,
-  }
-}
-
-export const fetchCoordinatesBuffered = (
-  params: URLSearchParams,
-  signal?: AbortSignal,
-) =>
-  cached(
-    'coords-buf:' + params.toString(),
-    () => fetchCoordinateBuffers(params, signal),
+  return cached(
+    'coords-bulk:' + params.toString(),
+    async () => {
+      const body = await request<{
+        lats?: number[]
+        lons?: number[]
+        total?: number
+        truncated?: boolean
+      }>('/api/v1/planting-data/coordinates/all', { params, signal })
+      return {
+        lats: Float32Array.from(body.lats ?? []),
+        lons: Float32Array.from(body.lons ?? []),
+        total: body.total ?? 0,
+        truncated: Boolean(body.truncated),
+      }
+    },
     AGGREGATE_TTL_MS,
   )
+}
 
 export const fetchCoordinates = (params: URLSearchParams, signal?: AbortSignal) =>
   cached(

@@ -7,7 +7,7 @@ import 'leaflet.heat'
 import {
   fetchClusters,
   fetchCoordinates,
-  fetchCoordinatesBuffered,
+  fetchCoordinatesBulk,
   fetchFilters,
   fetchPlantingRecords,
   MAX_PER_PAGE,
@@ -447,7 +447,7 @@ function MapView({
     const controller = new AbortController()
     const query = new URLSearchParams()
     for (const [key, value] of Object.entries(filters)) if (value) query.set(key, value)
-    void fetchCoordinatesBuffered(query, controller.signal)
+    void fetchCoordinatesBulk(query, controller.signal)
       .then((res) => {
         markers.clearLayers()
         bounds.length = 0
@@ -487,7 +487,9 @@ function MapView({
               lats.length.toLocaleString() +
               ' of ' +
               res.total.toLocaleString() +
-              ' points — partial set.',
+              ' points — the map is capped at ' +
+              lats.length.toLocaleString() +
+              '. Narrow the filters for full detail.',
             'warning',
           )
         }
