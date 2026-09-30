@@ -6,28 +6,40 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 
 ## 1. Architecture
 
-`docker-compose.yml` defines three services:
+`docker-compose.yml` defines four services:
 
 | Service | Image | Purpose |
 |---|---|---|
 | `base` | `ghcr.io/masgeek/python-3.14-poetry:2.3.2` (from `docker/Dockerfile.base`) | Build-only: Python 3.14 + pinned Poetry. Never started; nothing runs in it. |
 | `api` | `ghcr.io/cgiar-agwise/kvuno-api` (built from `docker/Dockerfile`) | Flask dev server. Listens on **80** in the container; compose maps host `5000`. Entrypoint migrates, then serves. |
+| `web` | `ghcr.io/cgiar-agwise/kvuno-web` (built from `frontend/Dockerfile`) | nginx: serves the React SPA and reverse-proxies `/api`, `/ui`, `/health` to `api`. Listens on **80** in the container; compose maps host `${WEB_PORT:-8080}`. |
 | `worker` | `ghcr.io/cgiar-agwise/kvuno-worker` (built from `docker/Dockerfile.worker`) | Celery ingestion worker |
 
 ```
-┌──────────────┐      port 5432     ┌──────────────┐
-│  PostgreSQL  │◀───────────────────│     api      │
-│  + PostGIS   │   DB_HOST=db       │  Flask API   │
-│  (external)  │                    │   port 80   │
-└──────────────┘                    └──────┬───────┘
-                                             │
-┌──────────────┐                              │
-│    redis     │◀───── broker, results ─────▶│    worker    │
+                       ┌──────────────────────┐
+                       │  Browser → :${WEB_PORT}│
+                       └──────────┬───────────┘
+                                  │ HTTP
+                       ┌──────────▼───────────┐
+                       │         web          │
+                       │  nginx + React SPA   │
+                       └──────────┬───────────┘
+                                  │ /api, /ui, /health  (same origin)
+┌──────────────┐      port 5432 ┌──▼───────────┐
+│  PostgreSQL  │◀───────────────│     api      │
+│  + PostGIS   │    DB_HOST=db  │  Flask API   │
+│  (external)  │                │   port 80    │
+└──────────────┘                └──────┬───────┘
+                                       │
+┌──────────────┐                       │
+│    redis     │◀───── broker, results ─┴────▶│    worker    │
 │  (external)  │      job progress keys      │  Celery task │
 └──────────────┘                              └──────────────┘
 ```
 
-> **Postgres and Redis are no longer compose services.** They are expected to be running elsewhere (or added back via an override file), and `DB_HOST` / `CELERY_BROKER_URL` must point at whatever is reachable. The services also no longer declare `depends_on`. If you need the full stack locally, bring your own `postgis/postgis:17-3.5` and `redis:7-alpine`, or add a `docker-compose.override.yml`.
+> **The browser talks to `web`, not `api`.** nginx reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is same-origin: no CORS preflight and the bearer token never crosses origins. Point users at `http://localhost:${WEB_PORT:-8080}`; the API port is for `/api-docs` and direct API calls. nginx must be reachable by the browser for the SPA to load at all — the Flask container alone serves no HTML.
+
+> **Postgres and Redis are no longer compose services.** They are expected to be running elsewhere (or added back via an override file), and `DB_HOST` / `CELERY_BROKER_URL` must point at whatever is reachable. The `api` and `worker` services also no longer declare `depends_on`. If you need the full stack locally, bring your own `postgis/postgis:17-3.5` and `redis:7-alpine`, or add a `docker-compose.override.yml`. (`web` is the exception: it declares `depends_on: api` so the proxy target exists when nginx starts.)
 
 `api` and `worker` both bind-mount `${DATA_DIR:-./data}` at `/app/static/data`.
 
@@ -43,7 +55,8 @@ The compose file reads these variables from the host environment (or `.env` file
 
 | Compose variable | Default | Used by |
 |---|---|---|
-| `TAG` | `latest` | `api` / `worker` image tag |
+| `TAG` | `latest` | `api` / `worker` / `web` image tag |
+| `WEB_PORT` | `8080` | Host port mapped to the `web` (nginx SPA) container's port 80 |
 | `DATA_DIR` | `./data` | Host directory mounted at `/app/static/data` |
 | `DB_NAME` | *(required)* | Database name |
 | `DB_USER` | *(required)* | Database user |
@@ -57,6 +70,7 @@ The compose file reads these variables from the host environment (or `.env` file
 |---|---|
 | `api` | `env_file: .env` (the explicit `environment:` block is commented out) |
 | `worker` | Explicit `environment:` block with `${VAR:-default}` interpolation |
+| `web` | None — nginx needs no application config; the proxy target is `api:80` in `frontend/nginx.conf` |
 | All | `load_dotenv()` at import time, so a mounted/baked `.env` also applies |
 
 ### Required values for the app container
@@ -90,9 +104,32 @@ docker compose build base
 # before it starts serving, so there is no separate migration step.
 docker compose up --build -d
 
-# Verify health
+# Verify health (through the SPA's nginx, or straight at the API)
+curl http://localhost:8080/health
 curl http://localhost:5000/health
 ```
+
+### Running the SPA
+
+`web` is a normal compose service; nothing extra is required.
+
+```bash
+docker compose up -d web        # nginx + the prebuilt bundle
+docker compose logs -f web
+```
+
+In development you can skip the image entirely and run the Vite dev server, which
+proxies the same paths to Flask — no build, no nginx, hot reload:
+
+```bash
+cd frontend
+pnpm install
+pnpm dev              # Vite on http://localhost:5173, proxying /api, /ui, /health to localhost:80
+```
+
+Run `python run.py` (or `docker compose up -d api`) first, since the dev server only
+proxies — it does not serve the API. `CORS_ORIGINS` already allows the Vite port
+(`http://localhost:5173`, `http://127.0.0.1:5173`) by default.
 
 ### Normal start/stop
 
@@ -110,6 +147,7 @@ docker compose down -v        # Stop and delete volumes (wipes DB)
 docker compose build --no-cache base
 
 docker compose build --no-cache api
+docker compose build web       # or `cd frontend && pnpm run build`
 docker compose up -d
 ```
 
@@ -154,15 +192,17 @@ docker compose exec api python housekeeping.py
 ### Interactive shell
 
 ```bash
+```bash
 docker compose exec api bash
 docker compose logs -f worker
+docker compose logs -f web
 ```
 
 ---
 
 ## 5. Image Variants
 
-Four Dockerfiles live in `docker/`. The three application images share a builder base; none of them install Poetry themselves. The build context is still the **repo root** — only the Dockerfile paths changed — so `docker-compose.yml` and `.dockerignore` remain at the root, and `COPY` paths inside the Dockerfiles are unchanged.
+Four Dockerfiles live in `docker/`, and a fifth (`frontend/Dockerfile`) builds the SPA. The three Python application images share a builder base; none of them install Poetry themselves. The build context for those is still the **repo root** — only the Dockerfile paths changed — so `docker-compose.yml` and `.dockerignore` remain at the root, and `COPY` paths inside the Dockerfiles are unchanged. The SPA image is the exception: `frontend/Dockerfile` builds from the **`frontend/`** context with node and pnpm, and its runtime stage is nginx.
 
 The base installs Poetry with the official installer
 (`https://install.python-poetry.org`), pinned to `ARG POETRY_VERSION`, and
@@ -177,6 +217,7 @@ that step and purged again in the same layer.
 | `docker/Dockerfile` | `ghcr.io/cgiar-agwise/kvuno-api` (dev) | Installs `--only main`; runs `python3 run.py` |
 | `docker/Dockerfile.prod.dockerfile` | same image name, prod build | Installs `--only main`; runs Gunicorn; adds a `HEALTHCHECK` |
 | `docker/Dockerfile.worker` | `ghcr.io/cgiar-agwise/kvuno-worker` | Runs the Celery worker |
+| `frontend/Dockerfile` | `ghcr.io/cgiar-agwise/kvuno-web` | `node:24-alpine` build stage (pnpm + `tsc -b && vite build`) → `nginx:1.27-alpine` runtime with `frontend/nginx.conf`. Does **not** use the Python base. |
 
 The dev and prod images share a base and differ only in dependency flags, CMD, and the `HEALTHCHECK`. Both use the same `docker/entrypoint.sh`, which applies migrations and then `exec`s the image CMD — there is no mode variable to set at build or run time.
 
@@ -258,6 +299,13 @@ All application images use `python:3.14-slim` for the runtime stage and run as a
 - `celery -A app.celery_app worker --loglevel=info --concurrency=1`
 - `restart: unless-stopped`
 
+**Web (`frontend/Dockerfile`)**
+- Build stage: `node:24-alpine` with pnpm enabled via corepack; `pnpm run build` runs `tsc -b` first, so a type error fails the image build instead of shipping a broken bundle
+- Runtime stage: `nginx:1.27-alpine` serving `dist/` plus `frontend/nginx.conf`
+- `HEALTHCHECK` spiders `http://localhost/`
+- No node in the final image — only nginx and a few hundred KB of static assets
+- `depends_on: api` in compose; the upstream is hardcoded to `api:80`, which is the compose service name (change it for a non-compose deploy)
+
 To build and run the production image standalone (base image must already be built):
 
 ```bash
@@ -290,6 +338,7 @@ There is no Postgres volume to back up here — the database is external (see §
 | 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
 | `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
 | Port 5000 already in use on the host | Another service on host port 5000 | Stop it, or remap the host side: `ports: - "5001:80"` |
+| Port 8080 already in use on the host | Another service on the `web` host port | Set `WEB_PORT=<other>` in the environment or `.env` |
 | `Permission denied` binding, app exits at startup | Container runs as non-root and port 80 is privileged | Add `cap_add: [NET_BIND_SERVICE]` (compose already does for `api`) |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |
 | `manifest unknown` on pull | Tag not built yet, or wrong `TAG` | Tags come from the Docker Build workflow; check what exists under the `CGIAR-AgWise` org |
@@ -301,6 +350,9 @@ There is no Postgres volume to back up here — the database is external (see §
 | A job shows as *Processing* indefinitely | The worker died (OOM, restart, crash) and never wrote a terminal status | It becomes *Stalled* after `JOB_STALE_AFTER_SECONDS` (default 1800) and offers Retry. A job that stays Processing past that is still being written to |
 | Worker container restarts during an ingest | Exceeded `WORKER_MEM_LIMIT` | Raise it, or check whether the file is unusually large for its format |
 | Entrypoint fails with `not found` | `docker/entrypoint.sh` checked out with CRLF | `.gitattributes` pins `*.sh` to LF; re-checkout after it is committed |
+| Page 404s or shows JSON at `/jobs`, `/explore`, … | You are on the API port; Flask serves no HTML | Use the `web` port (`http://localhost:${WEB_PORT:-8080}`) — nginx serves the SPA and falls back to `index.html` for client routes |
+| SPA loads but every API call fails | nginx cannot reach the upstream `api:80` | Check `docker compose logs web` and that the `api` service is on the same network; the upstream host is the compose service name |
+| CORS error in the browser | SPA and API on different origins (usually Vite dev without the proxy) | Use the proxy (`pnpm dev`, or nginx in compose) or add the origin to `CORS_ORIGINS` |
 | `denied: permission_denied: read_package` on push | The workflow's `GITHUB_TOKEN` cannot write the package | With a `push` trigger the token keeps `packages: write`. If it still fails, the package already exists with its own access rules — in the package settings set access to inherit from the repository, or add this repository explicitly |
 
 ---
@@ -336,9 +388,11 @@ Images are published to **GitHub Container Registry**, not Docker Hub:
 | Trigger | Image | Source Dockerfile | Tags |
 |---|---|---|---|
 | `develop` | `kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
+| `develop` | `kvuno-web` | `frontend/Dockerfile` (nginx + React bundle) | `:latest`, `:develop` |
 | `develop` | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:develop` |
 | `main` | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
 | any tag | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
+| any tag | `kvuno-web` | `frontend/Dockerfile` | `:latest`, `:<tag>`, `:production` |
 | any tag | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
 
 ### Build workflows
@@ -362,7 +416,7 @@ The gate marks the run failed rather than silently skipping, so a red push is vi
 
 The gate needs `actions: read` to read run status; the image jobs keep `packages: write`.
 
-Each job has a single-condition `if`. `main` builds **only** the production API image; the worker is not built there, so deploy the worker from a release tag.
+Each job has a single-condition `if`. `main` builds **only** the production API image; the worker and `kvuno-web` are not built there, so deploy those from a release tag.
 
 > `ghcr.io/masgeek/python-3.14-poetry` is **not** in this list: no CI workflow builds or pushes it. It is a general-purpose image, so it lives in the `masgeek` namespace rather than the `cgiar-agwise` one used by the kvuno images. Build it with `docker compose build base` and push it yourself if you want it available to others.
 
