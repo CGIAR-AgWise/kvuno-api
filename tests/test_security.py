@@ -200,10 +200,14 @@ class TestGetCurrentUser:
 
         token_id, secret = 1, "a" * 64
         bearer = f"{token_id}|{secret}"
+        # Naive UTC, which is what the `timestamp without time zone` column
+        # actually returns. This used to be an AWARE datetime, which hid the
+        # bug: production compared a naive DB value with an aware "now" and
+        # raised TypeError (500) for every token that had an expiry.
         mock_token_record = MagicMock(
             spec=UserToken, id=1,
             token=_hash_token(1, secret),
-            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1),
         )
         mock_session = MagicMock()
         mock_token_query = MagicMock()
@@ -415,8 +419,13 @@ class TestNoServerRenderedPages:
             ('/ui/jobs/events', 'GET'),
             ('/ui/progress/report.parquet', 'GET'),
             ('/ui/process', 'POST'),
-            ('/ui/upload/complete', 'POST'),
-            ('/ui/upload/resumable', 'POST'),
+            ('/ui/uploads', 'GET'),
+            ('/ui/uploads/tus', 'POST'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'HEAD'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'PATCH'),
+            ('/ui/uploads/' + 'a' * 32, 'GET'),
+            ('/ui/uploads/' + 'a' * 32, 'DELETE'),
+            ('/ui/uploads/' + 'a' * 32 + '/process', 'POST'),
         ]
         for path, method in needed:
             assert adapter.match(path, method=method), f'{method} {path} is gone'
@@ -428,6 +437,10 @@ class TestNoServerRenderedPages:
         with app.test_client() as c:
             assert c.get('/ui/columns').status_code == 401
             assert c.get('/ui/jobs/data').status_code == 401
+            assert c.get('/ui/uploads').status_code == 401
+            assert c.post('/ui/uploads/tus', headers={'Upload-Length': '10'}).status_code == 401
+            assert c.patch('/ui/uploads/tus/' + 'a' * 32, data=b'x',
+                           content_type='application/offset+octet-stream').status_code == 401
 
 
 class TestRequireAuth:

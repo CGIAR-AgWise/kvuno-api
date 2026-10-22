@@ -32,9 +32,9 @@ export default defineConfig(({ mode }) => {
       port: Number(env.VITE_DEV_PORT || 5173),
       proxy: {
         '/api': { target, changeOrigin: true },
-        // The resumable-upload endpoints, /ui/process, /ui/columns and the jobs
-        // SSE stream still live on the API container even though the HTML
-        // pages do not.
+        // The tus upload endpoints (/ui/uploads/*), /ui/process, /ui/columns
+        // and the jobs SSE stream still live on the API container even though
+        // the HTML pages do not.
         '/ui': { target, changeOrigin: true },
         '/health': { target, changeOrigin: true },
       },
@@ -42,7 +42,10 @@ export default defineConfig(({ mode }) => {
     build: {
       outDir: 'dist',
       emptyOutDir: true,
-      sourcemap: true,
+      // 'hidden': maps are still written for debugging a build locally, but
+      // bundles carry no sourceMappingURL and nginx refuses *.map, so the
+      // original source is not published alongside the app.
+      sourcemap: 'hidden',
     },
   }
 })
