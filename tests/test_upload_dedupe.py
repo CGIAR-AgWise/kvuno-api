@@ -3,8 +3,8 @@
 The worker already skips a file whose checksum is fully ingested
 (`existing.offset is None` -> return), but that happened *after* the job was
 enqueued. The user was told "Processing started", a job ran, and it silently did
-nothing. The check now happens at /ui/upload/complete, where the file is on disk
-and already being read for the preview.
+nothing. The check now happens during upload inspection, where the file is on
+disk and already being read for the preview.
 """
 
 from datetime import datetime
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.routes.main import _describe_duplicate
+from app.services.uploads import describe_duplicate as _describe_duplicate
 
 
 def _import(checksum='abc', offset=None, original='orig.parquet', processed=True):
@@ -61,6 +61,16 @@ def test_partially_processed_file_is_reported_as_partial(known):
     # 'partial' is a resume, not a duplicate — the file is worth submitting.
     assert result['status'] == 'partial'
     assert result['offset'] == 9317
+
+
+def test_offset_at_row_count_is_processed(known):
+    """Files completed before the worker cleared the offset kept offset == rows.
+
+    Those must read as done, not as a resume that would start at the end.
+    """
+    known['record'] = _import(offset=500)
+    assert _describe_duplicate('/tmp/x.parquet', total_rows=500)['status'] == 'processed'
+    assert _describe_duplicate('/tmp/x.parquet', total_rows=501)['status'] == 'partial'
 
 
 def test_missing_checksum_is_not_a_duplicate(known):

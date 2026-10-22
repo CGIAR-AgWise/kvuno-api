@@ -136,6 +136,7 @@ class TestClustersPagination:
     def test_clusters_are_limited(self, client, authed):
         repo = MagicMock()
         repo.get_clusters.return_value = [{"lat": 1.0, "lon": 2.0, "count": 10}]
+        repo.count_clusters.return_value = 30
         with patch("app.api.planting_data.repo", repo):
             resp = client.get("/api/v1/planting-data/clusters?zoom=5&page=2&per_page=25")
         assert resp.status_code == 200
@@ -171,7 +172,7 @@ class TestListEndpointsDefaultTo100:
         args = repo.get_paginated_data.call_args.args
         assert args[1] == 1 and args[2] == 100
 
-    def test_conflicts_defaults_to_100(self, client):
+    def test_conflicts_defaults_to_100(self, client, authed):
         repo = MagicMock()
         page = MagicMock(items=[], total=0, pages=0, page=1, per_page=100)
         repo.get_paginated.return_value = page
@@ -181,7 +182,7 @@ class TestListEndpointsDefaultTo100:
         args = repo.get_paginated.call_args.args
         assert args[1] == 1 and args[2] == 100
 
-    def test_conflicts_page_size_is_capped(self, client):
+    def test_conflicts_page_size_is_capped(self, client, authed):
         from app.dto.pagination import MAX_PER_PAGE
         repo = MagicMock()
         page = MagicMock(items=[], total=0, pages=0, page=1, per_page=MAX_PER_PAGE)
