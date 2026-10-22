@@ -21,6 +21,9 @@ type LayerMode = 'points' | 'heatmap' | 'clusters'
 
 const EMPTY_FILTERS = { country: '', province: '', variety: '', season_type: '' }
 
+/** Columns dropped below the md breakpoint so the table fits without scrolling. */
+const NARROW_HIDDEN = new Set(['season_type', 'planting_option'])
+
 export default function Explore() {
   const toast = useToast()
   const [records, setRecords] = useState<PlantingRecord[]>([])
@@ -235,7 +238,7 @@ export default function Explore() {
 
         {error && <div className="alert alert-danger">{error}</div>}
 
-        <div className="table-responsive kvuno-table-scroll">
+        <div className="kvuno-table-fit kvuno-table-scroll">
           <table className="table table-hover align-middle mb-0 sticky-top">
             <thead className="table-light">
               <tr>
@@ -253,8 +256,8 @@ export default function Explore() {
                 ).map(([key, label]) => (
                   <th
                     key={key}
-                    className="col-sort"
-                    style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}
+                    className={'col-sort' + (NARROW_HIDDEN.has(key) ? ' d-none d-md-table-cell' : '')}
+                    style={{ cursor: 'pointer' }}
                     tabIndex={0}
                     aria-sort={
                       sort?.col === key
@@ -292,9 +295,9 @@ export default function Explore() {
                     <td>{r.variety}</td>
                     <td className="kvuno-status">{r.lon}</td>
                     <td className="kvuno-status">{r.lat}</td>
-                    <td>{r.season_type}</td>
+                    <td className="d-none d-md-table-cell">{r.season_type}</td>
                     <td>{r.opt_date}</td>
-                    <td>{r.planting_option}</td>
+                    <td className="d-none d-md-table-cell">{r.planting_option}</td>
                   </tr>
                 ))
               )}

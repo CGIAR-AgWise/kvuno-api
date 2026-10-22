@@ -208,18 +208,18 @@ export default function Quality() {
 
           {error && <div className="alert alert-danger">{error}</div>}
 
-          <div className="table-responsive">
+          <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">
               <thead className="table-light">
                 <tr>
-                  <th>#</th>
+                  <th className="d-none d-md-table-cell">#</th>
                   <th>Country</th>
                   <th>Province</th>
                   <th>Variety</th>
                   <th>Season</th>
                   <th>Date</th>
                   <th>Source</th>
-                  <th>Logged</th>
+                  <th className="d-none d-md-table-cell">Logged</th>
                 </tr>
               </thead>
               <tbody>
@@ -232,14 +232,14 @@ export default function Quality() {
                 ) : (
                   rows.map((r) => (
                     <tr key={r.id}>
-                      <td>{r.id}</td>
+                      <td className="d-none d-md-table-cell">{r.id}</td>
                       <td>{r.country}</td>
                       <td>{r.province}</td>
                       <td>{r.variety}</td>
                       <td>{r.season_type}</td>
                       <td>{r.opt_date}</td>
                       <td>{r.source}</td>
-                      <td className="text-muted">{r.created_at?.slice(0, 10) ?? ''}</td>
+                      <td className="d-none d-md-table-cell text-muted">{r.created_at?.slice(0, 10) ?? ''}</td>
                     </tr>
                   ))
                 )}
@@ -267,7 +267,7 @@ export default function Quality() {
                   Showing a partial set — these counts are a lower bound.
                 </div>
               )}
-              <div className="table-responsive">
+              <div className="kvuno-table-fit">
                 <table className="table table-hover align-middle mb-0">
                   <thead className="table-light">
                     <tr>
