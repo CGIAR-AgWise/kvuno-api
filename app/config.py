@@ -102,6 +102,22 @@ TOKEN_TTL_DAYS = int(os.getenv('TOKEN_TTL_DAYS', '0'))
 # Set to 0 for no expiry, or a positive number of days.
 
 
+def registration_allowed_domains() -> frozenset[str]:
+    """Email domains allowed to self-register (REGISTRATION_ALLOWED_DOMAINS).
+
+    Comma-separated and case-insensitive, e.g. ``cgiar.org,iita.org``. Matching
+    is on the exact domain after the '@' — ``x.cgiar.org`` is NOT covered by
+    ``cgiar.org``; list it explicitly. Empty or unset disables registration
+    entirely: the endpoint used to be open to anyone on the internet, so the
+    safe default is closed. Existing accounts and login are unaffected.
+
+    Read on each call rather than at import so a deployment (or a test) can
+    change it without re-importing the module.
+    """
+    raw = os.getenv('REGISTRATION_ALLOWED_DOMAINS', '')
+    return frozenset(d.strip().lower().lstrip('@') for d in raw.split(',') if d.strip())
+
+
 # ── Housekeeping / ingestion ───────────────────────────────────
 
 HOUSEKEEPING_ENABLED = os.getenv('HOUSEKEEPING_ENABLED', 'false').lower() == 'true'
