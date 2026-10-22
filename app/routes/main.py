@@ -1,51 +1,23 @@
 import json
 import os
-import shutil
 import time
-import uuid
 
 from flask import abort, redirect, jsonify, request, Response, stream_with_context
 
 from pathlib import Path
 
 from app.auth import require_auth
-from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, MAX_FILE_SIZE
+from app.config import HOUSEKEEPING_DATA_DIR, MAX_FILE_SIZE
 from app.models.database_conn import MyDb
-from app.models.kvuno import PlantingRecommendation
-from app.utils.preview import FileTooLarge, build_preview, iter_chunks
+from app.routes.uploads import enqueue_upload, register_upload_routes
+from app.services import uploads as upload_service
+from app.services.uploads import COLUMN_ALIASES, DB_TARGET_COLUMNS, UploadError
 from app.utils.logging import SharedLogger
-from app.utils.rds_to_parquet import convert_for_ingestion
 
 logger = SharedLogger().get_logger()
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
-
-_EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
-DB_TARGET_COLUMNS = {
-    col.name for col in PlantingRecommendation.__table__.columns
-    if col.name not in _EXCLUDED
-}
-
-COLUMN_ALIASES = {
-    'cultivar': 'variety',
-    'season': 'season_type',
-    'sowing_date': 'opt_date',
-    'planting_date': 'opt_date',
-    'plantingdate': 'opt_date',
-    'date': 'opt_date',
-    'longitude': 'lon',
-    'long': 'lon',
-    'latitude': 'lat',
-    'lat_y': 'lat',
-    'lon_x': 'lon',
-}
-
-CHUNK_DIR = os.path.join(DATA_DIR, '.chunks')
-
-
-def _chunk_path(identifier: str, number: int):
-    return os.path.join(CHUNK_DIR, identifier, str(number))
 
 
 def _load_jobs():
@@ -61,34 +33,14 @@ def _format_jobs(raw):
     return raw, counts
 
 
-def _describe_duplicate(file_path: str) -> dict | None:
-    """Describe a previously-ingested file with the same content, if any.
+def _in_data_dir(file_name: str) -> Path | None:
+    """Resolve `file_name` inside the data directory, or None if it escapes it.
 
-    Returns None, or {status, original_filename, processed_at, offset} where
-    status is 'processed' (already fully ingested, re-running is a no-op) or
-    'partial' (interrupted, re-running resumes from that row).
+    `is_relative_to`, not a string prefix: '/data2/x' starts with '/data'.
     """
-    try:
-        from app.utils import calculate_file_checksum
-        from app.repo.file_import import FileImportRepo
-
-        checksum = calculate_file_checksum(file_path, logger)
-        if not checksum:
-            return None
-        existing = FileImportRepo().get_by_checksum(checksum)
-        if existing is None:
-            return None
-        return {
-            'status': 'processed' if existing.offset is None else 'partial',
-            'original_filename': existing.original_filename or existing.file_name,
-            'processed_at': existing.processed_at.isoformat() if existing.processed_at else None,
-            'offset': existing.offset,
-        }
-    except Exception:
-        # A failed lookup must not block the upload; the worker still
-        # guards, so the worst case is the old behaviour.
-        logger.warning('Duplicate check failed', exc_info=True)
-        return None
+    data_dir = Path(DATA_DIR).resolve()
+    file_path = (data_dir / file_name).resolve()
+    return file_path if file_path.is_relative_to(data_dir) else None
 
 
 def register_app_routes(app):
@@ -140,162 +92,85 @@ def register_app_routes(app):
     @app.route('/ui/columns', methods=['GET'])
     @require_auth
     def ui_columns():
-        return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES)
+        # max_file_size lets the SPA refuse an oversized file before sending a
+        # byte, from the server's own limit rather than a hardcoded copy of it.
+        return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES,
+                       max_file_size=MAX_FILE_SIZE)
 
-    # ── Upload UI ──────────────────────────────────────────────
-
-
-    @app.route('/ui/upload/resumable', methods=['GET'])
-    @require_auth
-    def upload_resumable_test():
-        """Resumable.js test — return 200 if chunk exists, 204 otherwise."""
-        try:
-            identifier = request.args['resumableIdentifier']
-            number = int(request.args['resumableChunkNumber'])
-            path = _chunk_path(identifier, number)
-            if os.path.isfile(path) and os.path.getsize(path) > 0:
-                return '', 200
-        except (KeyError, ValueError, TypeError):
-            pass
-        return '', 204
-
-    @app.route('/ui/upload/resumable', methods=['POST'])
-    @require_auth
-    def upload_resumable_chunk():
-        """Receive a single chunk from resumable.js."""
-        try:
-            identifier = request.form['resumableIdentifier']
-            number = int(request.form['resumableChunkNumber'])
-        except (KeyError, ValueError):
-            return jsonify(error="Missing chunk metadata"), 400
-
-        chunk_file = request.files.get('file')
-        if not chunk_file:
-            return jsonify(error="No chunk data"), 400
-
-        chunk_dir = os.path.join(CHUNK_DIR, identifier)
-        os.makedirs(chunk_dir, exist_ok=True)
-        chunk_file.save(_chunk_path(identifier, number))
-        return jsonify(success=True)
-
-    @app.route('/ui/upload/complete', methods=['POST'])
-    @require_auth
-    def upload_resumable_complete():
-        """Merge chunks into final file and return column preview."""
-        body = request.get_json(silent=True) or {}
-        identifier = body.get('identifier')
-        total_chunks = body.get('totalChunks')
-        filename = body.get('filename', 'upload')
-
-        if not identifier or not total_chunks:
-            return jsonify(error="Missing identifier or totalChunks"), 400
-
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            return jsonify(error=f"Unsupported extension {ext}"), 400
-
-        unique_name = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(DATA_DIR, unique_name)
-
-        # Bound the merge as we go. Without this the endpoint accepted chunks of
-        # any size — the UI cap is client-side only — so one request could fill
-        # the disk and then block on a full-file RDS parse below.
-        try:
-            with open(dest, 'wb') as out:
-                for block in iter_chunks(identifier, _chunk_path, total_chunks, MAX_FILE_SIZE):
-                    out.write(block)
-        except FileTooLarge as e:
-            shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
-            if os.path.exists(dest):
-                os.remove(dest)
-            return jsonify(error=str(e)), 413
-        except FileNotFoundError:
-            if os.path.exists(dest):
-                os.remove(dest)
-            return jsonify(error="Missing chunk — upload may have failed"), 400
-
-        # clean up chunk dir
-        shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
-
-        # Convert RDS -> Parquet once, here. An RDS is re-parsed in full by both
-        # the preview below and again by the worker; a Parquet answers both from
-        # the footer plus one batch. Falls back to the RDS if conversion fails.
-        stored = convert_for_ingestion(dest)
-        ext = os.path.splitext(stored)[1].lower()
-
-        meta = {"original_name": filename}
-        with open(stored + '.meta.json', 'w') as f:
-            json.dump(meta, f)
-
-        try:
-            preview = build_preview(stored, ext)
-        except Exception as e:
-            for p in (stored, stored + '.meta.json'):
-                if os.path.exists(p):
-                    os.remove(p)
-            return jsonify(error=f"Failed to read file: {e}"), 400
-
-        # Dedupe check. The worker already skips a file whose checksum is
-        # fully processed, but that happens *after* the job is enqueued, so the
-        # user was told "Processing started" and then nothing happened. Checking
-        # here — the file is on disk and already being read for the preview —
-        # lets the UI say so up front and skip the work.
-        duplicate = _describe_duplicate(stored)
-
-        return jsonify(file=os.path.basename(stored), duplicate=duplicate, **preview)
-
+    register_upload_routes(app)
 
     @app.route('/ui/process', methods=['POST'])
     @require_auth
     def upload_ui_process():
+        """(Re)process a stored file — the Jobs page's Retry.
+
+        Omitting `column_map` re-uses the mapping saved with the upload. Retry
+        used to send `{}`, which overwrote the user's mapping with nothing and
+        re-ingested the file with the defaults.
+        """
         body = request.get_json(silent=True) or {}
         file_name = body.get('file')
-        column_map = body.get('column_map', {})
+        column_map = body.get('column_map') or None
 
-        if not file_name:
+        if not file_name or not isinstance(file_name, str):
             return jsonify(error="No file specified"), 400
 
+        upload = upload_service.find_by_stored_name(file_name)
+        if upload is not None:
+            try:
+                upload_service.submit(upload, column_map)
+            except UploadError as e:
+                return jsonify(error=str(e)), e.status
+            return enqueue_upload(upload)
+
+        # A file placed in the data directory by hand or by the API upload,
+        # which has no upload row and keeps its mapping in a sidecar.
         ext = os.path.splitext(file_name)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             return jsonify(error=f"Unsupported extension '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}"), 400
 
-        data_dir = Path(DATA_DIR).resolve()
-        file_path = (data_dir / file_name).resolve()
-        if not str(file_path).startswith(str(data_dir)):
+        file_path = _in_data_dir(file_name)
+        if file_path is None:
             abort(404)
         if not file_path.is_file():
             return jsonify(error=f"File not found: {file_name}"), 404
 
-        invalid = [v for v in column_map.values() if v not in DB_TARGET_COLUMNS]
-        if invalid:
-            return jsonify(error=f"Invalid target columns: {invalid}"), 400
+        if column_map is not None:
+            if not isinstance(column_map, dict):
+                return jsonify(error="column_map must be an object"), 400
+            invalid = [v for v in column_map.values() if v not in DB_TARGET_COLUMNS]
+            if invalid:
+                return jsonify(error=f"Invalid target columns: {invalid}"), 400
+            with open(str(file_path) + '.map.json', 'w') as f:
+                json.dump(column_map, f)
 
-        mapping_path = str(file_path) + '.map.json'
-        with open(mapping_path, 'w') as f:
-            json.dump(column_map, f)
-
+        from app.config import HOUSEKEEPING_ENABLED
         if HOUSEKEEPING_ENABLED:
             from app.services.housekeeper import process_file_async
-            process_file_async(file_path=file_path)
-            return jsonify(id=file_name, message="Processing started")
+            if process_file_async(file_path=file_path):
+                return jsonify(id=file_name, message="Processing started")
+            return jsonify(error="The job queue is unreachable. Try again shortly."), 503
 
         return jsonify(id=file_name, message="File saved with mapping. Set HOUSEKEEPING_ENABLED=true and start a Celery worker.")
 
     @app.route('/ui/progress/<file_name>', methods=['GET'])
     @require_auth
     def ui_progress(file_name):
-        data_dir = Path(DATA_DIR).resolve()
-        file_path = (data_dir / file_name).resolve()
-        if not str(file_path).startswith(str(data_dir)):
+        """One job, in the same shape as an item of /ui/jobs/data.
+
+        This used to read a `.progress.json` sidecar that nothing has written
+        since progress moved to progress_store, so the Jobs detail modal (and
+        its Retry) always saw 'unknown'. The lookup is now Redis/Postgres, not
+        the filesystem, but a name with a path separator is still refused: job
+        keys are basenames, so such a name can only be a probe.
+        """
+        if '/' in file_name or '\\' in file_name or file_name in ('.', '..'):
             abort(404)
-        progress_path = file_path.with_name(file_path.name + '.progress.json')
-        if not progress_path.is_file():
+        from app.services.progress_store import get_job
+        job = get_job(file_name)
+        if job is None:
             return jsonify(status='unknown', current=0, total=0, message='')
-        try:
-            with open(progress_path) as f:
-                return jsonify(**json.load(f))
-        except (json.JSONDecodeError, OSError) as e:
-            return jsonify(status='error', current=0, total=0, message=str(e))
+        return jsonify(job)
 
     @app.route('/ui/jobs/data', methods=['GET'])
     @require_auth

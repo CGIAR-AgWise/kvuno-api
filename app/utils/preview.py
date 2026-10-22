@@ -99,29 +99,3 @@ def build_preview(path: str, ext: str, n: int = DEFAULT_ROWS, use_cache: bool = 
             pass  # a missing cache is not worth failing the preview over
 
     return {**payload, 'cached': False}
-
-
-def iter_chunks(identifier: str, chunk_path, total: int, max_bytes: int):
-    """Yield chunk contents, raising FileTooLarge once `max_bytes` is passed.
-
-    Bounding the merge is what keeps a single request from filling the disk and
-    then hanging on a full RDS parse.
-    """
-    total_bytes = 0
-    for i in range(1, total + 1):
-        with open(chunk_path(identifier, i), 'rb') as fh:
-            while True:
-                block = fh.read(1024 * 1024)
-                if not block:
-                    break
-                total_bytes += len(block)
-                if total_bytes > max_bytes:
-                    raise FileTooLarge(total_bytes, max_bytes)
-                yield block
-
-
-class FileTooLarge(Exception):
-    def __init__(self, size: int, limit: int):
-        super().__init__(f'File too large ({size / 1024 / 1024:.1f} MB). Maximum allowed: {limit / 1024 / 1024:.0f} MB')
-        self.size = size
-        self.limit = limit

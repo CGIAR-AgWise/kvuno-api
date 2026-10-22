@@ -93,6 +93,51 @@ class ProcessingJob(Base):
     run: Mapped[Optional['ProcessingRun']] = relationship(back_populates='jobs')
 
 
+class Upload(Base):
+    """One file a user is uploading, from the first byte to submission.
+
+    The previous chunked-upload flow kept its state in files on disk — a
+    `.chunks/<identifier>/` directory plus `.meta.json`, `.map.json` and
+    `.preview.json` sidecars — so nothing recorded where an upload had got to,
+    and a worker boot that wiped `.chunks` lost every upload in flight. Every
+    step now moves this row forward instead:
+
+        receiving -> received -> inspecting -> ready | failed -> submitted
+
+    `id` is issued by the server (a uuid hex), never taken from the client.
+    """
+    __tablename__ = 'uploads'
+    __table_args__ = (
+        PrimaryKeyConstraint('id', name='uploads_pkey'),
+        Index('ix_uploads_owner_id', 'owner_id'),
+        Index('ix_uploads_status', 'status'),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    owner_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey('users.id', ondelete='SET NULL'))
+    original_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Declared by the client at creation (tus Upload-Length) and checked
+    # against MAX_FILE_SIZE before any bytes are accepted.
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default='receiving')
+    # The file the worker will read. Differs from the received file after an
+    # RDS is converted to Parquet during inspection.
+    stored_path: Mapped[Optional[str]] = mapped_column(String(512))
+    sha256: Mapped[Optional[str]] = mapped_column(String(64))
+    preview: Mapped[Optional[dict]] = mapped_column(JSON)
+    duplicate: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Source column -> DB column. Seeded with the server's guesses during
+    # inspection, replaced by the user's choice on submit, and re-used by Retry.
+    column_map: Mapped[Optional[dict]] = mapped_column(JSON)
+    error: Mapped[Optional[str]] = mapped_column(String(2000))
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP'))
+    # Written explicitly on every change; see ProcessingJob.updated_at.
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime, nullable=False, server_default=text('CURRENT_TIMESTAMP'))
+
+
 class FileImport(Base):
     __tablename__ = 'file_imports'
     __table_args__ = (
@@ -133,7 +178,12 @@ class PlantingRecommendation(Base):
     __tablename__ = 'planting_recommendations'
     __table_args__ = (
         PrimaryKeyConstraint('id', name='planting_recommendations_pkey'),
-        UniqueConstraint('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date', name='uq_planting_recommendation'),
+        # NULLS NOT DISTINCT (PG15+): every key column is nullable, and with the
+        # default NULLS DISTINCT a row with any NULL key never conflicted, so
+        # ON CONFLICT DO NOTHING re-inserted it on every replay. Declared here
+        # too so autogenerate does not try to revert migration f3a9c2d4e5b6.
+        UniqueConstraint('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date',
+                         name='uq_planting_recommendation', postgresql_nulls_not_distinct=True),
         Index('idx_check_sum', 'check_sum'),
         Index('idx_coordinates', 'coordinates', postgresql_using='gist'),
         Index('idx_country', 'country'),

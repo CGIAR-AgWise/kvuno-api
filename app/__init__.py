@@ -18,7 +18,24 @@ from app.config import build_db_url, APP_NAME, APP_VERSION, HOUSEKEEPING_DATA_DI
 load_dotenv()
 
 
+def _age_seconds(env_name: str, default: str) -> int:
+    """Parse an age like '30m', '12h', '1d', '2w' from the environment."""
+    raw = os.getenv(env_name, default).strip()
+    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+    try:
+        return int(raw[:-1]) * multipliers[raw[-1]]
+    except (KeyError, ValueError, IndexError):
+        return int(default[:-1]) * multipliers[default[-1]]
+
+
 def _cleanup_temp_files():
+    """Remove what is safely finished. Runs once per worker boot.
+
+    It must never touch anything in flight. It used to `rmtree` the whole
+    chunk directory here, and gunicorn boots a worker on every `max_requests`
+    recycle and timeout — so uploads in progress lost their chunks at random.
+    Uploads are now only removed once idle for UPLOAD_ABANDON_AGE.
+    """
     data_dir = Path(HOUSEKEEPING_DATA_DIR)
     if not data_dir.is_dir():
         return
@@ -27,33 +44,57 @@ def _cleanup_temp_files():
     import time
     log = logging.getLogger(__name__)
 
-    chunks_dir = data_dir / '.chunks'
-    if chunks_dir.is_dir():
-        shutil.rmtree(chunks_dir)
-        log.info("Cleaned up chunks directory")
+    # The retired resumable.js flow's directory. Nothing writes to it anymore.
+    legacy_chunks = data_dir / '.chunks'
+    if legacy_chunks.is_dir():
+        shutil.rmtree(legacy_chunks, ignore_errors=True)
 
-    raw = os.getenv('CLEANUP_AGE', '1d')
-    unit = raw[-1]
-    value = int(raw[:-1])
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    cutoff = time.time() - value * multipliers.get(unit, 86400)
+    from app.services import uploads as upload_service
+    try:
+        removed = upload_service.cleanup_abandoned(_age_seconds('UPLOAD_ABANDON_AGE', '7d'))
+        if removed:
+            log.info("Removed %d abandoned upload(s)", removed)
+    except Exception as e:
+        # Table missing (migrations not yet run) or DB down: try next boot.
+        # Roll back so the failed statement does not poison the job cleanup.
+        MyDb.get_db().session.rollback()
+        log.warning("Upload cleanup skipped: %s", e.__class__.__name__)
+
+    cutoff = time.time() - _age_seconds('CLEANUP_AGE', '1d')
 
     from app.services.progress_store import load_all_jobs, delete_job
-    for job in load_all_jobs():
+    try:
+        jobs = load_all_jobs()
+    except Exception as e:
+        # Redis down and the jobs table missing (migrations not yet run) must
+        # not stop the app from booting; there is nothing to clean up yet.
+        log.warning("Job cleanup skipped: %s", e.__class__.__name__)
+        jobs = []
+    for job in jobs:
         if job.get('status') != 'completed':
             continue
         if job.get('mtime', 0) > cutoff:
             continue
-        stem = job['file']
-        for suffix in ('.rds', '.parquet', '.meta.json', '.map.json', '.preview.json'):
-            target = data_dir / f"{stem}{suffix}"
+        # job['file'] already carries its extension ('<id>.parquet'); the old
+        # code appended another, so the data file itself was never removed.
+        file_name = job['file']
+        try:
+            upload = upload_service.find_by_stored_name(file_name)
+            if upload is not None:
+                upload_service.discard(upload)
+                log.info("Removed processed upload: %s", file_name)
+        except Exception:
+            log.warning("Could not remove upload for %s", file_name, exc_info=True)
+        for target in [data_dir / file_name] + [
+            data_dir / f"{file_name}{suffix}" for suffix in ('.meta.json', '.map.json', '.preview.json')
+        ]:
             try:
                 if target.is_file():
                     target.unlink()
                     log.info("Removed processed file: %s", target.name)
             except OSError:
                 pass
-        delete_job(stem)
+        delete_job(file_name)
 
 
 # API contact information
@@ -190,7 +231,10 @@ def create_app():
         'http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173',
     )
     origins = [o.strip() for o in cors_origins.split(',') if o.strip()]
-    CORS(app, origins=origins, supports_credentials=True)
+    # The tus upload protocol is driven by response headers, which a
+    # cross-origin client cannot read unless they are exposed.
+    CORS(app, origins=origins, supports_credentials=True,
+         expose_headers=['Location', 'Upload-Offset', 'Upload-Length', 'Tus-Resumable'])
 
     # Rate limiting
     from app.rate_limit import limiter
@@ -232,16 +276,21 @@ def create_app():
         if response.content_type and 'text/html' in response.content_type:
             response.headers.setdefault(
                 'Content-Security-Policy',
-                "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com; "
-                # Tiles are served from a./b./c. subdomains (see explore.js
-                # tileLayer('https://{s}.tile.openstreetmap.org/...')). A CSP host
+                # No CDN hosts: the SPA bundles Bootstrap, Leaflet and the
+                # rest from npm, and nothing loads from a CDN at runtime, so
+                # the old cdn.jsdelivr.net / unpkg.com allowances were only
+                # widening the policy. The Swagger UI at /api-docs serves its
+                # assets locally from flask-openapi3-swagger.
+                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                # Tiles are served from a./b./c. subdomains
+                # (tileLayer('https://{s}.tile.openstreetmap.org/...')). A CSP host
                 # without a wildcard matches only that exact host, so the
                 # subdomain form is required — keep the bare host too, since
                 # '*.host' does not match 'host' itself.
                 "img-src 'self' data: https://tile.openstreetmap.org https://*.tile.openstreetmap.org; "
-                "font-src 'self' https://cdn.jsdelivr.net; "
-                "connect-src 'self' https://tile.openstreetmap.org https://*.tile.openstreetmap.org https://cdn.jsdelivr.net; "
+                "font-src 'self'; "
+                "connect-src 'self' https://tile.openstreetmap.org https://*.tile.openstreetmap.org; "
                 "frame-ancestors 'none';"
             )
         return response
@@ -253,11 +302,6 @@ def create_app():
 
     # Initialize the database
     init_db(app)
-
-    @app.template_filter('datetime')
-    def datetime_filter(ts):
-        from datetime import datetime
-        return datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
 
     # Register APIs and other routes
     register_apis(app)
