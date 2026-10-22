@@ -7,18 +7,19 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 ## Features
 
 - **RDS File Ingestion** — Reads `.RDS` files using `pyreadr`, processes data in chunks with batch inserts
+- **Resumable Uploads** — The SPA uploads over the [tus](https://tus.io) protocol; an interrupted upload resumes from the last byte, and the file is inspected (RDS → Parquet, preview, checksum, suggested column mapping) in the background
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
 - **Background Processing** — Celery + Redis worker for async file ingestion; separately deployable
 - **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
-- **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering
-- **Multi-Database** — SQLite and PostgreSQL/PostGIS (the spatial features require PostGIS)
+- **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering in metres (geography cast)
+- **Database** — PostgreSQL/PostGIS. SQLite can run the migrations and serve the API for UI work, but ingestion (Postgres `ON CONFLICT`) and the spatial queries need Postgres
 - **Health Check** — `GET /health` returns app name, build version, and database status
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
 - **React Frontend** — Standalone Vite + React 18 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx
-- **Login & Registration UI** — SPA routes `/login` and `/register`
+- **Login & Registration UI** — SPA routes `/login` and `/register`; self-registration is limited to the email domains in `REGISTRATION_ALLOWED_DOMAINS` and is **disabled when that is unset**
 - **Token Management** — List and revoke tokens at the SPA route `/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
@@ -29,7 +30,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 |---|---|---|
 | Framework | Flask (via flask-openapi3) |
 | ORM | SQLAlchemy (flask-sqlalchemy) |
-| Database | SQLite / PostgreSQL (psycopg2) |
+| Database | SQLite / PostgreSQL (psycopg 3, `psycopg[binary]`) |
 | Migrations | Alembic |
 | Spatial | GeoAlchemy2 / PostGIS |
 | RDS Parsing | pyreadr + pandas |
@@ -72,9 +73,11 @@ kvuno/
 │   │   ├── file_import.py    # FileImport repository
 │   │   └── import_conflict.py# ImportConflict repository
 │   ├── routes/
-│   │   └── main.py           # JSON /ui/* endpoints, resumable upload, SSE, /health
+│   │   ├── main.py           # JSON /ui/* endpoints, /ui/process, SSE, /health
+│   │   └── uploads.py        # tus upload server + upload lifecycle (/ui/uploads/*)
 │   ├── services/
 │   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
+│   │   ├── uploads.py        # Upload storage, background inspection, column-mapping rules
 │   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
 │   │   └── watch_handler.py  # watchdog directory watcher
 │   ├── static/               # css/ favicon served by Flask
@@ -162,6 +165,17 @@ DB_PORT=5432
 # DB_NAME=kvuno.db
 ```
 
+### Make targets
+
+A root `Makefile` wraps the common commands; `make help` (or plain `make`) lists every target. A few you will use most:
+
+```bash
+make install     # poetry install + pnpm install in frontend/
+make check       # what CI checks: lint, tests, SPA build
+make dev         # API dev server (python run.py)
+make migration MSG="add uploads index"   # autogenerate, then edit it by hand
+```
+
 ### Database Migrations
 
 Migrations are applied by the container entrypoint (`docker/entrypoint.sh`) before the API starts. Locally, run them explicitly:
@@ -221,7 +235,7 @@ Redis is optional for the API because with housekeeping off, progress is stored 
 
 ### Frontend Architecture
 
-The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with **Vite** and **pnpm**, and served by **nginx** — the Flask app renders no pages. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`, `/ui`, and `/health` to the `api` service, so production is **same-origin**: no CORS preflight, and the bearer token never crosses origins. The remaining `/ui/*` JSON endpoints (resumable upload, `/ui/process`, `/ui/columns`, jobs SSE) still run on Flask and are reached through that proxy. Routes are code-split with `React.lazy`, so the heavy pages (Explore pulls in Leaflet, markercluster, and the heat layer) do not weigh down the initial bundle. `vite dev` proxies the same paths to the API, so local development is same-origin too. The target defaults to `http://127.0.0.1:5000` — the compose `api` service publishes host `5000` → container `80` — and is overridable with `VITE_DEV_PROXY_TARGET` (see `frontend/.env.example`).
+The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with **Vite** and **pnpm**, and served by **nginx** — the Flask app renders no pages. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`, `/ui`, `/health`, and `/api-docs` (Swagger UI; spec at `/api-docs/openapi.json`) to the `api` service, so production is **same-origin**: no CORS preflight, and the bearer token never crosses origins. The remaining `/ui/*` JSON endpoints (tus uploads under `/ui/uploads`, `/ui/process`, `/ui/columns`, jobs SSE) still run on Flask and are reached through that proxy. Routes are code-split with `React.lazy`, so the heavy pages (Explore pulls in Leaflet, markercluster, and the heat layer) do not weigh down the initial bundle. `vite dev` proxies the same paths to the API, so local development is same-origin too. The target defaults to `http://127.0.0.1:5000` — the compose `api` service publishes host `5000` → container `80` — and is overridable with `VITE_DEV_PROXY_TARGET` (see `frontend/.env.example`).
 
 | Layer | Value |
 |---|---|
@@ -234,9 +248,11 @@ The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with 
 
 ### Docker Deployment
 
-`docker-compose.yml` defines four services: `base` (build-only, never started), `api` (Flask dev server), `web` (nginx serving the React SPA on host port `${WEB_PORT:-8080}`), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `5000` to it. Open the UI at `http://localhost:8080`, not at the API port.
+`docker-compose.yml` defines `base` (build-only, never started), `api` (production image, Gunicorn), `api-dev` (Flask dev server, only with `--profile dev`, host `127.0.0.1:5002`), `web` (nginx serving the React SPA on host `127.0.0.1:5001`), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `127.0.0.1:5000` to it. Open the UI at `http://localhost:5001`, not at the API port. All published ports bind to loopback only; there is no `WEB_PORT` variable — change the mapping in the compose file or an override.
 
-Database migrations are applied by the `api` container's entrypoint before the server starts — there is no separate migration service. Set `RUN_MIGRATIONS=false` to skip, which is what you want if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
+Database migrations are applied by the `api` container's entrypoint when `RUN_MIGRATIONS=true` — the entrypoint's own default — but `docker-compose.yml` overrides it to `${RUN_MIGRATIONS:-false}`, so under compose either set it or run `docker compose exec api python scripts/run_migrations.py` after every upgrade. Keep it `false` if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
+
+> **Set `REGISTRATION_ALLOWED_DOMAINS`** (e.g. `cgiar.org,iita.org`) on the `api`, or nobody can sign up: unset or empty disables `POST /api/v1/users/register` (`403`). Existing accounts and login are unaffected.
 
 > PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
@@ -247,6 +263,8 @@ docker compose build base
 # Build and start
 docker compose up --build -d
 
+# Apply migrations (compose defaults RUN_MIGRATIONS to false)
+docker compose exec api python scripts/run_migrations.py
 
 # Verify
 curl http://localhost:5000/health
@@ -302,7 +320,7 @@ The Poetry version is the **tag**, not part of the name, so a Poetry bump publis
 
 ### Local Development without Postgres
 
-The app runs with SQLite for local development — no Postgres needed:
+The API can run on SQLite for UI and auth work — no Postgres needed:
 
 ```bash
 # Edit .env
@@ -310,16 +328,19 @@ DB_DRIVER=sqlite
 DB_NAME=kvuno.db
 HOUSEKEEPING_ENABLED=false
 
-# Run
+# Create the schema (works end-to-end on SQLite), then run
+alembic upgrade head
 python run.py
 ```
+
+Ingestion and the spatial endpoints still need PostgreSQL/PostGIS: the batch insert uses Postgres `ON CONFLICT`, and on SQLite `coordinates` is a plain text column with no `ST_*` functions.
 
 ### Local Development without Redis / Celery
 
 When `HOUSEKEEPING_ENABLED=false` (default), the app runs entirely without Redis:
 
 - The API serves data normally
-- File uploads return a warning response saying no worker is available
+- File uploads are still received and inspected (that runs in the API process); submitting saves the mapping and leaves the upload `ready` with a message saying no worker is configured
 - Set `HOUSEKEEPING_ENABLED=true` to enable background enqueuing (requires Redis accessible)
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full details on Compose configuration, environment variables, running commands inside containers, and troubleshooting.
@@ -328,11 +349,13 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full details on Compose configu
 
 ### File Processing (Background Worker)
 
-File ingestion is handled by a Celery worker. When `HOUSEKEEPING_ENABLED=true`, the `/api/v1/upload/` endpoint enqueues a task; the Celery worker processes it asynchronously.
+File ingestion is handled by a Celery worker. When `HOUSEKEEPING_ENABLED=true`, the `/api/v1/data/upload` endpoint enqueues a task; the Celery worker processes it asynchronously.
+
+Redis is **not** a compose service; run it externally and point `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` at it.
 
 ```bash
-# Start Redis (Docker)
-docker compose up -d redis
+# Start Redis (standalone Docker container, not part of docker-compose.yml)
+docker run -d --name kvuno-redis -p 6379:6379 redis:7
 
 # Start the Celery worker (Native — Linux)
 celery -A app.celery_app worker --loglevel=info
@@ -343,6 +366,23 @@ celery -A app.celery_app worker --loglevel=info --pool solo
 # Start the Celery worker (Docker)
 docker compose up --build -d worker
 ```
+
+Tasks are acked late and re-queued if the worker dies (`task_reject_on_worker_lost`), so `CELERY_VISIBILITY_TIMEOUT` (default 6 h) must exceed your longest single-file ingest or Redis hands a still-running task to a second worker. A per-file `<file>.ingest.lock` makes any such duplicate exit quietly. A database outage mid-file re-raises so Celery retries from the stored offset; a bad file is recorded as `error` at its last position and is not retried. Each submission (and each startup scan) is its own processing run, so the Jobs page keeps one history row per attempt.
+
+### Uploading Files (SPA)
+
+The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.ts`) to a tus 1.0 server (core + creation) in `app/routes/uploads.py`. The server issues the upload id and appends bytes at an offset, so a dropped connection, closed tab, or API restart resumes from the last byte. Each upload is a row in the `uploads` table and moves through:
+
+```
+receiving → received → inspecting → ready | failed → submitted
+```
+
+1. **Receive** — bytes land in `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked at creation, before any bytes arrive
+2. **Inspect** — on a background thread in the API process (no Celery needed): RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping
+3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once
+4. **Submit** — `POST /ui/uploads/<id>/process` saves the mapping and enqueues ingestion. The worker uses that mapping as-is (not merged over `RDS_COLUMN_MAP`). If the broker is unreachable the API returns `503` and the upload goes back to `ready`
+
+Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unsubmitted uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted at worker boot. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
 
 ### Legacy Housekeeping Script
 
@@ -368,7 +408,7 @@ What happens during a run:
 3. **Deduplication** — SHA-256 checksum lookup in `file_imports` table; fully imported files are skipped
 4. **Resumable processing** — Files with a stored `offset` resume from that row; incremental checkpoints commit every `checkpoint_interval` batches
 5. **Batch insert** — Records are inserted in savepoint-protected batches; individual batch failures are logged and skipped
-6. **Graceful shutdown** — `Ctrl+C` (or `SIGTERM`) commits completed batches and persists the offset for later resumption; a second `Ctrl+C` force-quits immediately
+6. **Graceful shutdown** — `Ctrl+C` (or `SIGTERM`) commits completed batches and persists the offset for later resumption; a second `Ctrl+C` force-quits immediately. These handlers are installed by the CLI only — gunicorn and Celery keep their own signal handling
 7. **Telemetry** — Structured JSON events (`housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`) are written to stderr for monitoring ingestion
 
 Remote files are configured via environment variables:
@@ -379,6 +419,8 @@ Remote files are configured via environment variables:
 | `REMOTE_RDS_TOKEN` | Bearer token for authenticated downloads |
 | `REMOTE_RDS_COOKIES` | Cookie header (e.g. `session=abc; token=xyz`) |
 | `REMOTE_RDS_HEADERS` | Custom headers as `key: value; key2: value2` |
+
+Downloads are SSRF-guarded (`app/utils/downloader.py`): HTTPS only unless `REMOTE_RDS_ALLOW_HTTP=true`; private, loopback, link-local and metadata addresses refused; redirects followed by hand (max 5), each hop re-checked, with the bearer token and `REMOTE_RDS_COOKIES` dropped when a redirect changes host; optional `REMOTE_RDS_ALLOWED_DOMAINS` (exact host or subdomain); `REMOTE_RDS_MAX_BYTES` (default 1 GiB) per file; and a post-connect peer-IP check against DNS rebinding (best effort, skipped behind an HTTP proxy).
 
 Convert large `.RDS` files to `.parquet` for faster processing:
 
@@ -404,7 +446,11 @@ curl http://localhost:5000/api/v1/planting-data/ \
   -H "Authorization: Bearer 1|a1b2c3d4e5f6..."
 ```
 
-Or sign in through the SPA at `/login` — the token is stored as a cookie for browser navigation. An unauthenticated browser hitting a protected endpoint is redirected to `SPA_LOGIN_PATH` (default `/login`); API clients still get a `401` JSON body.
+Or sign in through the SPA at `/login` — the token is stored as a cookie for browser navigation (`Secure` when the page is served over HTTPS). An unauthenticated browser hitting a protected endpoint is redirected to `SPA_LOGIN_PATH` (default `/login`); API clients still get a `401` JSON body. In the SPA, a `401` from any API call (an expired or revoked token) signs the user out and returns them to `/login?next=<page>`.
+
+Registration (`POST /api/v1/users/register`) is open only to email addresses whose domain is listed in `REGISTRATION_ALLOWED_DOMAINS` — exact, case-insensitive match, so `sub.cgiar.org` is not covered by `cgiar.org`. When the variable is unset or empty, registration is **disabled** (`403`). Passwords longer than 72 UTF-8 bytes (bcrypt's limit) are rejected at registration (`422`); a login with one is simply `401`.
+
+Error responses never carry exception text: a failing endpoint returns a generic `500` body and logs the exception server-side. Request validation errors (bad query/body parameters, including an unknown `sort_col`/`sort_dir`) are `422`, flask-openapi3's validation status.
 
 ### API Endpoints
 
@@ -422,15 +468,19 @@ Or sign in through the SPA at `/login` — the token is stored as a cookie for b
 | `GET` | `/tokens` | Required | SPA route — token management (nginx) |
 | `GET` | `/ui/jobs/data` | Required | JSON: job list |
 | `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
-| `POST` | `/ui/upload/resumable` | Required | Receive one upload chunk (resumable.js) |
-| `GET` | `/ui/upload/resumable` | Required | Chunk probe — 200 if exists, 204 otherwise |
-| `POST` | `/ui/upload/complete` | Required | Merge chunks, return columns + sample rows |
-| `POST` | `/ui/process` | Required | Save column mapping and start ingestion |
-| `GET` | `/ui/progress/<file_name>` | Required | Per-file progress JSON |
-| `GET` | `/ui/columns` | Required | Mappable DB columns + aliases |
-| `POST` | `/api/v1/users/register` | — | Register a new account |
+| `POST` | `/ui/uploads/tus` | Required | tus create — `Upload-Length` + `Upload-Metadata filename`; size and extension checked before any bytes (`413`/`415`) |
+| `HEAD` | `/ui/uploads/tus/<id>` | Required | tus offset probe — `Upload-Offset` to resume from |
+| `PATCH` | `/ui/uploads/tus/<id>` | Required | tus append at `Upload-Offset` (`409` offset mismatch, `423` another request holds the upload) |
+| `GET` | `/ui/uploads` | Required | The caller's unfinished uploads (survives a page reload) |
+| `GET` | `/ui/uploads/<id>` | Required | Upload status, preview, duplicate info, suggested mapping |
+| `POST` | `/ui/uploads/<id>/process` | Required | Validate + save the column mapping, enqueue ingestion |
+| `DELETE` | `/ui/uploads/<id>` | Required | Discard an upload that has not been submitted |
+| `POST` | `/ui/process` | Required | (Re)process a stored file — Jobs page Retry; omit `column_map` to re-use the saved one |
+| `GET` | `/ui/progress/<file_name>` | Required | One job's progress record (same shape as a `/ui/jobs/data` item), or `status: unknown` |
+| `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, and `max_file_size` |
+| `POST` | `/api/v1/users/register` | — | Register a new account (email domain must be in `REGISTRATION_ALLOWED_DOMAINS`, else `403`) |
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
-| `POST` | `/api/v1/users/logout` | Required | Revoke the current token |
+| `POST` | `/api/v1/users/logout` | Required | Revoke the current token (bearer header or `token` cookie) |
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
@@ -438,8 +488,8 @@ Or sign in through the SPA at `/login` — the token is stored as a cookie for b
 | `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
 | `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values (paginated per column) |
 | `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates (paginated) |
-| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated) |
-| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated) |
+| `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated by cluster: `pages` from `total_clusters`; bad `zoom`/bounds → `400`) |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated; `0` values are kept) |
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
 | `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated) |
 
@@ -468,14 +518,14 @@ single objects.
 | `page` | int | Page number (default: 1) |
 | `per_page` | int | Items per page (default: 100, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
-| `radius` | float | Search radius in meters (requires `coordinates`) |
+| `radius` | float | Search radius in metres (requires `coordinates`; measured on the geography, not in degrees) |
 | `country` | string | Country name (partial ILIKE match) |
 | `province` | string | Province name (partial ILIKE match) |
 | `variety` | string | Crop variety exact match |
 | `season_type` | string | Season type exact match |
 | `opt_date` | string | Optimal sowing date (`YYYY-MM-DD`) |
 | `planting_option` | string | Planting option exact match |
-| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI |
+| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI. `sort_col` must be one of `id`, `check_sum`, `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option`, `created_at`, `updated_at`; `sort_dir` `asc`/`desc`. Anything else is `422` |
 
 ### Response Format
 
@@ -517,18 +567,19 @@ Key environment variables (see `.env.example`):
 | `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
 | `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
 | `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
+| `REGISTRATION_ALLOWED_DOMAINS` | Comma-separated email domains allowed to self-register (exact, case-insensitive; no subdomain matching). **Unset/empty disables registration** (`403`) | — (disabled) | To allow sign-up |
 | `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
 | `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
 | `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
 | `RATE_LIMIT_DATA` | flask-limiter limit string | `120 per minute` | |
-| `RATE_LIMIT_DEFAULT_HOURLY` | Blanket limit for routes with no explicit limit (UI pages) | `600` | |
-| `RATE_LIMIT_DEFAULT_DAILY` | Same, daily | `5000` | |
-| `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs | `0` | |
+| `RATE_LIMIT_COORDINATES_BULK` | flask-limiter limit string (bulk coordinates endpoint) | `20 per minute` | |
+| `RATE_LIMIT_DEFAULT_HOURLY` | Blanket limit for routes with no explicit limit — a bare **count**; the code appends `per hour` | `600` (= `600 per hour`) | |
+| `RATE_LIMIT_DEFAULT_DAILY` | Same, daily — a bare count; the code appends `per day` | `5000` (= `5000 per day`) | |
+| `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs. Set `0` if nothing proxies the app, or `X-Forwarded-For` can be forged | `1` | |
 | `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
 | `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173` | |
 | `SPA_ROOT_URL` | Target of the `GET /` redirect | `/` | |
 | `SPA_LOGIN_PATH` | Where `require_auth` sends an unauthenticated browser | `/login` | |
-| `WEB_PORT` | Host port for the `web` (nginx SPA) compose service | `8080` | |
 | `FLASK_DEBUG` | Enable debug mode | `false` | |
 | `SERVER_HOST` | Bind address | `0.0.0.0` | |
 | `SERVER_PORT` | Bind port for the dev server | `80` | |
@@ -539,12 +590,13 @@ Key environment variables (see `.env.example`):
 | `THREADS` | Threads per worker | `4` | |
 | `TIMEOUT` | Request timeout (s) — raised from the 30s default for large uploads | `120` | |
 | `ACCESSLOG` / `ERRORLOG` | Gunicorn log targets; `-` means stdout/stderr | `-` | |
-| `LOG_LEVEL` | Gunicorn log level | `INFO` | |
-| `LOG_LEVEL` | Logging level | `DEBUG` | |
+| `LOG_LEVEL` | Log level for both the app logger and Gunicorn | `INFO` | |
 | `DEBUG_DB` | Echo SQL statements | `false` | |
 | `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |
-| `MAX_FILE_SIZE_MB` | Upload size cap (API-enforced) | `20` | |
-| `CLEANUP_AGE` | Age of completed files purged at startup (`1d`, `12h`, …) | `1d` | |
+| `MAX_FILE_SIZE_MB` | Upload size cap, enforced at tus creation before any bytes are accepted | `20` | |
+| `CLEANUP_AGE` | Age after which completed jobs' files are purged at worker boot (`1d`, `12h`, …) | `1d` | |
+| `UPLOAD_ABANDON_AGE` | Idle age after which an unsubmitted upload is deleted at worker boot (same format) | `7d` | |
+| `UPLOAD_INSPECT_STALE_SECONDS` | An upload stuck in `inspecting` this long is re-claimed on the next status poll | `180` | |
 | `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` | |
 | `HOUSEKEEPING_DATA_DIR` | Directory watched for uploads | `static/data` | |
 | `HOUSEKEEPING_BATCH_SIZE` | Rows per batch insert | `2000` | |
@@ -557,12 +609,15 @@ Key environment variables (see `.env.example`):
 | `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` | |
 | `CELERY_TASK_MAX_RETRIES` | Max retries per task | `10` | |
 | `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` | |
+| `CELERY_VISIBILITY_TIMEOUT` | Redis visibility timeout (s) before an unacked task is redelivered; must exceed the longest single-file ingest | `21600` | |
+| `INGEST_LOCK_STALE_SECONDS` | Age (s) at which a per-file `<file>.ingest.lock` with no refresh is taken over as dead | `600` | |
 | `REMOTE_RDS_URLS` | Semicolon-delimited remote file URLs | — | |
 | `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — | |
 | `REMOTE_RDS_COOKIES` | Cookie header (comma-separated `k=v` pairs) | — | |
 | `REMOTE_RDS_HEADERS` | Custom headers (`key: value; key2: value2`) | — | |
 | `REMOTE_RDS_ALLOW_HTTP` | Permit non-HTTPS remote URLs | `false` | |
-| `REMOTE_RDS_ALLOWED_DOMAINS` | Comma-separated domain allow-list | — (any) | |
+| `REMOTE_RDS_ALLOWED_DOMAINS` | Comma-separated domain allow-list (exact host or a true subdomain) | — (any) | |
+| `REMOTE_RDS_MAX_BYTES` | Max bytes per remote download, enforced while streaming | `1073741824` (1 GiB) | |
 
 ## CI/CD
 

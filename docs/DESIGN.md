@@ -12,8 +12,8 @@ information).
 
 | Goal | Frequency | Current UX |
 |------|-----------|------------|
-| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page (`/upload`) with resumable.js drag-drop + column mapping |
-| Preview data before ingestion | Every upload | ✅ Columns + sample rows returned by `/ui/upload/complete` |
+| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page (`/upload`) with tus (`frontend/src/lib/tus.ts`) drag-drop, resume, and column mapping |
+| Preview data before ingestion | Every upload | ✅ Columns + sample rows + duplicate check from background inspection (`GET /ui/uploads/<id>`) |
 | Monitor processing status | Per upload | ✅ Jobs page (`/jobs`) with live SSE updates |
 | Explore / query ingested data | Daily | ✅ `/explore` — filters, map, paged table |
 | Filter by country, variety, date | Daily | ✅ `<select>` dropdowns populated from `/planting-data/filters` |
@@ -35,12 +35,21 @@ CORS preflight is needed; `vite dev` proxies the same paths to the API
 `api` service), so local development matches it. Routes are code-split with `React.lazy`, which keeps
 Leaflet, markercluster, and the heat layer out of the initial bundle.
 
+Only Bootstrap's **CSS** is loaded, not its JS, so `data-bs-*` attributes do
+nothing: the mobile navbar collapse is React state in `Layout.tsx`, and the Jobs
+modal is a React component. Shared GETs go through `cached()`
+(`frontend/src/lib/cache.ts`), where one subscriber aborting no longer cancels the
+request for the others — under React StrictMode's double mount that used to leave
+Explore empty. Explore's sortable headers are keyboard-operable and expose
+`aria-sort`. nginx serves the SPA with its own CSP and security headers
+(`frontend/security-headers.conf`; no CDN hosts) and never serves source maps.
+
 | Layer | Value |
 |---|---|
 | Framework | React 18 + react-router 6 + TypeScript 5.7 |
 | Build tool | Vite 6, package manager pnpm |
 | Client routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
-| Runtime | nginx (`ghcr.io/cgiar-agwise/kvuno-web`, host `${WEB_PORT:-8080}`) |
+| Runtime | nginx (`ghcr.io/cgiar-agwise/kvuno-web`, compose host `127.0.0.1:5001`) |
 | Dev server | `pnpm dev` → Vite on `:5173` |
 
 ---
@@ -50,12 +59,15 @@ Leaflet, markercluster, and the heat layer out of the initial bundle.
 ### Page: Upload (`/upload`)
 
 **What exists:**
-- Drag-drop zone with Resumable.js chunked upload
-- Column mapping UI (auto-match + manual select) with sample values
-- Processing trigger (`POST /ui/process`), which either enqueues a Celery task or stores the mapping when `HOUSEKEEPING_ENABLED=false`
+- Drag-drop zone (multiple files) uploading with the in-house tus client (`frontend/src/lib/tus.ts`) in 5 MB pieces; a dropped connection, closed tab, or API restart resumes from the last byte, and re-selecting the same file after a reload continues it
+- Size and type are refused up front: the SPA reads `max_file_size` from `/ui/columns` instead of hardcoding 20 MB, and the server rejects at tus creation before any bytes are sent
+- Per-file status badge following the server lifecycle (`receiving` → `inspecting` → `ready` / `failed` → `submitted`), polled from `GET /ui/uploads/<id>`; inspection (RDS → Parquet, preview, checksum) runs server-side, so nothing waits on one long request
+- Unfinished uploads are listed from `GET /ui/uploads` on load, so a reload never loses a file waiting to be mapped; each can be discarded
+- Column mapping UI seeded with the **server's** suggestion, so the selects show exactly what will be sent; *skip* removes a column. `lat`/`lon` are required and each DB column can be used once
+- Duplicate warning when the same content was already ingested (or partially ingested)
+- Processing trigger (`POST /ui/uploads/<id>/process`), which enqueues a Celery task, returns `503` and leaves the upload `ready` when the broker is unreachable, or stores the mapping when `HOUSEKEEPING_ENABLED=false`
 
 **Gaps:**
-- Uploads one file at a time (Resumable.js `maxFiles: 1`)
 - No per-column type information
 - No way to re-map or correct after submission
 
@@ -64,10 +76,10 @@ Leaflet, markercluster, and the heat layer out of the initial bundle.
 **What exists:**
 - SSE live-updating table with status, progress bar, timestamps
 - Status filter tabs (All / Completed / Processing / Failed) and filename search
-- Per-job detail modal with a Retry action, wired to `POST /ui/process`
+- Per-job detail modal with a Retry action, wired to `POST /ui/process` with only the file name, so the server re-uses the mapping saved with the upload (it used to send `{}` and wipe it). The modal reads `/ui/progress/<file_name>`, which returns the job record from `app/services/progress_store.py` (Redis hot path, Postgres durable record) — it used to read a `.progress.json` file nothing wrote, so it always showed `unknown` and hid Retry
+- The modal is a real dialog: `role="dialog"`, focus moves into it and back on close, Escape closes it
+- Rows open their detail from the keyboard (focusable, Enter/Space), and progress bars carry an accessible label and value
 - Highlight scroll from upload redirect
-
-**Known issue:** the detail modal fetches `/ui/progress/<file_name>`, which reads a `.progress.json` file that nothing writes anymore — progress moved to Redis / the `job_progress` table via `app/services/progress_store.py`. The modal therefore shows `unknown` and the Retry button stays hidden. Fix by having `/ui/progress/<file_name>` return the record from `progress_store` instead of reading a file.
 
 **Gaps:**
 - No per-job logs, row counts, or duration
@@ -116,7 +128,7 @@ Defaults: `perPage=200`, hard-capped at 500 server-side by `_clamp_per_page()` (
 | Export | Server streaming endpoint | Client-side Blob only works below ~10k rows |
 | State in URL | react-router search params | Filters, page, and sort are shareable |
 | Build tool | Vite 6 + pnpm | `tsc -b && vite build`; output served by nginx |
-| Job progress | Redis pub/sub (`jobs:updates`), DB fallback | `app/services/progress_store.py` |
+| Job progress | Redis hash + pub/sub (`jobs:updates`) as the hot path; `processing_runs` / `processing_jobs` (Postgres) as the durable record, checkpointed every `JOB_DB_CHECKPOINT_SECONDS` | `app/services/progress_store.py` |
 
 UX stance: data scientists are not frontend engineers, so the pages stay a thin
 client over the existing JSON endpoints — no client-side data modelling, and the
@@ -135,23 +147,27 @@ Client-side (React, served by nginx — no Flask route):
   /register                → registration page
   /jobs                    → jobs page
   /explore                 → data explorer
-  /upload                  → upload page (resumable.js)
+  /upload                  → upload page (lib/tus.ts)
   /quality                 → data quality dashboard
   /tokens                  → token management
 
 Flask (JSON, reverse-proxied by nginx):
-GET  /ui/columns           → JSON: mappable DB columns + aliases
-GET  /ui/jobs/data         → JSON: job list
-GET  /ui/jobs/events       → SSE: live updates (Redis pub/sub, 3s poll fallback)
-GET  /ui/upload/resumable  → chunk probe (200 exists / 204 missing)
-POST /ui/upload/resumable  → receive one chunk
-POST /ui/upload/complete   → merge chunks, return columns + sample rows
-POST /ui/process           → save column mapping, enqueue ingestion
-GET  /ui/progress/<file>   → JSON: per-file progress (⚠️ currently reads a stale `.progress.json` file — see Jobs audit)
+GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_file_size
+GET    /ui/jobs/data               → JSON: job list
+GET    /ui/jobs/events             → SSE: live updates (Redis pub/sub, 3s poll fallback)
+POST   /ui/uploads/tus             → tus create (size/type checked before any bytes; 413/415)
+HEAD   /ui/uploads/tus/<id>        → tus Upload-Offset, for resuming
+PATCH  /ui/uploads/tus/<id>        → tus append at offset (409 mismatch, 423 busy)
+GET    /ui/uploads                 → JSON: the caller's unfinished uploads
+GET    /ui/uploads/<id>            → JSON: status, preview, duplicate, suggested mapping
+POST   /ui/uploads/<id>/process    → validate + save mapping, enqueue ingestion
+DELETE /ui/uploads/<id>            → discard an unsubmitted upload
+POST   /ui/process                 → re-process a stored file (Jobs Retry; re-uses the saved mapping)
+GET    /ui/progress/<file>         → JSON: one job record from progress_store (or status "unknown")
 
-POST   /api/v1/users/register          → create account
+POST   /api/v1/users/register          → create account (REGISTRATION_ALLOWED_DOMAINS only; 403 when unset)
 POST   /api/v1/users/login             → {id}|{secret} token
-POST   /api/v1/users/logout            → revoke current token
+POST   /api/v1/users/logout            → revoke current token (bearer or token cookie)
 GET    /api/v1/users/tokens            → list tokens
 POST   /api/v1/users/tokens            → create token
 DELETE /api/v1/users/tokens/<id>       → revoke token
@@ -163,11 +179,11 @@ GET  /api/v1/planting-data/clusters    → JSON: server-side spatial clusters (p
 GET  /api/v1/planting-data/export      → CSV / JSON stream of one page of results
 
 POST /api/v1/data/upload               → upload a single RDS/Parquet file
-GET  /api/v1/quality/stats             → JSON: summary statistics
-GET  /api/v1/quality/conflicts         → JSON: paginated conflict list
+GET  /api/v1/quality/stats             → JSON: summary statistics (auth required)
+GET  /api/v1/quality/conflicts         → JSON: paginated conflict list (auth required)
 ```
 
-Every Flask `/ui/*` endpoint requires a session (`@require_auth`); they redirect browsers to the SPA login route (`SPA_LOGIN_PATH`, default `/login`) and return `401` JSON to API clients. The React routes are guarded client-side by `AuthContext`.
+Every Flask `/ui/*` endpoint requires a session (`@require_auth`); they redirect browsers to the SPA login route (`SPA_LOGIN_PATH`, default `/login`) and return `401` JSON to API clients. The React routes are guarded client-side by `AuthContext` (a single provider). A `401` from **any** API call dispatches `kvuno:unauthorized` (`frontend/src/api.ts`); `AuthContext` drops the token and `RequireAuth` sends the user to `/login?next=<page>`, instead of leaving a signed-in shell whose every request fails. Logout always clears local state, even if the server call fails. The token cookie is `Secure` on HTTPS.
 
 ### API pagination
 
