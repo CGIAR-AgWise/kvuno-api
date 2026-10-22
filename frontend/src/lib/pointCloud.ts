@@ -25,6 +25,8 @@ export interface PointCloudOptions {
   radius?: number
   color?: string
   opacity?: number
+  /** Outline drawn around each point; null for none. */
+  stroke?: string | null
 }
 
 export function createPointCloud(
@@ -34,7 +36,8 @@ export function createPointCloud(
 ): L.Layer {
   const radius = options.radius ?? 2
   const color = options.color ?? '#1976d2'
-  const opacity = options.opacity ?? 0.75
+  const opacity = options.opacity ?? 0.85
+  const stroke = options.stroke === undefined ? '#fff' : options.stroke
 
   const Layer = L.Layer.extend({
     _canvas: null as HTMLCanvasElement | null,
@@ -88,24 +91,38 @@ export function createPointCloud(
 
       ctx.fillStyle = color
       ctx.globalAlpha = opacity
+      if (stroke) {
+        ctx.strokeStyle = stroke
+        ctx.lineWidth = 1
+      }
 
-      const d = radius * 2
       const project = map.latLngToContainerPoint.bind(map)
       let minX = Infinity
       let minY = Infinity
       let maxX = -Infinity
       let maxY = -Infinity
 
+      // One path for all points, filled and stroked once. Outlined circles
+      // rather than the old 4px squares: a bare square in mid-blue all but
+      // vanished against the map, so users could not see where the data was.
+      // The bulk endpoint caps the sample at 5,000 points, so arcs are cheap.
+      ctx.beginPath()
       for (let i = 0; i < lats.length; i += 1) {
         // toNonNull: L.latLng returns LatLng; project returns a Point.
         const p = project(L.latLng(lats[i], lons[i]))
         const x = p.x
         const y = p.y
-        ctx.fillRect(x - radius, y - radius, d, d)
+        ctx.moveTo(x + radius, y)
+        ctx.arc(x, y, radius, 0, Math.PI * 2)
         if (x < minX) minX = x
         if (y < minY) minY = y
         if (x > maxX) maxX = x
         if (y > maxY) maxY = y
+      }
+      ctx.fill()
+      if (stroke) {
+        ctx.globalAlpha = 1
+        ctx.stroke()
       }
 
       ctx.globalAlpha = 1

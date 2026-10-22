@@ -3,6 +3,10 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet.markercluster'
 import 'leaflet.markercluster/dist/MarkerCluster.css'
+// The Default sheet is what draws the coloured cluster bubbles. Without it a
+// cluster is a bare number floating on the map, which says how many points
+// there are but not where they are.
+import 'leaflet.markercluster/dist/MarkerCluster.Default.css'
 import 'leaflet.heat'
 import {
   fetchClusters,
@@ -20,6 +24,13 @@ import { createPointCloud } from '../lib/pointCloud'
 type LayerMode = 'points' | 'heatmap' | 'clusters'
 
 const EMPTY_FILTERS = { country: '', province: '', variety: '', season_type: '' }
+
+/**
+ * Point fill for both point layers. Magenta with a white outline reads against
+ * every OpenStreetMap background; the previous mid-blue matched water and
+ * faded into the land colours, so the data was hard to find.
+ */
+const POINT_COLOR = '#d81b60'
 
 /** Columns dropped below the md breakpoint so the table fits without scrolling. */
 const NARROW_HIDDEN = new Set(['season_type', 'planting_option'])
@@ -430,11 +441,11 @@ function MapView({
     const addPoint = (lat: number, lon: number, label: string) => {
       if (Number.isNaN(lat) || Number.isNaN(lon)) return
       const marker = L.circleMarker([lat, lon], {
-        radius: 5,
-        fillColor: '#1976d2',
+        radius: 6,
+        fillColor: POINT_COLOR,
         color: '#fff',
-        weight: 1,
-        fillOpacity: 0.8,
+        weight: 1.5,
+        fillOpacity: 0.9,
       })
       if (label) marker.bindTooltip(label)
       markers.addLayer(marker)
@@ -479,7 +490,7 @@ function MapView({
           map.removeLayer(cloudRef.current)
           cloudRef.current = null
         }
-        cloudRef.current = createPointCloud(lats, lons, { radius: 2 })
+        cloudRef.current = createPointCloud(lats, lons, { radius: 3.5, color: POINT_COLOR })
         map.addLayer(cloudRef.current)
 
         // Fit to the returned extent, computed from the arrays rather than by
