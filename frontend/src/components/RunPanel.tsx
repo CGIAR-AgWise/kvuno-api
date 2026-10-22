@@ -88,6 +88,10 @@ export default function RunPanel({ pollMs = 5000 }: { pollMs?: number }) {
                     run.status === 'running' ? 'progress-bar-striped progress-bar-animated' : ''
                   }`}
                   role="progressbar"
+                  aria-label={`Progress of ${run.label}`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={pct}
                   style={{ width: `${pct}%` }}
                 />
               </div>

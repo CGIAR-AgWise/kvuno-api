@@ -29,8 +29,23 @@ interface Entry<T> {
 const DEFAULT_TTL_MS = 60_000
 const MAX_ENTRIES = 60
 
+/**
+ * A shared request plus how many callers are still waiting on it. The request
+ * has its own AbortController: it is only aborted once *every* subscriber has
+ * gone away, never because one of them did.
+ */
+interface InFlight<T> {
+  promise: Promise<T>
+  controller: AbortController
+  subscribers: number
+}
+
 const cache = new Map<string, Entry<unknown>>()
-const inflight = new Map<string, Promise<unknown>>()
+const inflight = new Map<string, InFlight<unknown>>()
+
+function abortError(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+}
 
 /** Exposed for tests and for an explicit refresh button. */
 export function cacheSize(): number {
@@ -53,38 +68,97 @@ function evictIfNeeded(): void {
 /**
  * Fetch `key`, reusing a cached value or an in-flight request when possible.
  *
- * `loader` is only called on a genuine miss. `signal` is intentionally not
- * forwarded to the shared request: if the caller that started it goes away, the
- * others waiting on the same promise should still get their result.
+ * `loader` is only called on a genuine miss, and receives the shared request's
+ * OWN AbortSignal — never a caller's. The caller's `signal` only stops that
+ * caller waiting: it rejects with an AbortError while the shared request keeps
+ * running for anyone else subscribed. The shared request is aborted only when
+ * no subscriber is left, and that check is deferred a macrotask so React
+ * StrictMode's unmount/remount (which aborts and immediately re-subscribes)
+ * joins the same request instead of killing it. An aborted or failed request
+ * is evicted and never cached.
  */
-export async function cached<T>(
+export function cached<T>(
   key: string,
-  loader: () => Promise<T>,
+  loader: (signal: AbortSignal) => Promise<T>,
   ttlMs: number = DEFAULT_TTL_MS,
+  signal?: AbortSignal,
 ): Promise<T> {
+  if (signal?.aborted) return Promise.reject(abortError(signal))
+
   const now = Date.now()
   const hit = cache.get(key)
   if (hit && hit.expires > now) {
     // Refresh recency for the LRU eviction order.
     cache.delete(key)
     cache.set(key, hit)
-    return hit.value as T
+    return Promise.resolve(hit.value as T)
   }
   if (hit) cache.delete(key)
 
-  const existing = inflight.get(key)
-  if (existing) return existing as Promise<T>
+  let entry = inflight.get(key) as InFlight<T> | undefined
+  if (!entry) {
+    const controller = new AbortController()
+    const created: InFlight<T> = {
+      controller,
+      subscribers: 0,
+      promise: loader(controller.signal).then(
+        (value) => {
+          if (inflight.get(key) === created) inflight.delete(key)
+          if (!controller.signal.aborted) {
+            cache.set(key, { value, expires: Date.now() + ttlMs })
+            evictIfNeeded()
+          }
+          return value
+        },
+        (error: unknown) => {
+          if (inflight.get(key) === created) inflight.delete(key)
+          throw error
+        },
+      ),
+    }
+    // Callers that all abort leave the rejection unobserved otherwise.
+    created.promise.catch(() => undefined)
+    inflight.set(key, created)
+    entry = created
+  }
 
-  const promise = loader()
-    .then((value) => {
-      cache.set(key, { value, expires: Date.now() + ttlMs })
-      evictIfNeeded()
-      return value
-    })
-    .finally(() => {
-      inflight.delete(key)
-    })
+  const shared = entry
+  shared.subscribers += 1
+  if (!signal) return shared.promise
 
-  inflight.set(key, promise)
-  return promise
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    const release = () => {
+      shared.subscribers -= 1
+      if (shared.subscribers > 0) return
+      setTimeout(() => {
+        if (shared.subscribers > 0 || shared.controller.signal.aborted) return
+        if (inflight.get(key) === shared) inflight.delete(key)
+        shared.controller.abort()
+      }, 0)
+    }
+    const onAbort = () => {
+      if (settled) return
+      settled = true
+      release()
+      reject(abortError(signal))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    shared.promise.then(
+      (value) => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        shared.subscribers -= 1
+        resolve(value)
+      },
+      (error: unknown) => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener('abort', onAbort)
+        shared.subscribers -= 1
+        reject(error)
+      },
+    )
+  })
 }

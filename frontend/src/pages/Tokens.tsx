@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { createToken, fetchTokens, revokeToken } from '../api'
 import type { TokenInfo } from '../api'
 import { useToast } from '../context/ToastContext'
@@ -26,7 +26,9 @@ export default function Tokens() {
   const [busy, setBusy] = useState(false)
   const [revoking, setRevoking] = useState<number | null>(null)
 
-  async function load() {
+  // `toast` is memoised in ToastProvider, so `load` is stable and the effect
+  // below runs once per mount.
+  const load = useCallback(async () => {
     setLoading(true)
     try {
       // The endpoint is paginated; fetchTokens walks the pages.
@@ -36,12 +38,11 @@ export default function Tokens() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [toast])
 
   useEffect(() => {
     void load()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [load])
 
   async function create() {
     setBusy(true)

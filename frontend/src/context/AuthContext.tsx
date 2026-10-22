@@ -1,6 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { getToken, login as apiLogin, logout as apiLogout, ApiError } from '../api'
+import {
+  getToken,
+  login as apiLogin,
+  logout as apiLogout,
+  ApiError,
+  UNAUTHORIZED_EVENT,
+} from '../api'
 
 interface AuthState {
   token: string | null
@@ -19,6 +25,11 @@ const AuthContext = createContext<AuthState | null>(null)
  * `ready` exists because the token is read from localStorage after the first
  * render; routing must not bounce to /login before that read completes, or a
  * signed-in user would see the login page flash on every reload.
+ *
+ * A 401 from any request clears storage in `request()` and dispatches
+ * UNAUTHORIZED_EVENT; this provider drops its token on that event, and
+ * RequireAuth then redirects to /login?next=<current page>. Without it the UI
+ * stayed "signed in" while every call failed.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null)
@@ -27,6 +38,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setTokenState(getToken())
     setReady(true)
+
+    const onUnauthorized = () => setTokenState(null)
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
   }, [])
 
   const login = useCallback(async (username: string, password: string) => {
@@ -35,8 +50,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(async () => {
-    await apiLogout()
-    setTokenState(null)
+    try {
+      await apiLogout()
+    } finally {
+      // The server-side revoke failing (network, already expired) must not
+      // leave the UI signed in: local state is cleared regardless.
+      setTokenState(null)
+    }
   }, [])
 
   const value = useMemo<AuthState>(

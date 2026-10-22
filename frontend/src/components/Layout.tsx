@@ -1,4 +1,5 @@
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { useEffect, useState } from 'react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 
 const LINKS = [
@@ -12,6 +13,26 @@ const LINKS = [
 export default function Layout() {
   const { logout } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+  // Bootstrap's JS is not loaded (CSS only), so the navbar collapse is driven
+  // by React state: `show` is the class Bootstrap's own plugin would toggle.
+  const [navOpen, setNavOpen] = useState(false)
+
+  // Close the mobile menu after navigating, as a native app menu would.
+  useEffect(() => {
+    setNavOpen(false)
+  }, [location.pathname])
+
+  async function signOut() {
+    try {
+      await logout()
+    } catch {
+      // logout() already cleared local state; a failed server revoke must not
+      // strand the user on a signed-in page.
+    } finally {
+      navigate('/login', { replace: true })
+    }
+  }
 
   return (
     <div className="min-vh-100 d-flex flex-column">
@@ -23,15 +44,14 @@ export default function Layout() {
           <button
             className="navbar-toggler"
             type="button"
-            data-bs-toggle="collapse"
-            data-bs-target="#nav-main"
             aria-controls="nav-main"
-            aria-expanded="false"
+            aria-expanded={navOpen}
             aria-label="Toggle navigation"
+            onClick={() => setNavOpen((open) => !open)}
           >
             <span className="navbar-toggler-icon" />
           </button>
-          <div className="collapse navbar-collapse" id="nav-main">
+          <div className={`collapse navbar-collapse${navOpen ? ' show' : ''}`} id="nav-main">
             <ul className="navbar-nav me-auto">
               {LINKS.map((link) => (
                 <li className="nav-item" key={link.to}>
@@ -46,11 +66,9 @@ export default function Layout() {
               ))}
             </ul>
             <button
+              type="button"
               className="btn btn-outline-light btn-sm"
-              onClick={async () => {
-                await logout()
-                navigate('/login', { replace: true })
-              }}
+              onClick={() => void signOut()}
             >
               <i className="bi bi-box-arrow-right me-1" />
               Sign out

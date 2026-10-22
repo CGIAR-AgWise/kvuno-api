@@ -23,6 +23,9 @@ RUN pnpm run build
 FROM nginx:1.27-alpine AS runtime
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Not under conf.d/: everything there is included at http level, where these
+# add_header lines would apply to (and be dropped by) every location.
+COPY security-headers.conf /etc/nginx/snippets/security-headers.conf
 COPY --from=build /fe/dist /usr/share/nginx/html
 
 EXPOSE 80

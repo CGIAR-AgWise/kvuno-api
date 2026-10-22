@@ -81,7 +81,10 @@ export default function Explore() {
       .catch((err: Error) => {
         if (err.name !== 'AbortError') setError(err.message)
       })
-      .finally(() => setLoading(false))
+      .finally(() => {
+        // An aborted fetch has been superseded; the newer one owns `loading`.
+        if (!controller.signal.aborted) setLoading(false)
+      })
     return () => controller.abort()
   }, [params, reloadKey])
 
@@ -252,7 +255,21 @@ export default function Explore() {
                     key={key}
                     className="col-sort"
                     style={{ cursor: 'pointer', whiteSpace: 'nowrap' }}
+                    tabIndex={0}
+                    aria-sort={
+                      sort?.col === key
+                        ? sort.dir === 'asc'
+                          ? 'ascending'
+                          : 'descending'
+                        : 'none'
+                    }
                     onClick={() => toggleSort(key)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        toggleSort(key)
+                      }
+                    }}
                   >
                     {label}
                     {sortIndicator(key)}

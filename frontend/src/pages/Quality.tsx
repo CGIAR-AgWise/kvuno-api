@@ -147,6 +147,10 @@ export default function Quality() {
                 <div
                   className="progress-bar bg-warning"
                   role="progressbar"
+                  aria-label={`Conflicts from ${s.source}`}
+                  aria-valuemin={0}
+                  aria-valuemax={maxSource}
+                  aria-valuenow={s.count}
                   style={{ width: Math.round((s.count / maxSource) * 100) + '%' }}
                 />
               </div>

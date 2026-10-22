@@ -1,5 +1,6 @@
-import { useMemo, useState } from 'react'
-import { startProcessing } from '../api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
+import { fetchJobProgress, startProcessing } from '../api'
 import type { Job } from '../api'
 import { STATUSES, useJobStream } from '../hooks/useJobStream'
 import type { StatusFilter } from '../hooks/useJobStream'
@@ -53,7 +54,10 @@ export default function Jobs() {
   const toast = useToast()
   const [filter, setFilter] = useState<StatusFilter>('all')
   const [search, setSearch] = useState('')
+  // The file whose detail is open, plus the row as it was when clicked. The
+  // modal shows the live row from the SSE list, so it keeps updating.
   const [detail, setDetail] = useState<Job | null>(null)
+  const liveDetail = detail ? (jobs.find((j) => j.file === detail.file) ?? detail) : null
   const [retrying, setRetrying] = useState<string | null>(null)
 
   const counts = useMemo(() => {
@@ -83,7 +87,8 @@ export default function Jobs() {
   async function retry(file: string) {
     setRetrying(file)
     try {
-      await startProcessing(file, {})
+      // No mapping: the server re-uses the one saved with the upload.
+      await startProcessing(file)
       toast.push('Re-queued ' + file, 'success')
     } catch (err) {
       toast.push('Retry failed: ' + (err as Error).message, 'danger')
@@ -109,6 +114,7 @@ export default function Jobs() {
         </div>
         <input
           type="search"
+          aria-label="Search files"
           className="form-control form-control-sm ms-auto"
           style={{ maxWidth: '18rem' }}
           placeholder="Search files…"
@@ -153,7 +159,22 @@ export default function Jobs() {
                   const rate = rateInfo(job)
                   const retryable = job.status === 'error' || job.status === 'stale'
                   return (
-                    <tr key={job.file} onClick={() => setDetail(job)} style={{ cursor: 'pointer' }}>
+                    <tr
+                      key={job.file}
+                      onClick={() => setDetail(job)}
+                      onKeyDown={(e: KeyboardEvent<HTMLTableRowElement>) => {
+                        // Only the row itself: Enter on the Retry button inside
+                        // must not also open the detail.
+                        if (e.target !== e.currentTarget) return
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault()
+                          setDetail(job)
+                        }
+                      }}
+                      tabIndex={0}
+                      aria-label={'Details for ' + (job.original_name || job.file)}
+                      style={{ cursor: 'pointer' }}
+                    >
                       <td>
                         <span className="kvuno-truncate fw-medium small" title={job.file}>
                           {job.original_name || job.file}
@@ -175,6 +196,10 @@ export default function Jobs() {
                                 : '')
                             }
                             role="progressbar"
+                            aria-label="Progress"
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={job.status === 'completed' ? 100 : pct}
                             style={{
                               width: (job.status === 'completed' ? 100 : pct) + '%',
                               backgroundColor: meta.bar,
@@ -229,7 +254,9 @@ export default function Jobs() {
         </div>
       </div>
 
-      {detail && <JobDetail job={detail} onClose={() => setDetail(null)} onRetry={retry} />}
+      {liveDetail && (
+        <JobDetail job={liveDetail} onClose={() => setDetail(null)} onRetry={retry} />
+      )}
     </div>
   )
 }
@@ -243,18 +270,68 @@ function JobDetail({
   onClose: () => void
   onRetry: (file: string) => Promise<void>
 }) {
-  const meta = statusMeta(job.status)
-  const total = job.total ?? 0
-  const current = job.current ?? 0
   const [busy, setBusy] = useState(false)
+  const [fetched, setFetched] = useState<Partial<Job> | null>(null)
+  const dialogRef = useRef<HTMLDivElement | null>(null)
+  const closeRef = useRef(onClose)
+  useEffect(() => {
+    closeRef.current = onClose
+  }, [onClose])
+  const file = job.file
+
+  // Refresh once from GET /ui/progress/<file> (same shape as a /ui/jobs/data
+  // item). The row from the SSE list stays the primary source; the fetched
+  // copy only wins when it is newer, e.g. after the row left the list.
+  useEffect(() => {
+    const controller = new AbortController()
+    fetchJobProgress(file, controller.signal)
+      .then((res) => {
+        if (res.status !== 'unknown') setFetched(res)
+      })
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [file])
+
+  // Focus the dialog on open, close on Escape, give focus back on close.
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null
+    dialogRef.current?.focus()
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') closeRef.current()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      previous?.focus?.()
+    }
+  }, [])
+
+  const shown: Job =
+    fetched && (fetched.mtime ?? 0) > (job.mtime ?? 0) ? { ...job, ...fetched, file } : job
+  const meta = statusMeta(shown.status)
+  const total = shown.total ?? 0
+  const current = shown.current ?? 0
+  const pct = shown.status === 'completed' ? 100 : total > 0 ? Math.round((current / total) * 100) : 0
+  const titleId = 'job-detail-title'
 
   return (
     <>
-      <div className="modal d-block" tabIndex={-1} role="dialog" onClick={onClose}>
-        <div className="modal-dialog modal-dialog-centered" onClick={(e) => e.stopPropagation()}>
+      <div className="modal d-block" tabIndex={-1} onClick={onClose}>
+        <div
+          ref={dialogRef}
+          className="modal-dialog modal-dialog-centered"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+          tabIndex={-1}
+          style={{ outline: 'none' }}
+          onClick={(e) => e.stopPropagation()}
+        >
           <div className="modal-content">
             <div className="modal-header">
-              <h5 className="modal-title kvuno-truncate">{job.original_name || job.file}</h5>
+              <h5 className="modal-title kvuno-truncate" id={titleId}>
+                {shown.original_name || shown.file}
+              </h5>
               <button type="button" className="btn-close" onClick={onClose} aria-label="Close" />
             </div>
             <div className="modal-body">
@@ -272,39 +349,48 @@ function JobDetail({
                   <div className="progress" style={{ height: 6, maxWidth: 200 }}>
                     <div
                       className="progress-bar"
-                      style={{ width: (total > 0 ? Math.round((current / total) * 100) : 0) + '%' }}
+                      role="progressbar"
+                      aria-label="Progress"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={pct}
+                      style={{ width: pct + '%' }}
                     />
                   </div>
                 </dd>
-                <dt className="col-sm-4">{job.error ? 'Error' : 'Message'}</dt>
+                <dt className="col-sm-4">{shown.error ? 'Error' : 'Message'}</dt>
                 <dd className="col-sm-8" style={{ whiteSpace: 'pre-wrap' }}>
-                  {job.error || job.message || '—'}
+                  {shown.error || shown.message || '—'}
                 </dd>
                 <dt className="col-sm-4">Attempts</dt>
-                <dd className="col-sm-8">{job.attempts ?? 1}</dd>
-                {job.worker && (
+                <dd className="col-sm-8">{shown.attempts ?? 1}</dd>
+                {shown.worker && (
                   <>
                     <dt className="col-sm-4">Worker</dt>
-                    <dd className="col-sm-8">{job.worker}</dd>
+                    <dd className="col-sm-8">{shown.worker}</dd>
                   </>
                 )}
               </dl>
             </div>
             <div className="modal-footer">
-              {(job.status === 'error' || job.status === 'stale') && (
+              {(shown.status === 'error' || shown.status === 'stale') && (
                 <button
-                  className="btn btn-outline-danger btn-sm"
+                  type="button"
+                  className={
+                    'btn btn-sm btn-outline-' + (shown.status === 'stale' ? 'warning' : 'danger')
+                  }
                   disabled={busy}
                   onClick={async () => {
                     setBusy(true)
-                    await onRetry(job.file)
+                    // retry() reports its own failure as a toast and never throws.
+                    await onRetry(file)
                     onClose()
                   }}
                 >
                   Retry
                 </button>
               )}
-              <button className="btn btn-secondary btn-sm" onClick={onClose}>
+              <button type="button" className="btn btn-secondary btn-sm" onClick={onClose}>
                 Close
               </button>
             </div>

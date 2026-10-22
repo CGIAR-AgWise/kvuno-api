@@ -51,16 +51,28 @@ export function getToken(): string | null {
   return localStorage.getItem('token')
 }
 
+/**
+ * Dispatched on `window` whenever a request comes back 401. AuthProvider
+ * listens for it and drops its token, so the UI cannot stay "signed in" after
+ * storage was cleared underneath it.
+ */
+export const UNAUTHORIZED_EVENT = 'kvuno:unauthorized'
+
+/** `; Secure` on HTTPS so the token cookie is never sent over plain HTTP. */
+function cookieFlags(): string {
+  return `path=/; SameSite=Lax${window.location.protocol === 'https:' ? '; Secure' : ''}`
+}
+
 export function setToken(token: string): void {
   localStorage.setItem('token', token)
   // Mirrored as a cookie: require_auth() reads it when a browser is bounced to
   // the login page, and it keeps /ui/* endpoints usable during a hard reload.
-  document.cookie = `token=${token}; path=/; max-age=${30 * 24 * 60 * 60}; SameSite=Lax`
+  document.cookie = `token=${token}; max-age=${30 * 24 * 60 * 60}; ${cookieFlags()}`
 }
 
 export function clearToken(): void {
   localStorage.removeItem('token')
-  document.cookie = 'token=; path=/; max-age=0; SameSite=Lax'
+  document.cookie = `token=; max-age=0; ${cookieFlags()}`
 }
 
 interface RequestOptions {
@@ -96,8 +108,11 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
   // 401 from an /ui/* endpoint means the session lapsed; the SPA sends a
   // Bearer token so it gets JSON rather than the redirect a browser would.
-  if (response.status === 401) {
+  // Only when a token was actually sent: a 401 from /login with bad
+  // credentials is not an expired session and should show the server's message.
+  if (response.status === 401 && token) {
     clearToken()
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))
     throw new ApiError('Your session has expired. Please sign in again.', 401)
   }
 
@@ -325,7 +340,12 @@ export function fetchPlantingRecords(
   signal?: AbortSignal,
 ): Promise<{ data: PlantingRecord[] } & PageMeta> {
   const key = 'planting:' + params.toString()
-  return cached(key, () => request('/api/v1/planting-data', { params, signal }), LIST_TTL_MS)
+  return cached(
+    key,
+    (shared) => request('/api/v1/planting-data', { params, signal: shared }),
+    LIST_TTL_MS,
+    signal,
+  )
 }
 
 export function fetchFilters(signal?: AbortSignal): Promise<FilterColumns> {
@@ -393,13 +413,13 @@ export function fetchCoordinatesBulk(
 ): Promise<CoordinateBuffers> {
   return cached(
     'coords-bulk:' + params.toString(),
-    async () => {
+    async (shared) => {
       const body = await request<{
         lats?: number[]
         lons?: number[]
         total?: number
         truncated?: boolean
-      }>('/api/v1/planting-data/coordinates/all', { params, signal })
+      }>('/api/v1/planting-data/coordinates/all', { params, signal: shared })
       return {
         lats: Float32Array.from(body.lats ?? []),
         lons: Float32Array.from(body.lons ?? []),
@@ -408,14 +428,16 @@ export function fetchCoordinatesBulk(
       }
     },
     AGGREGATE_TTL_MS,
+    signal,
   )
 }
 
 export const fetchClusters = (params: URLSearchParams, signal?: AbortSignal) =>
   cached(
     'clusters:' + params.toString(),
-    () => fetchAllPages<Cluster>('/api/v1/planting-data/clusters', 'clusters', params, signal),
+    (shared) => fetchAllPages<Cluster>('/api/v1/planting-data/clusters', 'clusters', params, shared),
     AGGREGATE_TTL_MS,
+    signal,
   )
 
 export const fetchConflicts = (
@@ -487,12 +509,35 @@ export interface DBColumn {
 export async function fetchDBColumns(signal?: AbortSignal): Promise<{
   columns: string[]
   aliases: Record<string, string>
+  /** The server's MAX_FILE_SIZE in bytes, so the client checks the real limit. */
+  max_file_size: number
 }> {
   return request('/ui/columns', { signal })
 }
 
-export function startProcessing(file: string, columnMap: Record<string, string>) {
-  return request<{ msg?: string }>('/ui/process', { method: 'POST', body: { file, column_map: columnMap } })
+/**
+ * One job's progress, in the same shape as an item of /ui/jobs/data. An
+ * unknown file comes back as `{status: 'unknown', current: 0, total: 0,
+ * message: ''}` (no `file`), so callers should fall back to what they have.
+ */
+export function fetchJobProgress(file: string, signal?: AbortSignal) {
+  return request<Partial<Job> & { status: string }>(
+    `/ui/progress/${encodeURIComponent(file)}`,
+    { signal },
+  )
+}
+
+/**
+ * Re-queue a stored file (the Jobs page's Retry).
+ *
+ * Omit `columnMap` to re-use the mapping saved with the upload. Sending `{}`
+ * here used to overwrite it with nothing.
+ */
+export function startProcessing(file: string, columnMap?: Record<string, string>) {
+  return request<{ msg?: string; message?: string }>('/ui/process', {
+    method: 'POST',
+    body: columnMap ? { file, column_map: columnMap } : { file },
+  })
 }
 
 /**
@@ -509,12 +554,53 @@ export interface DuplicateInfo {
   offset: number | null
 }
 
-export function completeUpload(identifier: string, totalChunks: number, filename: string) {
-  return request<{
-    file: string
-    columns: string[]
-    rows: Record<string, unknown>[]
-    duplicate: DuplicateInfo | null
-    error?: string
-  }>('/ui/upload/complete', { method: 'POST', body: { identifier, totalChunks, filename } })
+/** tus endpoint. Files are sent here by lib/tus.ts, not by `request()`. */
+export const TUS_ENDPOINT = '/ui/uploads/tus'
+
+/** receiving -> received -> inspecting -> ready | failed -> submitted */
+export type UploadStatus =
+  | 'receiving'
+  | 'received'
+  | 'inspecting'
+  | 'ready'
+  | 'failed'
+  | 'submitted'
+
+/** One upload as the server tracks it (app/services/uploads.py `to_dict`). */
+export interface UploadRecord {
+  id: string
+  name: string
+  size: number
+  received: number
+  status: UploadStatus
+  /** Stored file name — what Jobs and Retry refer to. */
+  file: string | null
+  columns: string[]
+  rows: Record<string, unknown>[]
+  total_rows: number | null
+  duplicate: DuplicateInfo | null
+  /** Source column -> DB column; seeded with the server's guesses. */
+  column_map: Record<string, string>
+  error: string | null
+  created_at: string | null
+  updated_at: string | null
+}
+
+export function fetchUploads(signal?: AbortSignal) {
+  return request<{ uploads: UploadRecord[] }>('/ui/uploads', { signal })
+}
+
+export function fetchUpload(id: string, signal?: AbortSignal) {
+  return request<UploadRecord>(`/ui/uploads/${id}`, { signal })
+}
+
+export function processUpload(id: string, columnMap: Record<string, string>) {
+  return request<{ id: string; file: string | null; message: string; queued: boolean }>(
+    `/ui/uploads/${id}/process`,
+    { method: 'POST', body: { column_map: columnMap } },
+  )
+}
+
+export function discardUpload(id: string) {
+  return request<null>(`/ui/uploads/${id}`, { method: 'DELETE' })
 }
