@@ -39,8 +39,16 @@ jobs:
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      # No checkout: the gate only queries the GitHub API via `gh`, which is
-      # preinstalled on the runner and authenticates from ${{ github.token }}.
+      # A local action (`./.github/actions/...`) is read from the workspace, so
+      # the repo must be checked out first or the step fails with "Can't find
+      # action.yml". Only the actions directory is needed; the gate itself just
+      # queries the GitHub API via `gh` (preinstalled, uses github.token).
+      - name: Checkout local actions
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/actions
+          fetch-depth: 1
+
       - id: gate
         uses: ./.github/actions/wait-for-checks
         with:

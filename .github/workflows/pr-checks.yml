@@ -32,6 +32,9 @@ jobs:
       - name: Install Poetry
         uses: snok/install-poetry@v1
         with:
+          # Must match the Poetry that generated poetry.lock (and the images'
+          # POETRY_VERSION); other 2.x releases compute a different lock hash.
+          version: 2.3.2
           virtualenvs-in-project: true
 
       - name: Cache pip
@@ -65,7 +68,7 @@ jobs:
     name: Frontend (typecheck + build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -91,7 +94,9 @@ jobs:
 
       - name: Audit JavaScript dependencies
         working-directory: frontend
-        run: pnpm audit --audit-level=high || echo "pnpm audit found issues (non-blocking)"
+        # Blocking for high/critical advisories, like pip-audit --strict on the
+        # Python side. Low/moderate findings are reported but do not fail CI.
+        run: pnpm audit --audit-level high
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -117,6 +122,9 @@ jobs:
       - name: Install Poetry
         uses: snok/install-poetry@v1
         with:
+          # Must match the Poetry that generated poetry.lock (and the images'
+          # POETRY_VERSION); other 2.x releases compute a different lock hash.
+          version: 2.3.2
           virtualenvs-in-project: true
 
       - name: Cache pip
