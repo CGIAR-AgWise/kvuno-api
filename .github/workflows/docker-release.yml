@@ -39,8 +39,16 @@ jobs:
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      # No checkout: the gate only queries the GitHub API via `gh`, which is
-      # preinstalled on the runner and authenticates from ${{ github.token }}.
+      # A local action (`./.github/actions/...`) is read from the workspace, so
+      # the repo must be checked out first or the step fails with "Can't find
+      # action.yml". Only the actions directory is needed; the gate itself just
+      # queries the GitHub API via `gh` (preinstalled, uses github.token).
+      - name: Checkout local actions
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/actions
+          fetch-depth: 1
+
       - id: gate
         uses: ./.github/actions/wait-for-checks
         with:
@@ -63,6 +71,19 @@ jobs:
       dockerfile: docker/Dockerfile.prod.dockerfile
       app_version: ${{ github.ref_name }}
       image_name: ghcr.io/cgiar-agwise/kvuno-api
+      branch_ref: refs/tags/${{ github.ref_name }}
+      branch_name: ${{ github.ref_name }}
+      commit_sha: ${{ github.sha }}
+
+  build-web-release:
+    needs: [ gate ]
+    if: needs.gate.outputs.passed == 'true'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      context: ./frontend
+      dockerfile: Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-web
+      app_version: ${{ github.ref_name }}
       branch_ref: refs/tags/${{ github.ref_name }}
       branch_name: ${{ github.ref_name }}
       commit_sha: ${{ github.sha }}

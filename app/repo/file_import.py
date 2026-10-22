@@ -78,7 +78,13 @@ class FileImportRepo:
             self.logger.error(f"Failed to delete file import with ID {record.id}: {e}")
             raise
 
-    def upsert_offset(self, checksum: str, file_name: str, offset: int, original_filename: str = "") -> None:
+    def upsert_offset(self, checksum: str, file_name: str, offset: int | None, original_filename: str = "",
+                      commit: bool = True) -> None:
+        """Record how far a file got. ``offset=None`` means fully ingested.
+
+        ``commit=False`` leaves the change in the caller's transaction, so an
+        ingest checkpoint can commit its rows and their offset atomically.
+        """
         session = self._get_session()
         try:
             existing = session.query(FileImport).filter_by(check_sum=checksum).first()
@@ -93,10 +99,16 @@ class FileImportRepo:
                     offset=offset,
                     original_filename=original_filename or None,
                 ))
-            session.commit()
+            if commit:
+                session.commit()
+            else:
+                session.flush()
             self.logger.info(f"Upserted offset {offset} for checksum {checksum}")
         except Exception as e:
-            session.rollback()
+            # With commit=False the transaction is the caller's to roll back,
+            # along with the rows it was checkpointing.
+            if commit:
+                session.rollback()
             self.logger.error(f"Failed to upsert offset for checksum {checksum}: {e}")
             raise
 

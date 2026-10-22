@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from app.utils.migration_utils import get_integer_column_type
+from app.utils.migration_utils import get_integer_column_type, now_default
 
 # revision identifiers, used by Alembic.
 revision: str = 'c3d4e5f6a7b8'
@@ -35,7 +35,7 @@ def upgrade() -> None:
         sa.Column('opt_date', sa.String(8)),
         sa.Column('check_sum', sa.String(100)),
         sa.Column('source', sa.String(50)),
-        sa.Column('created_at', sa.DateTime, server_default=sa.text('now()')),
+        sa.Column('created_at', sa.DateTime, server_default=now_default()),
     )
     op.create_index('idx_conflict_created_at', TABLE_NAME, ['created_at'])
 

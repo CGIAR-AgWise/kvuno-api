@@ -23,24 +23,30 @@ services:
       args:
         POETRY_VERSION: ${POETRY_VERSION:-2.3.2}
 
+  # Production API: gunicorn (docker/Dockerfile.prod.dockerfile), debug off.
+  # For the Flask dev server use the `api-dev` service below
+  # (`docker compose --profile dev up api-dev`).
   api:
     container_name: kvuno-api
     hostname: kvuno-api
     image: ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.prod.dockerfile
+    restart: unless-stopped
     env_file:
       - .env
-    environment:
-      FLASK_ENV: development
-      FLASK_APP: development
-      FLASK_DEBUG: true
-      DEBUG_DB: true
+    environment: &api-environment
+      FLASK_DEBUG: ${FLASK_DEBUG:-false}
+      DEBUG_DB: ${DEBUG_DB:-false}
       DB_DRIVER: ${DB_DRIVER:-postgresql}
-      DB_HOST: postgres
-      # The api image entrypoint can apply migrations before starting the server.
-      # It is currently false here, so migrations must be run manually:
+      # Postgres/PostGIS is not a compose service, so there is no sensible
+      # default host: set it in .env (or the shell) to a host reachable from
+      # inside the container — not localhost.
+      DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
+      # docker/entrypoint.sh applies migrations before starting the server when
+      # this is true (its own default). Compose overrides it to false, so
+      # migrations must be run manually:
       #   docker compose exec api python scripts/run_migrations.py
       # Set true to let the api migrate on start — but never with more than one
       # replica, or they race to migrate the same schema.
@@ -60,12 +66,67 @@ services:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
       # host 5000 -> container 80 (the app's default port)
-      - "5000:80"
+      - "127.0.0.1:5000:80"
     # The app listens on port 80 but the container runs as the non-root `app`
     # user, and ports below 1024 are privileged on Linux. Without this the
     # process dies with Permission denied at bind time.
     cap_add:
       - NET_BIND_SERVICE
+    networks:
+      - dokploy-network
+      - internal
+
+  # Development API: Flask dev server (docker/Dockerfile, `python3 run.py`) with
+  # debug on. Only started with the `dev` profile:
+  #   docker compose --profile dev up api-dev
+  # Published on host 5002 so it can run beside `api`. Its image tag matches
+  # what CI pushes for develop builds of docker/Dockerfile.
+  api-dev:
+    profiles: [ dev ]
+    container_name: kvuno-api-dev
+    hostname: kvuno-api-dev
+    image: ghcr.io/cgiar-agwise/kvuno-api:${DEV_TAG:-develop}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      <<: *api-environment
+      FLASK_DEBUG: ${FLASK_DEBUG:-true}
+      DEBUG_DB: ${DEBUG_DB:-true}
+    volumes:
+      - ${DATA_DIR:-./data}:/app/static/data
+    ports:
+      - "127.0.0.1:5002:80"
+    cap_add:
+      - NET_BIND_SERVICE
+    networks:
+      - dokploy-network
+      - internal
+
+  # React SPA + nginx. Serves the built bundle and reverse-proxies /api and
+  # the remaining /ui/* endpoints to the api service, so the browser sees a
+  # single origin and no CORS preflight is needed in production.
+  web:
+    container_name: kvuno-web
+    hostname: kvuno-web
+    image: ghcr.io/cgiar-agwise/kvuno-web:${TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5001:80"
+    # Wait for the API to actually serve, not merely to start: /health only
+    # passes once the DB is reachable (and any RUN_MIGRATIONS=true migration
+    # has finished).
+    # nginx re-resolves anyway, but starting first just produces a burst of
+    # 502s on the first page load.
+    depends_on:
+      api:
+        condition: service_healthy
     networks:
       - dokploy-network
       - internal
@@ -82,7 +143,7 @@ services:
       DEBUG_DB: ${DEBUG_DB:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DB_DRIVER: ${DB_DRIVER:-postgresql}
-      DB_HOST: ${DB_HOST:-db}
+      DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
       DB_PORT: ${DB_PORT:-5432}
       DB_USER: ${DB_USER:?DB_USER is required}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
@@ -92,6 +153,11 @@ services:
       CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
       CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
       CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
+      # Redis redelivers an unacked task after this; keep it above the longest
+      # single-file ingest or a second worker picks the same file up.
+      CELERY_VISIBILITY_TIMEOUT: ${CELERY_VISIBILITY_TIMEOUT:-21600}
+      INGEST_LOCK_STALE_SECONDS: ${INGEST_LOCK_STALE_SECONDS:-600}
+      REMOTE_RDS_MAX_BYTES: ${REMOTE_RDS_MAX_BYTES:-1073741824}
       HOUSEKEEPING_BATCH_SIZE: ${HOUSEKEEPING_BATCH_SIZE:-2000}
       HOUSEKEEPING_CHUNK_SIZE: ${HOUSEKEEPING_CHUNK_SIZE:-5000}
       HOUSEKEEPING_CHECKPOINT_INTERVAL: ${HOUSEKEEPING_CHECKPOINT_INTERVAL:-50}
@@ -105,6 +171,16 @@ services:
     # host. Streaming Parquet keeps normal usage far below this; the limit is a
     # backstop, not a target. Raise it if large files are legitimate.
     mem_limit: ${WORKER_MEM_LIMIT:-3g}
+    # Celery has no HTTP port, so ask the worker itself over the broker. The
+    # node name is celery@<container hostname> (kvuno-worker); `$$` stops
+    # compose from interpolating $HOSTNAME. The ping is answered by the parent
+    # process, so a long ingest in the (concurrency=1) child does not fail it.
+    healthcheck:
+      test: [ "CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1" ]
+      interval: 60s
+      timeout: 30s
+      start_period: 60s
+      retries: 3
     networks:
       - dokploy-network
       - internal

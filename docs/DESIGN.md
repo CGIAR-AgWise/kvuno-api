@@ -12,47 +12,80 @@ information).
 
 | Goal | Frequency | Current UX |
 |------|-----------|------------|
-| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page with resumable.js drag-drop + column mapping |
-| Preview data before ingestion | Every upload | ✅ Columns + sample rows returned by `/ui/upload/complete` |
-| Monitor processing status | Per upload | ✅ Jobs page with live SSE updates |
-| Explore / query ingested data | Daily | ✅ `/ui/explore` — filters, map, paged table |
+| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page (`/upload`) with tus (`frontend/src/lib/tus.ts`) drag-drop, resume, and column mapping |
+| Preview data before ingestion | Every upload | ✅ Columns + sample rows + duplicate check from background inspection (`GET /ui/uploads/<id>`) |
+| Monitor processing status | Per upload | ✅ Jobs page (`/jobs`) with live SSE updates |
+| Explore / query ingested data | Daily | ✅ `/explore` — filters, map, paged table |
 | Filter by country, variety, date | Daily | ✅ `<select>` dropdowns populated from `/planting-data/filters` |
 | View data on a map | Weekly | ✅ Leaflet + markercluster + optional heat layer |
 | Export data for offline analysis | Weekly | ✅ Server-streamed CSV / JSON from `/planting-data/export` |
-| Understand data quality | Weekly | ✅ Quality dashboard with conflicts, duplicates, coverage stats |
+| Understand data quality | Weekly | ✅ Quality dashboard (`/quality`) with conflicts, duplicates, coverage stats |
 | Test API queries interactively | Monthly | ⚠️ Swagger at `/api-docs`, but no live query builder |
+
+---
+
+## Frontend Architecture
+
+The pages are a standalone **React 18 + TypeScript SPA** in `frontend/`, built with
+**Vite** and **pnpm** and served by **nginx**. Flask renders no HTML — it only exposes
+JSON. `frontend/nginx.conf` serves the built bundle and reverse-proxies `/api`,
+`/ui`, and `/health` to the `api` service, so production is **same-origin** and no
+CORS preflight is needed; `vite dev` proxies the same paths to the API
+(`VITE_DEV_PROXY_TARGET`, default `http://127.0.0.1:5000` to match the compose
+`api` service), so local development matches it. Routes are code-split with `React.lazy`, which keeps
+Leaflet, markercluster, and the heat layer out of the initial bundle.
+
+Only Bootstrap's **CSS** is loaded, not its JS, so `data-bs-*` attributes do
+nothing: the mobile navbar collapse is React state in `Layout.tsx`, and the Jobs
+modal is a React component. Shared GETs go through `cached()`
+(`frontend/src/lib/cache.ts`), where one subscriber aborting no longer cancels the
+request for the others — under React StrictMode's double mount that used to leave
+Explore empty. Explore's sortable headers are keyboard-operable and expose
+`aria-sort`. nginx serves the SPA with its own CSP and security headers
+(`frontend/security-headers.conf`; no CDN hosts) and never serves source maps.
+
+| Layer | Value |
+|---|---|
+| Framework | React 18 + react-router 6 + TypeScript 5.7 |
+| Build tool | Vite 6, package manager pnpm |
+| Client routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Runtime | nginx (`ghcr.io/cgiar-agwise/kvuno-web`, compose host `127.0.0.1:5001`) |
+| Dev server | `pnpm dev` → Vite on `:5173` |
 
 ---
 
 ## Current UI Audit
 
-### Page: Upload (`/ui/upload`)
+### Page: Upload (`/upload`)
 
 **What exists:**
-- Drag-drop zone with Resumable.js chunked upload
-- Column mapping UI (auto-match + manual select) with sample values
-- Processing trigger (`POST /ui/process`), which either enqueues a Celery task or stores the mapping when `HOUSEKEEPING_ENABLED=false`
+- Drag-drop zone (multiple files) uploading with the in-house tus client (`frontend/src/lib/tus.ts`) in 5 MB pieces; a dropped connection, closed tab, or API restart resumes from the last byte, and re-selecting the same file after a reload continues it
+- Size and type are refused up front: the SPA reads `max_file_size` from `/ui/columns` instead of hardcoding 20 MB, and the server rejects at tus creation before any bytes are sent
+- Per-file status badge following the server lifecycle (`receiving` → `inspecting` → `ready` / `failed` → `submitted`), polled from `GET /ui/uploads/<id>`; inspection (RDS → Parquet, preview, checksum) runs server-side, so nothing waits on one long request
+- Unfinished uploads are listed from `GET /ui/uploads` on load, so a reload never loses a file waiting to be mapped; each can be discarded
+- Column mapping UI seeded with the **server's** suggestion, so the selects show exactly what will be sent; *skip* removes a column. `lat`/`lon` are required and each DB column can be used once
+- Duplicate warning when the same content was already ingested (or partially ingested)
+- Processing trigger (`POST /ui/uploads/<id>/process`), which enqueues a Celery task, returns `503` and leaves the upload `ready` when the broker is unreachable, or stores the mapping when `HOUSEKEEPING_ENABLED=false`
 
 **Gaps:**
-- Uploads one file at a time (Resumable.js `maxFiles: 1`)
 - No per-column type information
 - No way to re-map or correct after submission
 
-### Page: Jobs (`/ui/jobs`)
+### Page: Jobs (`/jobs`)
 
 **What exists:**
 - SSE live-updating table with status, progress bar, timestamps
 - Status filter tabs (All / Completed / Processing / Failed) and filename search
-- Per-job detail modal with a Retry action, wired to `POST /ui/process`
+- Per-job detail modal with a Retry action, wired to `POST /ui/process` with only the file name, so the server re-uses the mapping saved with the upload (it used to send `{}` and wipe it). The modal reads `/ui/progress/<file_name>`, which returns the job record from `app/services/progress_store.py` (Redis hot path, Postgres durable record) — it used to read a `.progress.json` file nothing wrote, so it always showed `unknown` and hid Retry
+- The modal is a real dialog: `role="dialog"`, focus moves into it and back on close, Escape closes it
+- Rows open their detail from the keyboard (focusable, Enter/Space), and progress bars carry an accessible label and value
 - Highlight scroll from upload redirect
-
-**Known issue:** the detail modal fetches `/ui/progress/<file_name>`, which reads a `.progress.json` file that nothing writes anymore — progress moved to Redis / the `job_progress` table via `app/services/progress_store.py`. The modal therefore shows `unknown` and the Retry button stays hidden. Fix by having `/ui/progress/<file_name>` return the record from `progress_store` instead of reading a file.
 
 **Gaps:**
 - No per-job logs, row counts, or duration
 - No history beyond the live progress store
 
-### Page: Quality (`/ui/quality`)
+### Page: Quality (`/quality`)
 
 **What exists:**
 - Summary stat cards (total records, conflicts, files, spatial coverage %)
@@ -74,10 +107,10 @@ The explore table uses **numbered pagination buttons, and this is a deliberate d
 
 Rationale:
 
-- The target users compare specific pages and share filtered URLs. A scroll position is not shareable or restorable the way `?page=3` is, and filter state is already URL-persisted via `history.replaceState`.
+- The target users compare specific pages and share filtered URLs. A scroll position is not shareable or restorable the way `?page=3` is, and filter state is already URL-persisted via the router's search params.
 - The page count communicates result-set size, which matters when inspecting a large ingestion.
 - Server-side `LIMIT/OFFSET` is already indexed and fast, so infinite scroll would add client-side row-accumulation state for no query-plan gain.
-- Keeping the table body a single `innerHTML` assignment per page keeps the render path trivial (`app/static/js/explore.js:140`, `renderPagination()` at `:155-176`).
+- Keeping each page fetch a single request keeps the render path trivial — the table body is one state update per page.
 
 Defaults: `perPage=200`, hard-capped at 500 server-side by `_clamp_per_page()` (`app/api/planting_data.py:70-74`).
 
@@ -87,47 +120,54 @@ Defaults: `perPage=200`, hard-capped at 500 server-side by `_clamp_per_page()` (
 
 | Concern | Choice | Notes |
 |---------|--------|-------|
-| CSS framework | Bootstrap 5.3 (jsDelivr CDN) | Also vendored under `node_modules/` for reference |
-| Icons | Bootstrap Icons (CDN) | |
-| Map | Leaflet + `leaflet.markercluster` (CDN) | `chunkedLoading: true`; optional `leaflet.heat` overlay |
-| Charts | Chart.js-style bar rendering in vanilla JS | Source breakdown on `/ui/quality` |
-| Tables | Server-rendered HTML + vanilla JS | No DataTables; body is one `innerHTML` assignment per page |
+| CSS framework | Bootstrap 5.3 | npm dependency of the `frontend/` package |
+| Icons | Bootstrap Icons | npm dependency |
+| Map | Leaflet + `leaflet.markercluster` | `chunkedLoading: true`; optional `leaflet.heat` overlay |
+| Charts | Bar rendering for the source breakdown | `/quality` |
+| Tables | React components | One page of rows per request; no DataTables |
 | Export | Server streaming endpoint | Client-side Blob only works below ~10k rows |
-| State in URL | `URLSearchParams` + `history.replaceState` | Filters, page, and sort are shareable |
-| Build tool | None | Static assets served by Flask; no JS build step |
-| Job progress | Redis pub/sub (`jobs:updates`), DB fallback | `app/services/progress_store.py` |
+| State in URL | react-router search params | Filters, page, and sort are shareable |
+| Build tool | Vite 6 + pnpm | `tsc -b && vite build`; output served by nginx |
+| Job progress | Redis hash + pub/sub (`jobs:updates`) as the hot path; `processing_runs` / `processing_jobs` (Postgres) as the durable record, checkpointed every `JOB_DB_CHECKPOINT_SECONDS` | `app/services/progress_store.py` |
 
-There is **no `package.json`** — the `node_modules/` directory at the repo root is a leftover, not part of the build. All third-party JS/CSS loads from jsDelivr or unpkg, which is why the CSP in `app/__init__.py` allows those origins.
-
-UX stance: data scientists are not frontend engineers, so the UI stays server-rendered (Jinja) with vanilla-JS progressive enhancement and no SPA framework.
+UX stance: data scientists are not frontend engineers, so the pages stay a thin
+client over the existing JSON endpoints — no client-side data modelling, and the
+filter/pagination contract is unchanged by the move to React.
 
 ---
 
 ## Routes Map (current)
 
 ```
-GET  /                    → redirect → /ui/jobs
+GET  /                    → redirect → SPA_ROOT_URL (default /)
 GET  /health              → JSON: app + database status
 
-GET  /ui/login            → login page
-GET  /ui/register         → registration page
-GET  /ui/jobs             → jobs page
-GET  /ui/jobs/data        → JSON: job list
-GET  /ui/jobs/events      → SSE: live updates (Redis pub/sub, 3s poll fallback)
-GET  /ui/upload           → upload page (resumable.js)
-GET  /ui/upload/resumable → chunk probe (200 exists / 204 missing)
-POST /ui/upload/resumable → receive one chunk
-POST /ui/upload/complete  → merge chunks, return columns + sample rows
-POST /ui/process          → save column mapping, enqueue ingestion
-GET  /ui/progress/<file>  → JSON: per-file progress (⚠️ currently reads a stale `.progress.json` file — see Jobs audit)
-GET  /ui/explore          → data explorer page
-GET  /ui/quality          → data quality dashboard
-GET  /ui/tokens           → token management
-GET  /ui/columns          → JSON: mappable DB columns + aliases
+Client-side (React, served by nginx — no Flask route):
+  /login                   → login page
+  /register                → registration page
+  /jobs                    → jobs page
+  /explore                 → data explorer
+  /upload                  → upload page (lib/tus.ts)
+  /quality                 → data quality dashboard
+  /tokens                  → token management
 
-POST   /api/v1/users/register          → create account
+Flask (JSON, reverse-proxied by nginx):
+GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_file_size
+GET    /ui/jobs/data               → JSON: job list
+GET    /ui/jobs/events             → SSE: live updates (Redis pub/sub, 3s poll fallback)
+POST   /ui/uploads/tus             → tus create (size/type checked before any bytes; 413/415)
+HEAD   /ui/uploads/tus/<id>        → tus Upload-Offset, for resuming
+PATCH  /ui/uploads/tus/<id>        → tus append at offset (409 mismatch, 423 busy)
+GET    /ui/uploads                 → JSON: the caller's unfinished uploads
+GET    /ui/uploads/<id>            → JSON: status, preview, duplicate, suggested mapping
+POST   /ui/uploads/<id>/process    → validate + save mapping, enqueue ingestion
+DELETE /ui/uploads/<id>            → discard an unsubmitted upload
+POST   /ui/process                 → re-process a stored file (Jobs Retry; re-uses the saved mapping)
+GET    /ui/progress/<file>         → JSON: one job record from progress_store (or status "unknown")
+
+POST   /api/v1/users/register          → create account (REGISTRATION_ALLOWED_DOMAINS only; 403 when unset)
 POST   /api/v1/users/login             → {id}|{secret} token
-POST   /api/v1/users/logout            → revoke current token
+POST   /api/v1/users/logout            → revoke current token (bearer or token cookie)
 GET    /api/v1/users/tokens            → list tokens
 POST   /api/v1/users/tokens            → create token
 DELETE /api/v1/users/tokens/<id>       → revoke token
@@ -139,11 +179,11 @@ GET  /api/v1/planting-data/clusters    → JSON: server-side spatial clusters (p
 GET  /api/v1/planting-data/export      → CSV / JSON stream of one page of results
 
 POST /api/v1/data/upload               → upload a single RDS/Parquet file
-GET  /api/v1/quality/stats             → JSON: summary statistics
-GET  /api/v1/quality/conflicts         → JSON: paginated conflict list
+GET  /api/v1/quality/stats             → JSON: summary statistics (auth required)
+GET  /api/v1/quality/conflicts         → JSON: paginated conflict list (auth required)
 ```
 
-All `/ui/*` routes except `/ui/login` and `/ui/register` require a session (`@require_auth`); they redirect browsers to `/ui/login` and return `401` JSON to API clients.
+Every Flask `/ui/*` endpoint requires a session (`@require_auth`); they redirect browsers to the SPA login route (`SPA_LOGIN_PATH`, default `/login`) and return `401` JSON to API clients. The React routes are guarded client-side by `AuthContext` (a single provider). A `401` from **any** API call dispatches `kvuno:unauthorized` (`frontend/src/api.ts`); `AuthContext` drops the token and `RequireAuth` sends the user to `/login?next=<page>`, instead of leaving a signed-in shell whose every request fails. Logout always clears local state, even if the server call fails. The token cookie is `Secure` on HTTPS.
 
 ### API pagination
 
@@ -164,10 +204,10 @@ Ordering is always tie-broken on the primary key (`get_filtered_data`).
 A non-unique sort column leaves row order ambiguous, and `LIMIT`/`OFFSET` over an
 ambiguous order silently repeats and skips rows as a client pages.
 
-Client-side, `explore.js` walks pages and accumulates (`fetchAllPages`) so the
-map, heatmap, and filter dropdowns still render a complete set rather than just
-the first page. It stops at `MAX_PAGES` (200) and tells the user when the result
-is a sample rather than pretending it is complete.
+Client-side, the Explore page maps the rows of the **current** page and fetches
+`/planting-data/coordinates` and `/planting-data/clusters` for the heatmap and
+cluster layers — the aggregation is server-side rather than accumulated in the
+browser, so there is no page-walking cap to reason about.
 
 ---
 

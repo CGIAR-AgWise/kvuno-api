@@ -4,6 +4,41 @@ from typing import Optional
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 
+# Columns a client may sort by. sort_col used to go straight into
+# getattr(Model, sort_col), so any model attribute was reachable: `metadata`
+# (the SQLAlchemy MetaData object) or a relationship has no .asc(), and the
+# request died with a 500. Only real, scalar table columns are listed — the
+# geometry and JSON columns are left out because ordering by them is either
+# meaningless or unsupported by the database.
+PLANTING_SORT_COLUMNS = (
+    'id', 'check_sum', 'country', 'province', 'lon', 'lat', 'variety',
+    'season_type', 'opt_date', 'planting_option', 'created_at', 'updated_at',
+)
+CONFLICT_SORT_COLUMNS = (
+    'id', 'country', 'province', 'lon', 'lat', 'variety', 'season_type',
+    'opt_date', 'check_sum', 'source', 'created_at',
+)
+SORT_DIRECTIONS = ('asc', 'desc')
+
+
+def _check_sort_col(value, allowed: tuple[str, ...]):
+    if value is None or not str(value).strip():
+        return None
+    value = str(value).strip()
+    if value not in allowed:
+        raise ValueError(f"sort_col must be one of: {', '.join(allowed)}")
+    return value
+
+
+def _check_sort_dir(value):
+    if value is None or not str(value).strip():
+        return None
+    value = str(value).strip().lower()
+    if value not in SORT_DIRECTIONS:
+        raise ValueError("sort_dir must be 'asc' or 'desc'")
+    return value
+
+
 class PlantingDataFilter(BaseModel):
     coordinates: Optional[str] = Field(
         default=None,
@@ -89,10 +124,30 @@ class PlantingDataFilter(BaseModel):
                 raise ValueError("Date must be in 'YYYY-MM-DD' format.")
         return value
 
+    @field_validator('sort_col', mode='before')
+    @classmethod
+    def validate_sort_col(cls, value):
+        return _check_sort_col(value, PLANTING_SORT_COLUMNS)
+
+    @field_validator('sort_dir', mode='before')
+    @classmethod
+    def validate_sort_dir(cls, value):
+        return _check_sort_dir(value)
+
 
 class QualityFilter(BaseModel):
     country: Optional[str] = Field(default=None)
     source: Optional[str] = Field(default=None)
     search: Optional[str] = Field(default=None)
-    sort_col: Optional[str] = Field(default=None)
-    sort_dir: Optional[str] = Field(default=None)
+    sort_col: Optional[str] = Field(default=None, description='Column to sort by')
+    sort_dir: Optional[str] = Field(default=None, description='Sort direction: asc or desc')
+
+    @field_validator('sort_col', mode='before')
+    @classmethod
+    def validate_sort_col(cls, value):
+        return _check_sort_col(value, CONFLICT_SORT_COLUMNS)
+
+    @field_validator('sort_dir', mode='before')
+    @classmethod
+    def validate_sort_dir(cls, value):
+        return _check_sort_dir(value)

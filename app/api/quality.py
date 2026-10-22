@@ -1,5 +1,6 @@
 from flask_openapi3 import Tag, APIBlueprint
 
+from app.auth import require_auth
 from app.config import API_PREFIX, API_VERSION
 from app.dto.data_filters import QualityFilter
 from app.dto.import_conflict import ImportConflictRecord
@@ -14,6 +15,9 @@ url_prefix = API_PREFIX + API_VERSION + __bp__
 
 tag = Tag(name="quality", description="Data quality endpoints")
 
+# NOTE: abp_security only labels the endpoints in the OpenAPI document; it does
+# not enforce anything. Each view below carries @require_auth for that — the
+# blueprint used to rely on the label alone, so these were public.
 api = APIBlueprint(__bp__, __name__, url_prefix=url_prefix, abp_tags=[tag], abp_security=[{"jwt": []}])
 
 shared_logger = SharedLogger()
@@ -39,19 +43,23 @@ class ConflictListResponse(PaginatedResponse[ImportConflictRecord]):
          responses={200: QualityStatsResponse, 401: Unauthorized},
          summary="Get data quality statistics",
          description="Return aggregate quality metrics including total records, conflicts, file count, coordinate coverage, and breakdowns by country and source.")
+@require_auth
 def get_quality_stats():
     try:
         stats = repo.get_stats()
         return stats, 200
-    except Exception as e:
-        logger.error(f"Error fetching quality stats: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        # Exception text can carry SQL and connection details; log it, do not
+        # return it.
+        logger.exception("Error fetching quality stats")
+        return {'error': 'Failed to fetch quality statistics'}, 500
 
 
 @api.get('/conflicts',
          responses={200: ConflictListResponse, 401: Unauthorized},
          summary="List import conflicts",
          description="Return paginated list of import conflicts with optional filtering. Defaults to 100 records per page, capped at 500.")
+@require_auth
 def get_conflicts(query: QualityFilter):
     pagination = get_pagination()
 
@@ -81,6 +89,6 @@ def get_conflicts(query: QualityFilter):
             "per_page": paginated.per_page,
         }, 200
 
-    except Exception as e:
-        logger.error(f"Error fetching conflicts: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error fetching conflicts")
+        return {'error': 'Failed to fetch import conflicts'}, 500

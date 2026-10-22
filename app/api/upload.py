@@ -7,13 +7,16 @@ from flask_openapi3 import Tag, APIBlueprint
 from pydantic import BaseModel, Field
 
 from app.auth import require_auth
-from app.cache import invalidate_cache
+from app.cache import invalidate_planting_data_cache
 from app.config import API_PREFIX, API_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, RATE_LIMIT_UPLOAD
 from app.config import MAX_FILE_SIZE, ALLOWED_EXTENSIONS
 from app.dto.upload import UploadResponse
 from app.rate_limit import limiter
+from app.utils.logging import SharedLogger
 from app.utils.preview import read_columns
 from app.utils.rds_to_parquet import convert_for_ingestion
+
+logger = SharedLogger().get_logger()
 
 __bp__ = "/data"
 url_prefix = API_PREFIX + API_VERSION + __bp__
@@ -56,23 +59,32 @@ def _process_uploaded_file(f):
 
     try:
         columns = read_columns(stored, stored_ext)
-    except Exception as e:
+    except Exception:
         for p in (stored, stored + '.preview.json'):
             if os.path.exists(p):
                 os.remove(p)
-        return {"error": f"Failed to read file columns: {e}", "file": unique_name}, 400
+        # The parser's exception text can carry server paths and library
+        # internals, so it goes to the log and the client gets a stable message.
+        logger.exception(f"Failed to read columns of uploaded file {unique_name}")
+        return {"error": "Failed to read file columns. Is it a valid RDS or Parquet file?",
+                "file": unique_name}, 400
 
-    # Invalidate cached aggregation data since the dataset changed
-    for prefix in ('filters', 'coordinates', 'clusters'):
-        invalidate_cache(prefix)
+    # Invalidate cached aggregation data since the dataset changed. Every
+    # planting-data prefix, not a hand-picked list: 'coordinates' does not
+    # match the 'coordinates_bulk' keys, so the map kept its stale sample.
+    invalidate_planting_data_cache()
 
+    message = "File saved. Set HOUSEKEEPING_ENABLED=true and start a Celery worker for background processing."
     if HOUSEKEEPING_ENABLED:
         from app.services.housekeeper import process_file_async
-        process_file_async(file_path=stored)
+        # Say so when the broker refused it, rather than "accepted" regardless.
+        # The file stays in the data directory, so the next startup scan or a
+        # Retry picks it up.
+        message = ("File accepted for processing" if process_file_async(file_path=stored)
+                   else "File saved, but the job queue is unreachable; it will be processed on the next worker start.")
 
     return UploadResponse(
-        message="File accepted for processing" if HOUSEKEEPING_ENABLED
-        else "File saved. Set HOUSEKEEPING_ENABLED=true and start a Celery worker for background processing.",
+        message=message,
         # The stored name may differ from the upload name: an RDS is converted
         # to Parquet, so return whatever the worker will actually read.
         file=os.path.basename(stored),

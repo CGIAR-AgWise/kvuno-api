@@ -15,6 +15,8 @@ name: Docker Build (branches)
 # expression below therefore uses `github.event.workflow_run.*`. Using `github.ref`
 # here silently means the develop jobs never match, and would pass
 # `refs/heads/main` to the tagger and label a develop build `production`.
+# That includes APP_VERSION: `github.ref_name` would report the default branch
+# in /health, so it is only the fallback after `workflow_run.head_branch`.
 #
 # ⚠️ A workflow_run fired from a pull request in a FORK gets a read-only
 # GITHUB_TOKEN, and the push then fails with
@@ -44,8 +46,27 @@ jobs:
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile
-      app_version: ${{ github.ref_name }}-dev
+      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
       image_name: ghcr.io/cgiar-agwise/kvuno-api
+      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
+      branch_name: ${{ github.event.workflow_run.head_branch }}
+      commit_sha: ${{ github.event.workflow_run.head_sha }}
+
+  build-web-dev:
+    if: >
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.head_branch == 'develop'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      # The SPA is a separate build context: its Dockerfile needs only
+      # frontend/, not the whole repo.
+      context: ./frontend
+      dockerfile: Dockerfile
+      image_name: ghcr.io/cgiar-agwise/kvuno-web
+      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
       commit_sha: ${{ github.event.workflow_run.head_sha }}
@@ -57,7 +78,7 @@ jobs:
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.worker
-      app_version: ${{ github.ref_name }}-dev
+      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
       image_name: ghcr.io/cgiar-agwise/kvuno-worker
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}
@@ -70,7 +91,7 @@ jobs:
     uses: ./.github/workflows/docker-build-reusable.yml
     with:
       dockerfile: docker/Dockerfile.prod.dockerfile
-      app_version: ${{ github.ref_name }}
+      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}
       image_name: ghcr.io/cgiar-agwise/kvuno-api
       branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
       branch_name: ${{ github.event.workflow_run.head_branch }}

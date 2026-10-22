@@ -22,9 +22,15 @@ RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
+# `COPY . .` already brings in docker/entrypoint.worker.sh (.dockerignore only
+# excludes Dockerfile*), so it only needs to be made executable.
 COPY --chown=app:app . .
-RUN chown app:app /app
+RUN chown app:app /app && chmod +x /app/docker/entrypoint.worker.sh
 
 USER app
+
+# Verifies database + Redis reachability before Celery starts, then execs CMD.
+# A worker without a broker would otherwise idle forever instead of failing.
+ENTRYPOINT ["/app/docker/entrypoint.worker.sh"]
 
 CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]

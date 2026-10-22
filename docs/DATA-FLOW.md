@@ -6,9 +6,26 @@ This document describes the two main data flows in KVuno API: **ingestion** (RDS
 
 ---
 
+## 0. Request Path — Browser to API
+
+The frontend is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with
+Vite and pnpm and served by **nginx**; Flask renders no HTML. nginx reverse-proxies
+`/api`, `/ui`, and `/health` to the `api` service, so the browser talks to one origin
+and the bearer token never crosses one. Everything below is what happens *after* that
+proxy hop — the flows are otherwise unchanged by the move to React.
+
+| Layer | Value |
+|---|---|
+| SPA | `frontend/` (React 18, react-router 6, TypeScript), routes `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Edge | nginx — serves the bundle, reverse-proxies `/api`, `/ui`, `/health` to `api:80` |
+| API | Flask — JSON only; SSE through `/ui/jobs/events` with buffering disabled |
+| Async | Celery worker, same as §1 |
+
+---
+
 ## 1. Ingestion Flow — RDS File Processing
 
-RDS/Parquet files containing crop planting data are either uploaded through the UI/API (into `static/data/`, or `HOUSEKEEPING_DATA_DIR` if set) or downloaded from remote sources (`REMOTE_RDS_URLS`). They are then processed either by a Celery task (`worker` service) or by the standalone `housekeeping.py` CLI.
+RDS/Parquet files containing crop planting data are either uploaded through the SPA (into `static/data/uploads/<id>/`, see §1a), uploaded through `POST /api/v1/data/upload` or dropped into the data dir (`static/data/`, or `HOUSEKEEPING_DATA_DIR` if set), or downloaded from remote sources (`REMOTE_RDS_URLS`). They are then processed either by a Celery task (`worker` service) or by the standalone `housekeeping.py` CLI.
 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
@@ -41,8 +58,8 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
                                                                              │
                                                               ┌──────────────▼─────────────┐
                                                               │  Drop rows without coords  │
-                                                              │  Map columns via           │
-                                                              │  RDS_COLUMN_MAP + aliases  │
+                                                              │  Map columns via upload's  │
+                                                              │ column_map / RDS_COLUMN_MAP│
                                                               └──────────────┬─────────────┘
                                                                              │
                                                               ┌──────────────▼─────────────┐
@@ -67,32 +84,35 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 
 ### Step-by-step
 
-1. **(Optional) Remote download** — `download_remote_files()` (`app/services/housekeeper.py:190`) reads `REMOTE_RDS_URLS` (semicolon-delimited) and fetches each URL into the data dir. Supports bearer tokens (`REMOTE_RDS_TOKEN`), cookies (`REMOTE_RDS_COOKIES`), and custom headers (`REMOTE_RDS_HEADERS`). SSRF guards: HTTPS-only unless `REMOTE_RDS_ALLOW_HTTP=true`, private/loopback/link-local/metadata IPs rejected, `allow_redirects=False` unless the target validates, optional `REMOTE_RDS_ALLOWED_DOMAINS` allow-list. Failures are logged and skipped.
-2. **File discovery** — `load_rds_to_db()` (`app/services/housekeeper.py:507`) scans the data dir for `.RDS` and `.parquet` files, both pre-existing and freshly downloaded
+1. **(Optional) Remote download** — `download_remote_files()` (`app/services/housekeeper.py`) reads `REMOTE_RDS_URLS` (semicolon-delimited) and fetches each URL into the data dir. Supports bearer tokens (`REMOTE_RDS_TOKEN`), cookies (`REMOTE_RDS_COOKIES`), and custom headers (`REMOTE_RDS_HEADERS`). SSRF guards (`app/utils/downloader.py`): HTTPS-only unless `REMOTE_RDS_ALLOW_HTTP=true`; private/loopback/link-local/metadata IPs rejected; redirects followed **by hand** (max 5), each hop re-validated, with the bearer token (`Authorization`) dropped when a hop changes host — `REMOTE_RDS_COOKIES` are not host-scoped and are still sent; optional `REMOTE_RDS_ALLOWED_DOMAINS` allow-list (exact host or true subdomain — `example.org.evil.com` does not match); `REMOTE_RDS_MAX_BYTES` (default 1 GiB) enforced while streaming; and, after connecting, the socket's peer IP is re-checked against DNS rebinding (best effort; skipped behind an HTTP(S) proxy, whose own address is the peer). Failures are logged and skipped.
+2. **File discovery** — `load_rds_to_db()` (`app/services/housekeeper.py`) scans the data dir **root** (not subdirectories) for `.RDS` and `.parquet` files, both pre-existing and freshly downloaded. SPA uploads live in `uploads/<id>/` precisely so this scan does not ingest them with the default mapping before the user has mapped their columns
 3. **Pre-flight DB health check** — `db_health_check()` runs `SELECT 1` before any processing
-4. **Concurrent dispatch** — Files are processed in a `ThreadPoolExecutor` (size `HOUSEKEEPING_MAX_WORKERS`) using `submit()` + `as_completed()` so one failure does not abort the batch
+4. **Concurrent dispatch** — Files are processed in a `ThreadPoolExecutor` (size `HOUSEKEEPING_MAX_WORKERS`) using `submit()` + `as_completed()` so one failure does not abort the batch. The whole scan is **one** `processing_runs` row (`source='scan'`); each upload submission or Jobs Retry gets its own run (`source='upload'`) from `process_file_async()`. On the API, `process_pending()` only enqueues the scan if it wins the Redis key `kvuno:process_pending` (`SET NX EX 300`), so N gunicorn workers enqueue one scan — and an API restart within 5 minutes skips it
+   - **Per-file lock** — `process_file` takes `<file>.ingest.lock` next to the data file (O_EXCL, `app/utils/file_lock.py`) and touches it every chunk. A second worker on the same file (double submit, or a Redis redelivery of a still-running task) returns **silently** — writing an error would mark the live job failed. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (default 600) is taken over as dead
 5. **Checksum calculation** — Each file is hashed with SHA-256 (`app/utils/__init__.py::calculate_file_checksum`)
-6. **Deduplication / resume** — `FileImportRepo.get_by_checksum()` checks `file_imports`. Fully imported files are skipped; a non-zero `offset` resumes mid-file
-7. **File parsing** — `pyreadr.read_r()` for `.RDS`, `pandas.read_parquet()` for `.parquet`. The whole file is loaded, then iterated in chunks of `HOUSEKEEPING_CHUNK_SIZE` (default 5000)
-8. **Column mapping** — Rows without coordinates are dropped. Column names are resolved through `load_column_map()` (`RDS_COLUMN_MAP` JSON) plus built-in aliases (`cultivar`→`variety`, `season`→`season_type`, `sowing_date`/`planting_date`/`date`→`opt_date`, `longitude`→`lon`, `latitude`/`lat_y`→`lat`, `long`/`lon_x`→`lon`). The file checksum is attached to every row
-9. **Batch insert** — Records are bulk-inserted via `PlantingRecommendationRepo.batch_insert()`, each batch wrapped in `begin_nested()` (savepoint) and retried up to 3× with exponential backoff. `coordinates` is built as `POINT(lon lat)` WKT, SRID 4326
-10. **Checkpointing** — Every `HOUSEKEEPING_CHECKPOINT_INTERVAL` batches (default 50) the outer transaction commits **and** the new `offset` is persisted. This ordering is what makes resumption safe — don't reorder it
-11. **Conflict capture** — Duplicates against the `uq_planting_recommendation` unique constraint are recorded in `import_conflicts` (country/province/lon/lat/variety/season_type/opt_date)
-12. **File tracking** — A `FileImport` record (file name, checksum, `original_filename`, final `offset`) is saved. A partially processed file is *not* marked as fully processed
-13. **Graceful shutdown** — SIGTERM/SIGINT set a flag checked at each batch boundary: the current batch finishes and the offset is committed; a second signal force-quits
-14. **Progress** — `save_progress()` in `app/services/progress_store.py` writes `job:{stem}` to Redis (falling back to the `job_progress` table) and publishes on the `jobs:updates` channel, which `/ui/jobs/events` streams to browsers
+6. **Deduplication / resume** — `FileImportRepo.get_by_checksum()` checks `file_imports`. A row with `offset IS NULL` is fully imported: the file is skipped and a `completed` progress entry ("Already ingested") is written so a submitted duplicate still shows up on the Jobs page. A non-null `offset` resumes mid-file; an `offset` at or past the row count (left by files completed before the offset was cleared on success) is treated as processed and normalised to `NULL`
+7. **File parsing** — `.parquet` is **streamed**: `_iter_parquet_chunks()` reads record batches from a `pyarrow.parquet.ParquetFile` starting at the resume offset, so the whole file is never in memory. `.RDS` is read with `pyreadr.read_r()`, which has no chunked mode and deserialises the **whole** file before it is sliced — which is why SPA uploads are converted to Parquet during inspection. Either way rows are processed in chunks of `HOUSEKEEPING_CHUNK_SIZE` (default 5000), which sizes the insert batches rather than bounding memory
+8. **Column mapping** — Rows without coordinates are dropped. A file submitted from the Upload page carries the user's `column_map` (passed to `process_file(column_map=...)`), which is used **as is** — not merged over the defaults, so a skipped column stays skipped. Any other file resolves its columns through `load_column_map()`: built-in defaults, overridden by `RDS_COLUMN_MAP` JSON, overridden by a per-file `.map.json` sidecar — and that map is then **intersected with the file's actual columns** (`_select_columns()`; missing ones are logged and skipped), because asking pyarrow for an absent column fails the whole read. `XY` is read only if the file has it. The aliases (`cultivar`→`variety`, `season`→`season_type`, `sowing_date`/`planting_date`/`date`→`opt_date`, `longitude`/`long`/`lon_x`→`lon`, `latitude`/`lat_y`→`lat`) live in `COLUMN_ALIASES` (`app/services/uploads.py`) and only seed the suggested mapping during upload inspection. The file checksum is attached to every row
+9. **Batch insert** — Records are bulk-inserted, each batch wrapped in `begin_nested()` (savepoint) and retried with backoff. `coordinates` is built as `POINT(lon lat)` WKT, SRID 4326, whenever `lat` and `lon` are not `None` — `0` is a valid coordinate (a truthiness check used to null it and fail the whole batch). A batch that still fails is skipped and counted — unless the failure is a **transient** database error (`is_transient_db_error()`: lost connection, pool timeout, …), which aborts the file instead, since skipping would move the offset past rows that were never written
+10. **Checkpointing** — Every `HOUSEKEEPING_CHECKPOINT_INTERVAL` batches (default 50) the inserted rows **and** the new `offset` (`upsert_offset(commit=False)`) are committed in **one** transaction. Committing rows first left a window where a crash kept rows past the stored offset, which a resume re-inserted. Don't split them
+11. **Conflict capture** — Duplicates against the `uq_planting_recommendation` unique constraint are recorded in `import_conflicts` (country/province/lon/lat/variety/season_type/opt_date). The constraint is `NULLS NOT DISTINCT` on PostgreSQL ≥ 15 (migration `f3a9c2d4e5b6`), so a row with a NULL key column now conflicts instead of being re-inserted on every replay, and the conflict lookup matches with `IS NOT DISTINCT FROM`
+12. **File tracking** — A `FileImport` record (file name, checksum, `original_filename`, `offset`) is saved. On completion `offset` is stored as `NULL`, which is what every "already processed" check tests for (it used to store the row count, so no finished file was ever recognised and re-uploads were reported as partial). A partially processed file keeps its numeric offset. Completion with skipped batches is reported as `completed` with an error note ("Done with errors")
+13. **Graceful shutdown / failure** — In the CLI (`python housekeeping.py`), SIGTERM/SIGINT set a flag checked at each batch boundary: the current batch finishes and the offset is committed; a second signal force-quits. The handlers are installed by `install_signal_handlers()` from `cli_run()` only — they used to be installed at import, which replaced gunicorn's and Celery's own SIGTERM handling. On an exception the session is rolled back and the error is reported at the last checkpoint row (where a retry will resume). A transient DB error is **re-raised**, so the Celery task's `autoretry_for` retries it from the stored offset; any other error (a bad file) is recorded as `error` and the task returns, so it is **not** retried
+14. **Progress** — `save_progress()` in `app/services/progress_store.py` writes the `job:{stem}` hash to Redis and publishes on the `jobs:updates` channel, which `/ui/jobs/events` streams to browsers (the hot path, throttled by `JOB_PROGRESS_MIN_INTERVAL`). It also checkpoints the job to the `processing_jobs` table (grouped under a `processing_runs` row) every `JOB_DB_CHECKPOINT_SECONDS` (default 5s) whether or not Redis is up; terminal states always write through to both. Database progress writes use their **own short-lived `Session`** (`_db_session()`), never the scoped session holding the uncommitted ingest batch, so a progress write can no longer commit ingest rows ahead of their offset. `attempts` counts on from the file's history for each new run and increments when a run's job comes back to `processing` (a retry). Timestamps are stored naive UTC and converted with `_epoch()`, which treats them as UTC — `datetime.timestamp()` assumed local time and made jobs look stale (or fresh) on non-UTC hosts. On completion the worker also calls `invalidate_planting_data_cache()`, so new rows appear in the cached map/filter endpoints immediately
 15. **Telemetry** — `emit_event()` writes structured JSON lines to stderr at `housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`
 
 ### Tuning knobs
 
 | Env var | Default | Effect |
 |---|---|---|
-| `HOUSEKEEPING_DATA_DIR` | `static/data` | Where uploads and downloads live |
+| `HOUSEKEEPING_DATA_DIR` | `static/data` | Where downloads live; SPA uploads go in its `uploads/` subdirectory |
 | `HOUSEKEEPING_BATCH_SIZE` | `2000` | Rows per savepoint-wrapped insert |
 | `HOUSEKEEPING_CHUNK_SIZE` | `5000` | Rows per in-memory chunk |
 | `HOUSEKEEPING_CHECKPOINT_INTERVAL` | `50` | Batches between offset commits |
 | `HOUSEKEEPING_MAX_WORKERS` | `1` | Files processed in parallel |
 | `RDS_COLUMN_MAP` | built-in defaults | JSON map of source column → ORM field |
+| `INGEST_LOCK_STALE_SECONDS` | `600` | Age at which an unrefreshed `<file>.ingest.lock` is taken over |
+| `CELERY_VISIBILITY_TIMEOUT` | `21600` | Redis redelivers an unacked (late-acked) task after this; must exceed the longest single-file ingest |
 
 ### Tables affected
 
@@ -101,7 +121,52 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 | `planting_recommendations` | INSERT (bulk) | `check_sum`, `country`, `province`, `coordinates` (POINT), `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option` |
 | `file_imports` | UPSERT | `check_sum` (unique), `file_name`, `original_filename`, `offset`, `processed_at` |
 | `import_conflicts` | INSERT | `record_data` (JSON), `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `check_sum`, `source` |
-| `job_progress` | UPSERT (only if Redis is down) | `file_name` (unique), `status`, `current_row`, `total_rows`, `message` |
+| `processing_runs` | INSERT (one per enqueued submission/Retry, one per scan) | `id`, `label`, `source`, `status`, `total_files`, `started_at`, `finished_at` |
+| `processing_jobs` | INSERT / UPDATE (checkpointed, always on terminal states) | `run_id` → `processing_runs.id`, `file_name` (not unique), `status`, `current_row`, `total_rows`, `error`, `attempts`, `updated_at` |
+
+---
+
+## 1a. Upload Flow — SPA to Worker
+
+The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.ts`) (5 MB `PATCH` bodies) to a tus 1.0 server (core + creation extension) implemented in Flask in `app/routes/uploads.py`, with storage, inspection and mapping rules in `app/services/uploads.py`. Every step moves one `uploads` row forward; nothing is kept in sidecar files.
+
+```
+ browser (lib/tus.ts)                        API process                                worker
+ ───────────────────────                     ───────────                                ──────
+ POST  /ui/uploads/tus  ───────────────▶ create row `receiving`, empty data.part
+   Upload-Length, Upload-Metadata          size ≤ MAX_FILE_SIZE, .rds/.parquet
+                                           (413 / 415 before any bytes)
+ HEAD  /ui/uploads/tus/<id> ───────────▶ Upload-Offset = size of data.part
+ PATCH /ui/uploads/tus/<id> ───────────▶ append at offset (409 mismatch, 423 locked)
+                                           last byte: rename to <id>.<ext>, `received`,
+                                           start inspection thread
+ GET   /ui/uploads/<id>  (poll) ───────▶ `inspecting` → `ready` | `failed`
+                                           restarts a dead inspection
+ POST  /ui/uploads/<id>/process ───────▶ validate + save column_map, `submitted` ──▶ process_file(
+                                                                                     column_map=…)
+```
+
+### Lifecycle
+
+`receiving → received → inspecting → ready | failed → submitted`
+
+1. **Create** — `POST /ui/uploads/tus` with `Upload-Length` and `Upload-Metadata: filename <base64>`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked here, before any bytes are accepted (`413` / `415`). The server issues the id (`uuid4().hex`, validated against `^[0-9a-f]{32}$` before it ever becomes a path) and returns `201` + `Location`. `Upload-Defer-Length` is not supported
+2. **Receive** — `PATCH` appends at `Upload-Offset` into `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The part file's size *is* the offset, so an API restart loses nothing and `HEAD` tells the client where to resume. An offset mismatch is `409`; a second request while another holds the per-upload `.lock` file (O_EXCL, taken over after 30s without a write) is `423`, which the client retries
+3. **Received** — after the last byte the part file is renamed to `<id>.rds` / `<id>.parquet` and inspection starts
+4. **Inspect** — on a daemon thread in the API process, so it works with `HOUSEKEEPING_ENABLED=false`: `convert_for_ingestion()` (RDS → Parquet; the original path is kept if conversion fails), preview rows, row count, SHA-256, duplicate lookup against `file_imports` (`processed` or `partial`), and a suggested `column_map` (exact DB column name, case-insensitive, then `COLUMN_ALIASES`). The claim is a conditional `UPDATE`, so two pollers never run it twice. A heartbeat refreshes `updated_at` every 30s; a row still `inspecting` without one after `UPLOAD_INSPECT_STALE_SECONDS` (default 180) — its gunicorn worker was recycled — is re-claimed by the next `GET /ui/uploads/<id>`
+5. **Map** — the SPA shows the server's suggestion, so what is in the selects is exactly what will be sent; choosing *skip* removes the key. Validation on submit: `lat` and `lon` must be mapped, no DB column used twice, every source must exist in the file, every target must be a `planting_recommendations` column
+6. **Submit** — `POST /ui/uploads/<id>/process` saves the mapping (`submitted`) and calls `process_file_async(column_map=…)`, which returns whether the broker accepted the task. Broker unreachable → `503` and the upload returns to `ready`. `HOUSEKEEPING_ENABLED=false` → the mapping is saved and the upload stays `ready` with a message
+7. **Retry** — the Jobs page calls `POST /ui/process` with only the file name; for an upload the server re-uses the saved `column_map` (it used to send `{}` and wipe it). Files with no `uploads` row fall back to the sidecar path, resolved with `Path.is_relative_to` against the data dir
+
+Uploads are per user (`owner_id`); anyone else's id is reported as `404`. `GET /ui/uploads` lists the caller's unfinished uploads so a page reload does not lose files waiting to be mapped, and `DELETE /ui/uploads/<id>` discards one that has not been submitted. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit.
+
+### Cleanup
+
+`_cleanup_temp_files()` runs on every API worker boot and must never touch anything in flight — it used to `rmtree` the whole chunk directory, and gunicorn boots a worker on every `max_requests` recycle and timeout, which is what made uploads fail at random. It now:
+
+- deletes unsubmitted uploads idle longer than `UPLOAD_ABANDON_AGE` (default `7d`; `30m` / `12h` / `1d` / `2w`)
+- deletes the upload directory, data file and any sidecars of jobs `completed` longer than `CLEANUP_AGE` ago
+- removes the retired `.chunks/` directory if one is left over
 
 ---
 
@@ -149,21 +214,23 @@ Clients retrieve planting data via `GET /api/v1/planting-data/`, which applies f
 
 ### Step-by-step
 
-1. **HTTP request** — `GET /api/v1/planting-data/?country=Zambia&variety=Soybean&page=1&per_page=20` (`app/api/planting_data.py:77`)
-2. **Parameter extraction** — `page` and `per_page` from `request.args` (defaults 1 and 50; `per_page` is clamped to `[1, 500]` by `_clamp_per_page()`). All filter params are injected as a `PlantingDataFilter` Pydantic model (`app/dto/data_filters.py`)
+1. **HTTP request** — `GET /api/v1/planting-data/?country=Zambia&variety=Soybean&page=1&per_page=20` (`app/api/planting_data.py::get_data`)
+2. **Parameter extraction** — `page` and `per_page` from `request.args` via `get_pagination()` (`app/dto/pagination.py`; defaults 1 and `DEFAULT_PER_PAGE` = 100; `per_page` is clamped to `[1, MAX_PER_PAGE]` = `[1, 500]`). All filter params are injected as a `PlantingDataFilter` Pydantic model (`app/dto/data_filters.py`)
 3. **Validation** — Pydantic validators check:
    - `coordinates`: must match `lon,lat` format; lat in [-90, 90], lon in [-180, 180]
    - `opt_date`: must be `YYYY-MM-DD`
-   - `sort_col` / `sort_dir`: allow-listed column names and direction
+   - `sort_col` / `sort_dir`: allow-listed scalar columns (`PLANTING_SORT_COLUMNS` / `CONFLICT_SORT_COLUMNS` in `app/dto/data_filters.py`) and `asc`/`desc`; anything else is a `422` (flask-openapi3's validation status). It used to reach `getattr(Model, sort_col)` unchecked and 500 on names like `metadata`
    - Whitespace is stripped; enum values resolved
 4. **Query building** — `PlantingRecommendationRepo.get_filtered_data()` (`app/repo/planting_recommendation.py`) constructs a SQLAlchemy query with optional filters:
-   - **Spatial**: If `coordinates` + `radius` provided, uses `ST_DWithin(geometry, point, radius)` for PostGIS radius search
+   - **Spatial**: If `coordinates` + `radius` provided, uses `ST_DWithin(coordinates::geography, point::geography, radius)`, so `radius` is in **metres**. Without the cast, `ST_DWithin` on SRID 4326 geometries measured in degrees and `radius=50000` matched the whole planet
    - **Exact match**: `country`, `variety`, `season_type`, `opt_date`, `planting_option`
    - **Partial/ILIKE**: `province` uses `ILIKE '%search%'`
    - **Sort**: `sort_col` / `sort_dir` (defaults to `id` ascending)
 5. **Pagination** — `query.paginate(page, per_page)` returns a `QueryPagination` object with items, total count, and page metadata
 6. **Response mapping** — Each ORM `PlantingRecommendation` row is converted to a `PlantingRecommendationRecord` dict (`app/api/planting_data.py`)
-7. **JSON response** — Returns `{ data: [...], total, pages, current_page, per_page }` with HTTP 200, or 500 on error. The sibling endpoints `filters` (TTL 300s), `coordinates` (120s), and `clusters` (120s) are Redis-cached via `@api_cache`; new uploads call `invalidate_cache()` (`app/api/upload.py:66`) to drop those keys. The main data endpoint is **not** cached.
+7. **JSON response** — Returns `{ data: [...], total, pages, current_page, per_page }` with HTTP 200, or a generic 500 on error (the exception is logged with `logger.exception`, never returned to the client). The sibling endpoints `filters` (TTL 300s), `coordinates` (120s), `coordinates_bulk` (120s), and `clusters` (120s) are Redis-cached via `@api_cache`, which stores only **2xx `dict`/`list`** bodies — a cached 500 used to be replayed as a 200 for the whole TTL. `invalidate_planting_data_cache()` (`app/cache.py`) drops all four prefixes (`PLANTING_DATA_CACHE_PREFIXES`); it runs after an API upload (`app/api/upload.py`) **and** when the worker completes a file (`housekeeper.process_file`). The main data endpoint is **not** cached.
+
+Other serving details: `/clusters` pages by cluster — `pages` is computed from `total_clusters` (also returned), not from the point `total` — and a non-numeric `zoom` or an out-of-range bound (`ne_lat`, `ne_lng`, `sw_lat`, `sw_lng`) is a `400` naming the parameter. CSV `/export` keeps `0` values (a truthiness check used to blank them).
 
 ### Response shape
 
@@ -194,7 +261,7 @@ Clients retrieve planting data via `GET /api/v1/planting-data/`, which applies f
 
 ## 3. Database Schema
 
-Six tables, all defined in `app/models/kvuno.py` and created by Alembic migrations in `alembic/versions/`.
+All tables are defined in `app/models/kvuno.py` and created by Alembic migrations in `alembic/versions/`.
 
 ### `planting_recommendations`
 
@@ -202,7 +269,7 @@ Six tables, all defined in `app/models/kvuno.py` and created by Alembic migratio
 |---|---|---|
 | `id` | BIGINT PK | Auto-increment ID |
 | `check_sum` | VARCHAR(100) NOT NULL | SHA-256 of source file |
-| `coordinates` | GEOMETRY(POINT, 4326) NOT NULL | Spatial point (PostGIS) |
+| `coordinates` | GEOMETRY(POINT, 4326) NOT NULL | Spatial point (PostGIS). `TEXT` on SQLite, where the migration skips the `postgis` extension — so spatial queries and ingestion need Postgres |
 | `country` | VARCHAR(20) | Country name |
 | `province` | VARCHAR(20) | Province/region name |
 | `lon` | REAL | Longitude (denormalized) |
@@ -214,7 +281,7 @@ Six tables, all defined in `app/models/kvuno.py` and created by Alembic migratio
 | `created_at` | DATETIME | Auto-set on insert |
 | `updated_at` | DATETIME | Auto-set on update |
 
-Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date)` — this is what drives conflict detection.
+Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date)` — this is what drives conflict detection. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
 
 Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_province`, `idx_lon`, `idx_lat`, `idx_variety`, `idx_season_type`, `idx_opt_date`, `idx_planting_option`, plus a second GiST index `idx_planting_recommendations_coordinates`.
 
@@ -226,8 +293,30 @@ Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_province
 | `check_sum` | VARCHAR(100) UNIQUE NOT NULL | SHA-256 of processed file |
 | `file_name` | VARCHAR(120) NOT NULL | Stored file name |
 | `original_filename` | VARCHAR(255) | User-facing upload name |
-| `offset` | BIGINT | Row offset reached — enables resume |
+| `offset` | BIGINT | Row offset reached — enables resume; `NULL` once fully processed |
 | `processed_at` | DATETIME | Auto-set on insert |
+
+### `uploads`
+
+One row per SPA upload, from the first byte to submission (migration `20261022120000_create_uploads_table.py`, revision `7b1d0c5e2a91`). Replaces the `.meta.json` / `.map.json` / `.preview.json` sidecars for uploads. `.map.json` and `.meta.json` are still read by `process_file()` for files with no `uploads` row (dropped into the data dir, or sent to `/api/v1/data/upload`), and `/ui/process` still writes `.map.json` for them.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | VARCHAR(32) PK | Server-issued uuid hex; also the directory name under `uploads/` |
+| `owner_id` | BIGINT FK → `users.id` (SET NULL) | Uploader; other users get `404` |
+| `original_name` | VARCHAR(255) NOT NULL | User-facing file name |
+| `size` | BIGINT NOT NULL | tus `Upload-Length`, checked against `MAX_FILE_SIZE` |
+| `status` | VARCHAR(20) NOT NULL | `receiving` / `received` / `inspecting` / `ready` / `failed` / `submitted` |
+| `stored_path` | VARCHAR(512) | File the worker reads (`.parquet` after conversion) |
+| `sha256` | VARCHAR(64) | Checksum of the stored file |
+| `preview` | JSON | Columns, sample rows, `total_rows` |
+| `duplicate` | JSON | Matching `file_imports` row, if any (`processed` / `partial`) |
+| `column_map` | JSON | Source → DB column; seeded by inspection, replaced on submit, re-used by Retry |
+| `error` | VARCHAR(2000) | Inspection failure or why a submit did not enqueue |
+| `created_at` | DATETIME | Set on insert |
+| `updated_at` | DATETIME | Written explicitly on every change; the inspection heartbeat |
+
+Indexes: `ix_uploads_owner_id`, `ix_uploads_status`.
 
 ### `import_conflicts`
 
@@ -259,25 +348,52 @@ Index: `idx_conflict_created_at`.
 | `id` | BIGINT PK | Auto-increment ID |
 | `user_id` | BIGINT FK → `users.id` | Owner |
 | `token` | VARCHAR(128) NOT NULL | `{id}\|{secret}` bearer token |
-| `expires_at` | DATETIME | NULL = never expires |
-| `last_used_at` | DATETIME | Updated on each authenticated request |
+| `expires_at` | DATETIME | NULL = never expires. Naive UTC, like every token timestamp (`_utcnow()` / `_as_naive_utc()` in `app/api/user.py`); mixing aware and naive values used to 500 on any expiring token |
+| `last_used_at` | DATETIME | Refreshed by an authenticated request only when unset or older than 5 minutes, not on every request |
 | `created_at` | DATETIME | Auto-set on insert |
 
 Index: `idx_user_tokens_token`.
 
-### `job_progress`
+### `processing_runs`
+
+One ingestion batch — every enqueue (upload submit, Jobs Retry, `/api/v1/data/upload`) opens one via `start_run(source='upload')`, and a startup/CLI scan opens one for all its files (`source='scan'`). A run whose task could not be enqueued is discarded. Replaced the old `job_progress` table (migration `20260930110505_replace_job_progress_with_processing_runs_and_processing_jobs.py`).
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | BIGINT PK | Auto-increment ID |
-| `file_name` | VARCHAR(255) UNIQUE NOT NULL | File stem |
-| `status` | VARCHAR(20) | `unknown` / `processing` / `completed` / `error` |
-| `current_row` | BIGINT | Rows processed so far |
-| `total_rows` | BIGINT | Total rows detected |
-| `message` | VARCHAR(500) | Human-readable status |
-| `updated_at` | DATETIME | Auto-set on insert |
+| `id` | BIGINT PK | Auto-increment ID (INTEGER on SQLite) |
+| `label` | VARCHAR(255) | Optional display label |
+| `source` | VARCHAR(20) NOT NULL | Origin of the run: `upload` (default) or `scan` |
+| `status` | VARCHAR(20) NOT NULL | Stored status, default `running` — **not** authoritative: `list_runs()` derives a run's status from its jobs |
+| `total_files` | INTEGER | Files in the batch |
+| `initiated_by` | VARCHAR(120) | Who started it |
+| `created_at` | DATETIME | Auto-set on insert |
+| `started_at` / `finished_at` | DATETIME | Run timing |
 
-> `job_progress` is only the **fallback** store. When Redis is reachable, progress lives in the `job:{stem}` keys and this table stays empty.
+Index: `ix_processing_runs_created_at`.
+
+### `processing_jobs`
+
+One file's progress within a run.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGINT PK | Auto-increment ID (INTEGER on SQLite) |
+| `run_id` | BIGINT FK → `processing_runs.id` | `ON DELETE CASCADE` |
+| `file_name` | VARCHAR(255) NOT NULL | Stored file basename — **not** unique, so re-processing a file keeps its history |
+| `original_filename` | VARCHAR(255) | Name as uploaded |
+| `stored_path` | VARCHAR(512) | Real path on disk (differs after RDS → Parquet conversion) |
+| `status` | VARCHAR(20) NOT NULL | `unknown` / `processing` / `completed` / `error`; `mark_stale()` reports an idle `processing` job as `stale` |
+| `current_row` / `total_rows` | BIGINT | Rows processed / detected |
+| `message` | VARCHAR(500) | Human-readable status |
+| `error` | VARCHAR(2000) | Last failure detail, kept apart from `message` |
+| `attempts` | INTEGER | Times this file has been processed — continues from the file's history in a new run, and increments when a run's job returns to `processing` (retry/redelivery) |
+| `worker` | VARCHAR(120) | Worker that wrote the row |
+| `started_at` / `finished_at` | DATETIME | Job timing |
+| `updated_at` | DATETIME NOT NULL | Written explicitly on every update (not just a server default) |
+
+Indexes: `ix_processing_jobs_run_id`, `ix_processing_jobs_status`, `ix_processing_jobs_updated_at`.
+
+> Redis `job:{stem}` hashes are the hot path the SSE stream reads; these tables are the durable record, checkpointed every `JOB_DB_CHECKPOINT_SECONDS` and always written on terminal states, so a broker restart does not lose running jobs.
 
 ---
 
@@ -288,13 +404,14 @@ Index: `idx_user_tokens_token`.
 | ETL | `app/services/housekeeper.py` | Remote download, file discovery, parallel dispatch, chunked processing, checkpointing, CLI |
 | CLI wrapper | `housekeeping.py` | argparse front-end → `housekeeper.cli_run()` |
 | Watcher | `app/services/watch_handler.py` | watchdog-based directory monitoring for `--watch` |
-| Progress | `app/services/progress_store.py` | Job progress: Redis primary, `job_progress` table fallback, `jobs:updates` pub/sub |
-| Celery | `app/tasks.py` | `process_file_task` / `process_pending_task`; builds its own Flask app + `MyDb` |
+| Progress | `app/services/progress_store.py` | Job progress: Redis hot path + `jobs:updates` pub/sub, `processing_runs` / `processing_jobs` durable record |
+| Uploads | `app/services/uploads.py` | Upload storage, tus append + lock, background inspection, suggested mapping (`COLUMN_ALIASES`), mapping validation, abandoned-upload cleanup |
+| Celery | `app/tasks.py` | `process_file_task` (accepts `column_map`) / `process_pending_task`; builds its own Flask app + `MyDb` |
 | Download | `app/utils/downloader.py` | `RDSDownloader` — remote download with auth + SSRF guards |
-| Conversion | `app/utils/rds_to_parquet.py` | `batch_convert()` — RDS → Parquet |
+| Conversion | `app/utils/rds_to_parquet.py` | `batch_convert()` — RDS → Parquet; `convert_for_ingestion()` used by upload inspection and `/api/v1/data/upload` |
 | Checksum | `app/utils/__init__.py` | `calculate_file_checksum()` — file hashing |
 | Parsing | `pyreadr` / `pandas` (external) | RDS or Parquet → DataFrame |
-| Models | `app/models/kvuno.py` | `PlantingRecommendation`, `FileImport`, `ImportConflict`, `User`, `UserToken`, `JobProgress` |
+| Models | `app/models/kvuno.py` | `PlantingRecommendation`, `FileImport`, `ImportConflict`, `Upload`, `User`, `UserToken`, `ProcessingRun`, `ProcessingJob` |
 | DB Conn | `app/models/database_conn.py` | `MyDb` — SQLAlchemy initialization + health check |
 | Repo | `app/repo/planting_recommendation.py` | `PlantingRecommendationRepo` — CRUD, batch insert, filtered queries, spatial search |
 | Repo | `app/repo/file_import.py` | `FileImportRepo` — deduplication checks, offset upserts |
@@ -303,10 +420,13 @@ Index: `idx_user_tokens_token`.
 | DTO | `app/dto/planting_recommendation.py` | Response models for OpenAPI schema |
 | API | `app/api/planting_data.py` | `public_api` (query) + `protected_api` (filters, coordinates, clusters, export) |
 | API | `app/api/upload.py` | `POST /api/v1/data/upload` |
-| API | `app/api/quality.py` | `GET /api/v1/quality/stats`, `/conflicts` |
-| API | `app/api/user.py` | Register, login, logout, token management |
+| API | `app/api/quality.py` | `GET /api/v1/quality/stats`, `/conflicts` — both `@require_auth` |
+| API | `app/api/user.py` | Register (gated by `REGISTRATION_ALLOWED_DOMAINS`; passwords ≤ 72 UTF-8 bytes), login, logout (bearer or `token` cookie), token management |
 | Auth | `app/auth.py` | `require_auth` — Bearer header or `token` cookie |
-| Cache | `app/cache.py` | `@api_cache` / `invalidate_cache` (Redis, no-op if unavailable) |
-| Routes | `app/routes/main.py` | `/` redirect, `/health`, all `/ui/*` pages, resumable upload endpoints, SSE stream |
+| Cache | `app/cache.py` | `@api_cache` (2xx `dict`/`list` bodies only) / `invalidate_planting_data_cache()` (Redis, no-op if unavailable) |
+| Locking | `app/utils/file_lock.py` | `FileLock` — O_EXCL lock file with stale takeover; the per-file `.ingest.lock` |
+| Routes | `app/routes/main.py` | `/` redirect (`SPA_ROOT_URL`), `/health`, the JSON `/ui/*` endpoints, `/ui/process` (Retry), SSE stream |
+| Routes | `app/routes/uploads.py` | tus 1.0 server (`/ui/uploads/tus`) + upload lifecycle (`/ui/uploads/*`) |
+| Frontend | `frontend/` | React + TypeScript SPA (Vite/pnpm), served by nginx; the UI is not in this repo's Python layer |
 | App | `app/__init__.py` | `create_app()` — OpenAPI factory, CORS, rate limiter, security headers, DB init |
 | Config | `app/config.py` | Constants + `build_db_url()`; **raises at import if `DB_USER`/`DB_PASSWORD`/`DB_NAME` are unset** (no `DB_URL`) |

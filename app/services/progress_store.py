@@ -36,9 +36,14 @@ terminal status, so its job would sit at ``processing`` forever. Celery's
   genuinely be in progress, and is reported as ``stale``. This is what fixes
   the stuck UI, since the TTL alone would just make jobs vanish.
 """
+import datetime
 import json
 import os
 import time
+
+from app.utils.logging import SharedLogger
+
+_shared_logger = SharedLogger()
 
 PROGRESS_CHANNEL = 'jobs:updates'
 KEY_PREFIX = 'job:'
@@ -56,9 +61,23 @@ KEY_TTL_SECONDS = int(os.getenv('JOB_PROGRESS_TTL_SECONDS', str(7 * 24 * 3600)))
 # Minimum seconds between published updates for one job in an active state.
 MIN_INTERVAL_SECONDS = float(os.getenv('JOB_PROGRESS_MIN_INTERVAL', '1.0'))
 
+# Minimum seconds between DURABLE writes for one job. Postgres is the record of
+# truth, but writing it on every published tick would put one write per second
+# per running job on the database. Slower than the publish throttle, terminal
+# states always write through.
+DB_CHECKPOINT_SECONDS = float(os.getenv('JOB_DB_CHECKPOINT_SECONDS', '5.0'))
+
+# Postgres column widths, so a long message or error is truncated rather than
+# raising a DataError mid-ingest.
+MESSAGE_MAX = 500
+ERROR_MAX = 2000
+
 # Last publish time per stem, for throttling. Per-process and advisory only:
 # losing it just means a slightly higher publish rate.
 _last_published: dict[str, float] = {}
+
+# Last durable write per file, for the independent DB checkpoint throttle.
+_last_db_write: dict[str, float] = {}
 
 _migrated = False
 
@@ -97,8 +116,30 @@ def mark_stale(job: dict, now: float | None = None) -> dict:
     return job
 
 
+def _decode_hash(h: dict) -> dict:
+    """Normalise a Redis hash to str keys and values.
+
+    The client is built without ``decode_responses``, so ``hgetall`` returns
+    ``{b'status': b'processing', ...}``. Looking those up with a str key misses
+    every field, which silently degraded a job to ``status='unknown'`` with
+    zero rows — so the Jobs page showed every job as "Pending" while ingestion
+    was running normally, and the rows/sec + ETA never appeared either because
+    ``started_at`` was read the same way.
+    """
+    out = {}
+    for key, value in h.items():
+        if isinstance(key, (bytes, bytearray)):
+            key = key.decode('utf-8', 'replace')
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode('utf-8', 'replace')
+        out[key] = value
+    return out
+
+
 def _to_job(stem: str, h: dict) -> dict:
     """Normalise a hash into the shape the API and UI expect."""
+    h = _decode_hash(h)
+
     def _num(key, default=0):
         raw = h.get(key)
         try:
@@ -127,8 +168,20 @@ def _should_publish(stem: str, status: str, now: float) -> bool:
     return True
 
 
-def save_progress(file_path: str, status: str, current: int, total: int, message: str = ""):
-    """Record progress for a file. Publishes at most once per interval."""
+def save_progress(file_path: str, status: str, current: int, total: int, message: str = '',
+                  run_id: int | None = None, error: str | None = None,
+                  worker: str | None = None, original_filename: str | None = None):
+    """Record progress for a file. Publishes at most once per interval.
+
+    Two write paths with deliberately different cadences:
+
+    - **Redis** is the hot path the SSE stream reads, throttled to
+      ``JOB_PROGRESS_MIN_INTERVAL`` because browsers cannot use anything finer.
+    - **Postgres** is the durable record, checkpointed on its own slower
+      ``JOB_DB_CHECKPOINT_SECONDS`` interval so a long job still leaves a
+      recoverable trail without a write per published tick. Terminal states
+      always write through.
+    """
     stem = os.path.basename(file_path)
     now = time.time()
 
@@ -159,14 +212,51 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
         except Exception:
             pass
 
-    # Always persist terminal states, even when Redis is healthy. Otherwise the
-    # DB fallback holds no history at all, and a later Redis outage loses every
-    # completed and failed job.
-    if status in TERMINAL_STATUSES or r is None:
+    # Postgres is the durable record, not merely a fallback. Previously an
+    # in-flight job existed ONLY in Redis while Redis was healthy, so a broker
+    # restart or flush lost every running job with no trace. Checkpointed
+    # rather than written per tick to keep the write volume sane.
+    if not _should_write_db(stem, status, now):
+        return
+    # Best effort: the progress record must never be the thing that fails an
+    # ingest. A broken progress write is logged; the ingest's own DB errors
+    # still surface from the ingest itself.
+    try:
         _db_save(stem, {
-            'status': status, 'current': int(current), 'total': int(total),
-            'message': message, 'mtime': now,
+            'status': status,
+            'current': int(current),
+            'total': int(total),
+            'message': message,
+            'error': error,
+            'worker': worker,
+            'original_filename': original_filename or stem,
+            'stored_path': file_path,
+            'run_id': run_id,
+            'mtime': now,
         })
+    except Exception as e:
+        _logger().warning(f"Durable progress write failed for {stem}: {e}")
+
+
+def _logger():
+    return _shared_logger.get_logger()
+
+
+def _should_write_db(stem: str, status: str, now: float) -> bool:
+    """Throttle durable writes independently of the publish throttle.
+
+    Terminal states always write. Otherwise a job is checkpointed at most once
+    per DB_CHECKPOINT_SECONDS, and only when the same file has not just been
+    written.
+    """
+    if status in TERMINAL_STATUSES:
+        _last_db_write.pop(stem, None)
+        return True
+    last = _last_db_write.get(stem)
+    if last is not None and (now - last) < DB_CHECKPOINT_SECONDS:
+        return False
+    _last_db_write[stem] = now
+    return True
 
 
 def get_job(stem: str) -> dict | None:
@@ -181,10 +271,7 @@ def get_job(stem: str) -> dict | None:
         except Exception:
             pass
 
-    for job in _db_load_all():
-        if job.get('file') == stem:
-            return mark_stale(job)
-    return None
+    return _db_get_job(stem)
 
 
 def load_all_jobs(limit: int | None = None) -> list[dict]:
@@ -257,55 +344,271 @@ def _migrate_legacy(r) -> None:
         pass
 
 
-# ── DB fallback ────────────────────────────────────────────────
+# ── Durable record (Postgres) ──────────────────────────────────
+
+def _db_session():
+    """A short-lived Session of its own, NOT the app's scoped session.
+
+    process_file holds uncommitted ingest rows in the scoped session between
+    checkpoints. A progress write that committed *that* session committed
+    those rows too, ahead of the stored offset, so a resume re-inserted them
+    and logged spurious import_conflicts. A separate Session on the same
+    engine has its own connection and transaction, so committing progress can
+    never commit ingest work. Use it as a context manager so it is closed.
+
+    ``expire_on_commit=False`` so ids and columns stay readable after commit
+    without a second round trip.
+    """
+    from sqlalchemy.orm import Session
+    from app.models.database_conn import MyDb
+    return Session(bind=MyDb.get_db().engine, expire_on_commit=False)
+
+
+def _epoch(value: datetime.datetime | None) -> float:
+    """Seconds since the epoch for a naive-UTC DB timestamp.
+
+    Every timestamp here is stored naive in UTC. ``datetime.timestamp()`` on a
+    naive value assumes LOCAL time, so on a non-UTC host a DB-read job was
+    shifted by the UTC offset — enough to make a healthy job look stale to
+    mark_stale(), or a stale one look fresh.
+    """
+    if value is None:
+        return 0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value.timestamp()
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _clip(value, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else text[: limit - 1] + '…'
+
 
 def _db_save(stem: str, payload: dict):
-    try:
-        from app.models.database_conn import MyDb
-        from app.models.kvuno import JobProgress
+    """Upsert one job row.
 
-        session = MyDb.get_db().session
-        existing = session.query(JobProgress).filter_by(file_name=stem).first()
-        if existing:
-            existing.status = payload['status']
-            existing.current_row = payload['current']
-            existing.total_rows = payload['total']
-            existing.message = payload['message']
-        else:
-            session.add(JobProgress(
+    Matching is on ``(run_id, file_name)``, NOT on ``file_name`` alone. The
+    table this replaces had a UNIQUE constraint on file_name, which capped
+    history at one row per filename forever and silently overwrote a previous
+    run whenever a file was reprocessed.
+
+    ``updated_at`` is assigned explicitly on every write. Relying on
+    ``server_default=now()`` was the original bug: a DEFAULT applies on INSERT
+    only, so for any existing row it kept the creation timestamp — which made
+    mtime ordering wrong and let ``mark_stale`` report healthy jobs as stalled.
+    """
+    from sqlalchemy import func
+    from app.models.kvuno import ProcessingJob
+
+    now = _utcnow()
+    with _db_session() as session:
+        query = session.query(ProcessingJob).filter_by(file_name=stem)
+        if payload.get('run_id') is not None:
+            query = query.filter_by(run_id=payload['run_id'])
+
+        row = query.order_by(ProcessingJob.id.desc()).first()
+        if row is None:
+            # A new row for a file seen before is another attempt at it, so
+            # count on from the file's history rather than restarting at 1.
+            previous = (session.query(func.max(ProcessingJob.attempts))
+                        .filter_by(file_name=stem).scalar())
+            row = ProcessingJob(
                 file_name=stem,
-                status=payload['status'],
-                current_row=payload['current'],
-                total_rows=payload['total'],
-                message=payload['message'],
-            ))
+                run_id=payload.get('run_id'),
+                # started_at is set on creation and then preserved, so the rate
+                # and ETA the UI computes cover the whole job rather than
+                # resuming from whatever this attempt happens to have reached.
+                started_at=now,
+                attempts=(previous or 0) + 1,
+            )
+            session.add(row)
+        elif (payload['status'] == 'processing'
+              and row.status in TERMINAL_STATUSES | {'stale'}):
+            # The same run's row coming back to life is a retry (Celery
+            # autoretry after a transient DB error, or a redelivered task).
+            row.attempts = (row.attempts or 0) + 1
+            row.finished_at = None
+
+        row.status = payload['status']
+        row.current_row = int(payload.get('current') or 0)
+        row.total_rows = int(payload.get('total') or 0)
+        row.message = _clip(payload.get('message'), MESSAGE_MAX)
+        row.error = _clip(payload.get('error'), ERROR_MAX)
+        row.updated_at = now
+        if payload.get('worker'):
+            row.worker = str(payload['worker'])[:120]
+        if payload.get('original_filename'):
+            row.original_filename = _clip(payload['original_filename'], 255)
+        if payload.get('stored_path'):
+            row.stored_path = _clip(payload['stored_path'], 512)
+        if payload['status'] in TERMINAL_STATUSES:
+            row.finished_at = now
+
         session.commit()
-    except Exception:
-        pass
+        return row
 
 
-def _db_load_all():
-    try:
-        from app.models.database_conn import MyDb
-        from app.models.kvuno import JobProgress
+def _row_to_job(row) -> dict:
+    """Normalise a ProcessingJob row into the shape the API and UI expect."""
+    return {
+        'file': row.file_name,
+        'status': row.status,
+        'current': row.current_row or 0,
+        'total': row.total_rows or 0,
+        'message': row.message or '',
+        'error': row.error or '',
+        'run_id': row.run_id,
+        'attempts': row.attempts or 0,
+        'worker': row.worker or '',
+        'original_name': row.original_filename or row.file_name,
+        'mtime': _epoch(row.updated_at),
+        'started_at': _epoch(row.started_at),
+    }
 
-        session = MyDb.get_db().session
-        rows = session.query(JobProgress).order_by(JobProgress.updated_at.desc()).all()
-        return [
-            {
-                'file': r.file_name,
-                'status': r.status,
-                'current': r.current_row,
-                'total': r.total_rows,
-                'message': r.message or '',
-                'mtime': r.updated_at.timestamp() if r.updated_at else 0,
-                # The table has no started_at column, and updated_at moves on
-                # every write, so reporting it as the start would inflate the
-                # computed rate wildly. Zero makes the UI omit rate/ETA rather
-                # than show a wrong figure.
-                'started_at': 0,
-            }
-            for r in rows
-        ]
-    except Exception:
-        return []
+
+def _db_load_all(limit: int | None = None) -> list[dict]:
+    from app.models.kvuno import ProcessingJob
+
+    with _db_session() as session:
+        # order_by before limit: SQLAlchemy refuses order_by on a limited Query.
+        query = session.query(ProcessingJob).order_by(ProcessingJob.updated_at.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        return [_row_to_job(r) for r in query.all()]
+
+
+def _db_get_job(stem: str) -> dict | None:
+    """The latest DB row for one file, or None."""
+    from app.models.kvuno import ProcessingJob
+
+    with _db_session() as session:
+        row = (session.query(ProcessingJob).filter_by(file_name=stem)
+               .order_by(ProcessingJob.id.desc()).first())
+        return mark_stale(_row_to_job(row)) if row is not None else None
+
+
+# ── Runs ───────────────────────────────────────────────────────
+
+def start_run(label: str | None = None, source: str = 'upload',
+              total_files: int = 0, initiated_by: str | None = None) -> int | None:
+    """Open a run so a batch can be tracked as a unit. Returns its id."""
+    from app.models.kvuno import ProcessingRun
+
+    now = _utcnow()
+    run = ProcessingRun(
+        label=_clip(label, 255),
+        source=source,
+        status='running',
+        total_files=int(total_files or 0),
+        initiated_by=_clip(initiated_by, 120),
+        created_at=now,
+        started_at=now,
+    )
+    with _db_session() as session:
+        session.add(run)
+        session.commit()
+        return run.id
+
+
+def discard_run(run_id: int | None):
+    """Delete a run that never got a job, e.g. because the enqueue failed.
+
+    A run with no jobs derives to 'pending' forever, so leaving one behind
+    would show a batch that is never going to start.
+    """
+    from app.models.kvuno import ProcessingJob, ProcessingRun
+
+    if run_id is None:
+        return
+    with _db_session() as session:
+        if session.query(ProcessingJob).filter_by(run_id=run_id).count():
+            return
+        run = session.get(ProcessingRun, run_id)
+        if run is not None:
+            session.delete(run)
+            session.commit()
+
+
+def finish_run(run_id: int, status: str = 'completed'):
+    """Close a run once all its jobs have settled."""
+    from app.models.kvuno import ProcessingRun
+
+    with _db_session() as session:
+        run = session.get(ProcessingRun, run_id)
+        if run is None:
+            return
+        run.status = status
+        run.finished_at = _utcnow()
+        session.commit()
+
+
+def _derive_run_status(run, counts: dict) -> str:
+    """A run is finished once none of its jobs are still in flight.
+
+    'pending' means the run exists but no job has reported yet, so a
+    freshly-created run does not briefly claim to have failed.
+    """
+    if counts['processing']:
+        return 'running'
+    if counts['completed'] and not counts['error']:
+        return 'completed'
+    if counts['error'] and not counts['completed']:
+        return 'error'
+    if counts['completed'] and counts['error']:
+        return 'partial'
+    if counts['stale']:
+        return 'stale'
+    return 'pending'
+
+
+def list_runs(limit: int = 20) -> list[dict]:
+    """Recent runs with aggregate progress, newest first."""
+    from app.models.kvuno import ProcessingRun
+
+    with _db_session() as session:
+        runs = (session.query(ProcessingRun)
+                .order_by(ProcessingRun.created_at.desc()).limit(limit).all())
+        return [_summarise_run(run) for run in runs]
+
+
+def _summarise_run(run) -> dict:
+    jobs = list(run.jobs)
+    # The stored status of a job whose worker died is still 'processing';
+    # staleness is judged on read, so apply it here too or such a run would
+    # claim to be running forever.
+    statuses = [
+        mark_stale({'status': j.status, 'mtime': _epoch(j.updated_at)})['status']
+        for j in jobs
+    ]
+    counts = {
+        'total': len(jobs),
+        'processing': statuses.count('processing'),
+        'completed': statuses.count('completed'),
+        'error': statuses.count('error'),
+        'stale': statuses.count('stale'),
+    }
+    return {
+        'id': run.id,
+        'label': run.label or f'Run {run.id}',
+        'source': run.source,
+        # Derived from the jobs, not read from run.status. A run is only
+        # finished when every one of its jobs has settled, and nothing
+        # reliably calls finish_run() — deriving it here means a run can
+        # never be left claiming to be running after its work finished.
+        'status': _derive_run_status(run, counts),
+        'total_files': run.total_files or len(jobs),
+        'initiated_by': run.initiated_by or '',
+        'created_at': _epoch(run.created_at),
+        'finished_at': _epoch(run.finished_at),
+        'counts': counts,
+        'rows': {
+            'current': sum(j.current_row or 0 for j in jobs),
+            'total': sum(j.total_rows or 0 for j in jobs),
+        },
+    }

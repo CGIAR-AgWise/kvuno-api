@@ -200,10 +200,14 @@ class TestGetCurrentUser:
 
         token_id, secret = 1, "a" * 64
         bearer = f"{token_id}|{secret}"
+        # Naive UTC, which is what the `timestamp without time zone` column
+        # actually returns. This used to be an AWARE datetime, which hid the
+        # bug: production compared a naive DB value with an aware "now" and
+        # raised TypeError (500) for every token that had an expiry.
         mock_token_record = MagicMock(
             spec=UserToken, id=1,
             token=_hash_token(1, secret),
-            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1),
         )
         mock_session = MagicMock()
         mock_token_query = MagicMock()
@@ -357,34 +361,101 @@ class TestPaginationBounds:
                                        'current_page': 3, 'per_page': 100}
 
 
-class TestAuthPages:
-    def test_login_page_renders(self):
-        from app import create_app
-        app = create_app()
-        with app.test_client() as c:
-            resp = c.get('/ui/login')
-            assert resp.status_code == 200
-            assert b'Sign in' in resp.data
-            assert b'Register' in resp.data
+class TestNoServerRenderedPages:
+    """The UI is a separate React SPA; this container serves only the API.
 
-    def test_register_page_renders(self):
+    These routes used to render Jinja templates. They must now be gone, so a
+    stale link cannot silently serve a page whose scripts and data contract no
+    longer match the SPA.
+    """
+
+    RETIRED = ['/ui/login', '/ui/register', '/ui/jobs', '/ui/explore',
+               '/ui/upload', '/ui/quality', '/ui/tokens']
+
+    def test_retired_pages_are_404(self):
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/register')
+            for path in self.RETIRED:
+                assert c.get(path).status_code == 404, path
+
+    def test_root_without_spa_url_returns_a_pointer(self):
+        """No redirect loop.
+
+        Defaulting SPA_ROOT_URL to '/' would point the browser back at this
+        same service, which redirects again forever. With it unset the root
+        must answer with a pointer instead.
+        """
+        from app import create_app
+        app = create_app()
+        with app.test_client() as c:
+            resp = c.get('/')
             assert resp.status_code == 200
-            assert b'Create an account' in resp.data
-            assert b'Sign in' in resp.data
+            assert resp.is_json
+            assert resp.get_json()['service'] == 'kvuno-api'
+
+    def test_root_redirects_to_configured_spa(self, monkeypatch):
+        from app import create_app
+        monkeypatch.setenv('SPA_ROOT_URL', 'http://127.0.0.1:5001')
+        app = create_app()
+        with app.test_client() as c:
+            resp = c.get('/')
+            assert resp.status_code == 302
+            assert resp.location == 'http://127.0.0.1:5001'
+
+    def test_endpoints_the_spa_needs_are_still_registered(self):
+        """Only the HTML pages were retired; the SPA's endpoints must remain.
+
+        These are the paths the React app calls. Losing one would surface as a
+        404 in the browser rather than a failure here, so assert on the URL map.
+        """
+        from app import create_app
+        app = create_app()
+        adapter = app.url_map.bind('')
+        # (path, method) — several are POST-only, and match() defaults to GET.
+        needed = [
+            ('/ui/columns', 'GET'),
+            ('/ui/jobs/data', 'GET'),
+            ('/ui/jobs/events', 'GET'),
+            ('/ui/progress/report.parquet', 'GET'),
+            ('/ui/process', 'POST'),
+            ('/ui/uploads', 'GET'),
+            ('/ui/uploads/tus', 'POST'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'HEAD'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'PATCH'),
+            ('/ui/uploads/' + 'a' * 32, 'GET'),
+            ('/ui/uploads/' + 'a' * 32, 'DELETE'),
+            ('/ui/uploads/' + 'a' * 32 + '/process', 'POST'),
+        ]
+        for path, method in needed:
+            assert adapter.match(path, method=method), f'{method} {path} is gone'
+
+    def test_protected_spa_endpoints_still_require_auth(self):
+        """Retiring the pages must not have relaxed auth on what remains."""
+        from app import create_app
+        app = create_app()
+        with app.test_client() as c:
+            assert c.get('/ui/columns').status_code == 401
+            assert c.get('/ui/jobs/data').status_code == 401
+            assert c.get('/ui/uploads').status_code == 401
+            assert c.post('/ui/uploads/tus', headers={'Upload-Length': '10'}).status_code == 401
+            assert c.patch('/ui/uploads/tus/' + 'a' * 32, data=b'x',
+                           content_type='application/offset+octet-stream').status_code == 401
 
 
 class TestRequireAuth:
     def test_redirects_browser_to_login(self):
+        """A browser hitting a protected endpoint is bounced to the SPA login.
+
+        The SPA owns the login route, so the redirect target is expressed as a
+        query param the SPA reads rather than a server-rendered page.
+        """
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/jobs', headers={'Accept': 'text/html'})
+            resp = c.get('/ui/columns', headers={'Accept': 'text/html'})
             assert resp.status_code == 302
-            assert resp.location.startswith('/ui/login?next=')
+            assert resp.location.startswith('/login?next=')
 
     def test_returns_401_for_api_client(self):
         from app import create_app
@@ -474,3 +545,44 @@ class TestCookieAuth:
             assert user is not None
             assert user.id == 1
             assert user.username == "cookie_user"
+
+
+class TestCeleryArgumentSerialisation:
+    """Task arguments are JSON-serialised before publishing.
+
+    Both call sites of process_file_async build a pathlib.Path while the
+    signature says str, and nothing checked. Celery then failed to publish with
+    "Object of type WindowsPath is not JSON serializable" — and because the
+    enqueue happens after the response is prepared, the upload still returned
+    200. The file was stored and silently never ingested.
+    """
+
+    def test_path_argument_is_coerced_to_str(self):
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+
+        def fake_enqueue(task, **kwargs):
+            captured.update(kwargs)
+            json.dumps(kwargs)  # what Celery does before publishing
+
+        with patch('app.services.housekeeper._enqueue_or_warn', fake_enqueue):
+            process_file_async(file_path=Path('/tmp/data/sample.parquet'))
+
+        assert isinstance(captured['file_path'], str)
+        assert captured['file_path'] == str(Path('/tmp/data/sample.parquet'))
+
+    def test_str_argument_passes_through_unchanged(self):
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+        with patch('app.services.housekeeper._enqueue_or_warn',
+                   lambda task, **kw: captured.update(kw)):
+            process_file_async(file_path='/tmp/data/sample.parquet')
+        assert captured['file_path'] == '/tmp/data/sample.parquet'

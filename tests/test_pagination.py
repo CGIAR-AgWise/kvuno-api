@@ -136,6 +136,7 @@ class TestClustersPagination:
     def test_clusters_are_limited(self, client, authed):
         repo = MagicMock()
         repo.get_clusters.return_value = [{"lat": 1.0, "lon": 2.0, "count": 10}]
+        repo.count_clusters.return_value = 30
         with patch("app.api.planting_data.repo", repo):
             resp = client.get("/api/v1/planting-data/clusters?zoom=5&page=2&per_page=25")
         assert resp.status_code == 200
@@ -171,7 +172,7 @@ class TestListEndpointsDefaultTo100:
         args = repo.get_paginated_data.call_args.args
         assert args[1] == 1 and args[2] == 100
 
-    def test_conflicts_defaults_to_100(self, client):
+    def test_conflicts_defaults_to_100(self, client, authed):
         repo = MagicMock()
         page = MagicMock(items=[], total=0, pages=0, page=1, per_page=100)
         repo.get_paginated.return_value = page
@@ -181,7 +182,7 @@ class TestListEndpointsDefaultTo100:
         args = repo.get_paginated.call_args.args
         assert args[1] == 1 and args[2] == 100
 
-    def test_conflicts_page_size_is_capped(self, client):
+    def test_conflicts_page_size_is_capped(self, client, authed):
         from app.dto.pagination import MAX_PER_PAGE
         repo = MagicMock()
         page = MagicMock(items=[], total=0, pages=0, page=1, per_page=MAX_PER_PAGE)
@@ -212,3 +213,51 @@ class TestListEndpointsDefaultTo100:
         query.limit.assert_called_once_with(100)
         # Ordered, so paging is stable rather than arbitrary.
         query.order_by.assert_called_once()
+
+
+class TestCountQueriesDropOrdering:
+    """A COUNT(*) must not carry an ORDER BY.
+
+    Postgres rejects the whole statement when a sort column is neither
+    aggregated nor in a GROUP BY: "column planting_recommendations.id must
+    appear in the GROUP BY clause". This broke /coordinates with a 500 while
+    /planting-data and /quality/conflicts kept working, because flask-sqlalchemy
+    paginate() counts via Query.count() — which strips ordering automatically —
+    whereas the coordinate count used with_entities(func.count()).scalar(),
+    which does not.
+    """
+
+    def test_count_coordinates_emits_no_order_by(self):
+        from app.repo.planting_recommendation import PlantingRecommendationRepo
+        from app.dto.data_filters import PlantingDataFilter
+
+        captured = {}
+
+        class Recorder:
+            def __getattr__(self, _name):
+                def call(*args, **kwargs):
+                    return self
+
+                return call
+
+            def order_by(self, *args):
+                captured['order_by'] = args
+                return self
+
+            def scalar(self):
+                return 7
+
+        repo = PlantingRecommendationRepo()
+        # Replace the session with a recorder so the emitted statement is
+        # inspected without a live database.
+        original = repo._get_session
+        repo._get_session = lambda: Recorder()
+        try:
+            filters = PlantingDataFilter(sort_col='variety', sort_dir='desc')
+            count = repo.count_coordinates(filters)
+        finally:
+            repo._get_session = original
+
+        assert count == 7
+        # order_by(None) must be called, which is how the ordering is dropped.
+        assert captured.get('order_by') == (None,)

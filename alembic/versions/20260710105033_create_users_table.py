@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from app.utils.migration_utils import get_integer_column_type
+from app.utils.migration_utils import get_integer_column_type, now_default
 
 # revision identifiers, used by Alembic.
 revision: str = '92d64c2ee467'
@@ -28,7 +28,7 @@ def upgrade() -> None:
         sa.Column('username', sa.String(length=100), nullable=False),
         sa.Column('email', sa.String(length=255), nullable=False),
         sa.Column('password_hash', sa.String(length=255), nullable=False),
-        sa.Column('created_at', sa.DateTime(), server_default=sa.text('now()'), nullable=True),
+        sa.Column('created_at', sa.DateTime(), server_default=now_default(), nullable=True),
         sa.UniqueConstraint('username', name='users_username_key'),
         sa.UniqueConstraint('email', name='users_email_key'),
     )
