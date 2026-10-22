@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import math
 import os
 
 from flask import request, Response, stream_with_context
@@ -63,7 +64,8 @@ class ClusterItem(BaseModel):
 
 class ClustersResponse(BaseModel):
     clusters: list[ClusterItem] = Field(default=[], description="Spatially aggregated clusters")
-    total: int = Field(0, description="Total points represented")
+    total: int = Field(0, description="Total points represented by the clusters on this page")
+    total_clusters: int = Field(0, description="Total clusters across all pages")
     pages: int = Field(0, description="Total number of cluster pages")
     current_page: int = Field(1, description="Current page number")
     per_page: int = Field(100, description="Clusters per page")
@@ -144,9 +146,9 @@ def get_data(query: PlantingDataFilter):
             per_page=paginated_data.per_page,
         ).model_dump(), 200
 
-    except Exception as e:
-        logger.error(f"Error retrieving planting recommendation data: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error retrieving planting recommendation data")
+        return {'error': 'Failed to retrieve planting data'}, 500
 
 
 FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type']
@@ -172,9 +174,9 @@ def get_filter_options():
         }
         return {**values, 'totals': totals, 'pages': pages,
                 'current_page': pagination.page, 'per_page': pagination.per_page}, 200
-    except Exception as e:
-        logger.error(f"Error fetching filter options: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error fetching filter options")
+        return {'error': 'Failed to fetch filter options'}, 500
 
 
 @protected_api.get('/coordinates',
@@ -204,9 +206,9 @@ def get_coordinates(query: PlantingDataFilter):
             "coordinates": [{"lat": lat, "lon": lon} for lat, lon in points],
             **pagination.envelope(total),
         }, 200
-    except Exception as e:
-        logger.error(f"Error retrieving coordinates: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error retrieving coordinates")
+        return {'error': 'Failed to retrieve coordinates'}, 500
 
 
 @protected_api.get('/coordinates/all',
@@ -233,9 +235,9 @@ def get_coordinates_all(query: PlantingDataFilter):
             "truncated": len(points) < total,
             "cap": cap,
         }, 200
-    except Exception as e:
-        logger.error(f"Error retrieving bulk coordinates: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error retrieving bulk coordinates")
+        return {'error': 'Failed to retrieve coordinates'}, 500
 
 
 @protected_api.get('/clusters',
@@ -247,24 +249,41 @@ def get_coordinates_all(query: PlantingDataFilter):
 @api_cache('clusters', ttl=120)
 def get_clusters(query: PlantingDataFilter):
     pagination = get_pagination()
+    # Parsed outside the try below: a malformed value is the client's mistake
+    # and gets a 400 naming the parameter, not a 500 from int()/float().
     try:
         zoom = int(request.args.get('zoom', 5))
-        ne_lat = float(request.args.get('ne_lat', 90))
-        ne_lng = float(request.args.get('ne_lng', 180))
-        sw_lat = float(request.args.get('sw_lat', -90))
-        sw_lng = float(request.args.get('sw_lng', -180))
-
-        clusters = repo.get_clusters(query, zoom, ne_lat, ne_lng, sw_lat, sw_lng,
+    except (TypeError, ValueError):
+        return {'error': "zoom must be an integer"}, 400
+    bounds = {}
+    for name, default, limit in (('ne_lat', 90, 90), ('ne_lng', 180, 180),
+                                 ('sw_lat', -90, 90), ('sw_lng', -180, 180)):
+        try:
+            value = float(request.args.get(name, default))
+        except (TypeError, ValueError):
+            return {'error': f"{name} must be a number"}, 400
+        if not math.isfinite(value) or abs(value) > limit:
+            return {'error': f"{name} must be between -{limit} and {limit}"}, 400
+        bounds[name] = value
+    try:
+        clusters = repo.get_clusters(query, zoom, bounds['ne_lat'], bounds['ne_lng'],
+                                     bounds['sw_lat'], bounds['sw_lng'],
                                      limit=pagination.per_page, offset=pagination.offset)
-        # `total` is points represented, not cluster count, so it keeps its
-        # existing meaning; the cluster page count describes this page only.
+        # `total` is points represented on this page, so it keeps its existing
+        # meaning. `pages` is about clusters, though: it used to be derived
+        # from the point total, which over-reported pages by orders of
+        # magnitude (one cluster can hold thousands of points), so a client
+        # paging until `pages` walked far past the last real cluster.
+        cluster_total = repo.count_clusters(query, zoom, bounds['ne_lat'], bounds['ne_lng'],
+                                            bounds['sw_lat'], bounds['sw_lng'])
         total = sum(c['count'] for c in clusters)
         return {"clusters": clusters, "total": total,
+                "total_clusters": cluster_total,
                 "current_page": pagination.page, "per_page": pagination.per_page,
-                "pages": max(1, (total + pagination.per_page - 1) // pagination.per_page)}, 200
-    except Exception as e:
-        logger.error(f"Error fetching clusters: {e}")
-        return {'error': str(e)}, 500
+                "pages": max(1, (cluster_total + pagination.per_page - 1) // pagination.per_page)}, 200
+    except Exception:
+        logger.exception("Error fetching clusters")
+        return {'error': 'Failed to fetch clusters'}, 500
 
 
 def _row_to_dict(row):
@@ -311,7 +330,10 @@ def export_data(query: PlantingDataFilter):
             buf.seek(0)
             buf.truncate(0)
             for batch in rows.yield_per(500):
-                w.writerow([getattr(batch, col, None) or '' for col in EXPORT_COLUMNS])
+                # Explicit None check: `or ''` also blanked legitimate zeros
+                # (planting_option 0, a coordinate on the equator/meridian).
+                w.writerow(['' if (v := getattr(batch, col, None)) is None else v
+                            for col in EXPORT_COLUMNS])
                 yield buf.getvalue()
                 buf.seek(0)
                 buf.truncate(0)
@@ -322,6 +344,6 @@ def export_data(query: PlantingDataFilter):
             headers={'Content-Disposition': 'attachment; filename=kvuno-export.csv'},
         )
 
-    except Exception as e:
-        logger.error(f"Error exporting data: {e}")
-        return {'error': str(e)}, 500
+    except Exception:
+        logger.exception("Error exporting data")
+        return {'error': 'Failed to export data'}, 500

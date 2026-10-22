@@ -1,14 +1,14 @@
 from typing import Optional, List, Type
 
 from flask_sqlalchemy.pagination import QueryPagination
-from geoalchemy2 import WKTElement
-from sqlalchemy import func
+from geoalchemy2 import Geography, WKTElement
+from sqlalchemy import cast, func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query
 
 from app.dto.planting_recommendation import PlantingRecommendationCreate
-from app.dto.data_filters import PlantingDataFilter
+from app.dto.data_filters import PLANTING_SORT_COLUMNS, PlantingDataFilter
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, ImportConflict
 from app.utils.logging import SharedLogger
@@ -65,7 +65,13 @@ class PlantingRecommendationRepo:
         query = self._apply_filters(filters)
         sort_col = filters.sort_col or 'id'
         sort_dir = filters.sort_dir or 'asc'
-        col_attr = getattr(PlantingRecommendation, sort_col, PlantingRecommendation.id)
+        # The DTO already rejects unknown columns with a validation error; this
+        # is the backstop for callers that build a filter with model_construct
+        # or bypass validation. getattr on an arbitrary name reached non-column
+        # attributes like `metadata` and 500'd on .asc().
+        if sort_col not in PLANTING_SORT_COLUMNS:
+            sort_col = 'id'
+        col_attr = getattr(PlantingRecommendation, sort_col)
         order = col_attr.asc() if sort_dir == 'asc' else col_attr.desc()
         # Tie-break on the primary key. A non-unique sort column leaves row
         # order ambiguous, and LIMIT/OFFSET over an ambiguous order silently
@@ -81,8 +87,16 @@ class PlantingRecommendationRepo:
         if filters.coordinates and filters.radius:
             lon, lat = map(float, filters.coordinates.split(","))
             point = WKTElement(f'POINT({lon} {lat})', srid=4326)
+            # `radius` is documented in metres, but ST_DWithin on two SRID 4326
+            # geometries measures in the SRS's unit — degrees — so radius=50000
+            # matched the whole planet. Casting both sides to geography makes
+            # the distance metres (on the spheroid), as documented.
             query = query.filter(
-                func.ST_DWithin(PlantingRecommendation.coordinates, point, filters.radius)
+                func.ST_DWithin(
+                    cast(PlantingRecommendation.coordinates, Geography(srid=4326)),
+                    cast(point, Geography(srid=4326)),
+                    filters.radius,
+                )
             )
         if filters.country:
             query = query.filter(PlantingRecommendation.country == filters.country)
@@ -145,10 +159,9 @@ class PlantingRecommendationRepo:
         )
         return query.order_by(None).with_entities(func.count()).scalar() or 0
 
-    def get_clusters(self, filters: PlantingDataFilter, zoom: int,
-                     ne_lat: float, ne_lng: float,
-                     sw_lat: float, sw_lng: float,
-                     limit: int | None = None, offset: int = 0) -> list[dict]:
+    def _cluster_base(self, filters: PlantingDataFilter, zoom: int,
+                      ne_lat: float, ne_lng: float, sw_lat: float, sw_lng: float):
+        """Filtered, bounded query plus the grid expression clusters group by."""
         grid_size = max(0.0001, 360.0 / (2 ** max(zoom, 1)))
         bounds = func.ST_MakeEnvelope(sw_lng, sw_lat, ne_lng, ne_lat, 4326)
 
@@ -161,9 +174,24 @@ class PlantingRecommendationRepo:
             PlantingRecommendation.lon.isnot(None),
         )
         query = query.order_by(None)
+        grid = func.ST_SnapToGrid(PlantingRecommendation.coordinates, grid_size)
+        return query, grid
+
+    def count_clusters(self, filters: PlantingDataFilter, zoom: int,
+                       ne_lat: float, ne_lng: float,
+                       sw_lat: float, sw_lng: float) -> int:
+        """Number of grid cells (clusters) the cluster endpoint can page over."""
+        query, grid = self._cluster_base(filters, zoom, ne_lat, ne_lng, sw_lat, sw_lng)
+        cells = query.with_entities(grid.label('cell')).group_by(grid).subquery()
+        return self._get_session().query(func.count()).select_from(cells).scalar() or 0
+
+    def get_clusters(self, filters: PlantingDataFilter, zoom: int,
+                     ne_lat: float, ne_lng: float,
+                     sw_lat: float, sw_lng: float,
+                     limit: int | None = None, offset: int = 0) -> list[dict]:
+        query, grid = self._cluster_base(filters, zoom, ne_lat, ne_lng, sw_lat, sw_lng)
 
         # Group by grid cell and return center + count
-        grid = func.ST_SnapToGrid(PlantingRecommendation.coordinates, grid_size)
         grid_query = query.with_entities(
             func.avg(PlantingRecommendation.lat).label('lat'),
             func.avg(PlantingRecommendation.lon).label('lon'),

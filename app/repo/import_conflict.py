@@ -2,7 +2,7 @@
 from sqlalchemy import func
 from sqlalchemy.orm import Query
 
-from app.dto.data_filters import QualityFilter
+from app.dto.data_filters import CONFLICT_SORT_COLUMNS, QualityFilter
 from app.models.database_conn import MyDb
 from app.models.kvuno import ImportConflict
 from app.utils.logging import SharedLogger
@@ -35,7 +35,12 @@ class ImportConflictRepo:
 
         sort_col = filters.sort_col or 'created_at'
         sort_dir = filters.sort_dir or 'desc'
-        col_attr = getattr(ImportConflict, sort_col, ImportConflict.created_at)
+        # The DTO rejects unknown columns; this is the backstop for a filter
+        # built without validation. getattr on an arbitrary name reached
+        # non-column attributes like `metadata` and 500'd on .asc().
+        if sort_col not in CONFLICT_SORT_COLUMNS:
+            sort_col = 'created_at'
+        col_attr = getattr(ImportConflict, sort_col)
         query = query.order_by(col_attr.asc() if sort_dir == 'asc' else col_attr.desc())
 
         return query
