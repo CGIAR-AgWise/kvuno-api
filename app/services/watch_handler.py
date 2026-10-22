@@ -4,7 +4,7 @@ import time
 
 from watchdog.events import FileSystemEventHandler
 
-from app.services.housekeeper import process_file
+from app.services.housekeeper import logger, process_file
 
 
 class RDSFileHandler(FileSystemEventHandler):
@@ -33,13 +33,20 @@ class RDSFileHandler(FileSystemEventHandler):
             return
 
         time.sleep(1)
-        process_file(
-            path,
-            batch_size=self.batch_size,
-            chunk_size=self.chunk_size,
-            checkpoint_interval=self.checkpoint_interval,
-            dry_run=self.dry_run,
-        )
+        try:
+            process_file(
+                path,
+                batch_size=self.batch_size,
+                chunk_size=self.chunk_size,
+                checkpoint_interval=self.checkpoint_interval,
+                dry_run=self.dry_run,
+            )
+        except Exception as e:
+            # process_file re-raises transient DB errors so Celery can retry.
+            # There is no retrier here, and an exception escaping a watchdog
+            # handler kills the observer thread, so log it and keep watching;
+            # the file's offset is kept and the next event or run resumes it.
+            logger.error(f"Ingest of {path} failed, will resume on the next run: {e}")
 
     def on_created(self, event):
         if not event.is_directory:

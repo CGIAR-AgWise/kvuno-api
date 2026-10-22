@@ -10,7 +10,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from app.utils.migration_utils import get_integer_column_type
+from app.utils.migration_utils import get_integer_column_type, now_default
 
 revision: str = 'j0bpr0gr3ss'
 down_revision: Union[str, None] = '022ecd9e3632'
@@ -27,7 +27,7 @@ def upgrade() -> None:
         sa.Column('current_row', get_integer_column_type(), nullable=False, server_default='0'),
         sa.Column('total_rows', get_integer_column_type(), nullable=False, server_default='0'),
         sa.Column('message', sa.String(500), nullable=True),
-        sa.Column('updated_at', sa.DateTime, server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime, server_default=now_default()),
     )
 
 

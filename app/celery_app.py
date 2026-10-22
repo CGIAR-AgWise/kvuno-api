@@ -19,6 +19,18 @@ celery_app.config_from_object({
     'result_serializer': 'json',
     'task_track_started': True,
     'task_acks_late': True,
+    # With acks_late, a worker killed mid-task (OOM, container stop) would
+    # otherwise have its task acked as failed and the file never finished.
+    # Rejecting puts it back on the queue instead. Redelivery is safe because
+    # ingest resumes from the stored offset and holds a per-file lock.
+    'task_reject_on_worker_lost': True,
+    # Redis redelivers an unacked task once the visibility timeout passes —
+    # 1 hour by default — even if the first worker is still running it. With
+    # acks_late, a long ingest therefore got a second, concurrent copy. Set
+    # this above the longest expected single-file ingest.
+    'broker_transport_options': {
+        'visibility_timeout': int(os.getenv('CELERY_VISIBILITY_TIMEOUT', '21600')),
+    },
     'worker_prefetch_multiplier': 1,
     'broker_connection_retry_on_startup': False,
     'broker_connection_max_retries': 1,

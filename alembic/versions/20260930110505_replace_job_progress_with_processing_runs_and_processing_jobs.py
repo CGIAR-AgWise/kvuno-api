@@ -22,7 +22,7 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from app.utils.migration_utils import get_integer_column_type, is_specified_db
+from app.utils.migration_utils import get_integer_column_type, is_specified_db, now_default
 
 revision: str = '00318c15e700'
 down_revision: Union[str, None] = 'j0bpr0gr3ss'
@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.Column('status', sa.String(20), nullable=False, server_default='running'),
         sa.Column('total_files', sa.Integer, nullable=False, server_default='0'),
         sa.Column('initiated_by', sa.String(120), nullable=True),
-        sa.Column('created_at', sa.DateTime, server_default=sa.text('now()'), nullable=True),
+        sa.Column('created_at', sa.DateTime, server_default=now_default(), nullable=True),
         sa.Column('started_at', sa.DateTime, nullable=True),
         sa.Column('finished_at', sa.DateTime, nullable=True),
     )
@@ -62,7 +62,7 @@ def upgrade() -> None:
         sa.Column('attempts', sa.Integer, nullable=False, server_default='0'),
         sa.Column('worker', sa.String(120), nullable=True),
         sa.Column('started_at', sa.DateTime, nullable=True),
-        sa.Column('updated_at', sa.DateTime, nullable=False, server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime, nullable=False, server_default=now_default()),
         sa.Column('finished_at', sa.DateTime, nullable=True),
         sa.ForeignKeyConstraint(['run_id'], ['processing_runs.id'], ondelete='CASCADE'),
     )
@@ -127,7 +127,7 @@ def downgrade() -> None:
         sa.Column('current_row', get_integer_column_type(), nullable=False, server_default='0'),
         sa.Column('total_rows', get_integer_column_type(), nullable=False, server_default='0'),
         sa.Column('message', sa.String(500), nullable=True),
-        sa.Column('updated_at', sa.DateTime, server_default=sa.text('now()')),
+        sa.Column('updated_at', sa.DateTime, server_default=now_default()),
     )
 
     # Carry the most recent row per filename back, since the old schema could

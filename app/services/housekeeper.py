@@ -19,7 +19,15 @@ from dotenv import load_dotenv
 from geoalchemy2 import WKTElement
 from sqlalchemy import text as db_text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+    PendingRollbackError,
+    SQLAlchemyError,
+    TimeoutError as PoolTimeoutError,
+)
 from tqdm import tqdm
 
 from app import create_app
@@ -39,6 +47,7 @@ from app.repo.planting_recommendation import PlantingRecommendationRepo
 from app.repo.file_import import FileImportRepo
 from app.utils import calculate_file_checksum
 from app.utils.downloader import RDSDownloader
+from app.utils.file_lock import FileLock
 from app.utils.logging import SharedLogger
 
 load_dotenv()
@@ -48,6 +57,19 @@ logger = shared_logger.get_logger()
 
 _app = None
 DATA_DIR = HOUSEKEEPING_DATA_DIR
+
+# Per-file ingest lock, next to the data file. Two workers could ingest the
+# same file at once (a double-click enqueues twice; a Redis redelivery after
+# the visibility timeout runs a task that is still running), interleaving
+# commits and offsets. The holder refreshes it every chunk, so it only goes
+# stale when the holder is dead; set this well above the slowest chunk.
+INGEST_LOCK_SUFFIX = '.ingest.lock'
+INGEST_LOCK_STALE_SECONDS = float(os.getenv('INGEST_LOCK_STALE_SECONDS', '600'))
+
+# How long process_pending()'s de-dupe key lives. create_app() calls it once
+# per gunicorn worker, so without this N workers enqueued N identical scans.
+PROCESS_PENDING_DEDUPE_KEY = 'kvuno:process_pending'
+PROCESS_PENDING_DEDUPE_SECONDS = 300
 
 
 # ── App management ─────────────────────────────────────────────
@@ -112,11 +134,23 @@ def _handle_sigint(signum, frame):
     logger.warning("KeyboardInterrupt received — shutting down after current batch")
 
 
-try:
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-except (ValueError, AttributeError):
-    pass
-signal.signal(signal.SIGINT, _handle_sigint)
+def install_signal_handlers():
+    """Install graceful-shutdown handlers — for the standalone CLI only.
+
+    These used to be installed at import time, which replaced gunicorn's and
+    Celery's own SIGTERM handlers in any process that merely imported this
+    module (the API with HOUSEKEEPING_ENABLED, and every worker), so neither
+    shut down the way it expects. Celery's warm shutdown already lets a task
+    finish, and an interrupted ingest resumes from its offset.
+
+    ``signal.signal`` raises ValueError off the main thread, so both are
+    guarded; SIGTERM may also be missing on some platforms (AttributeError).
+    """
+    for sig_name, handler in (('SIGTERM', _handle_sigterm), ('SIGINT', _handle_sigint)):
+        try:
+            signal.signal(getattr(signal, sig_name), handler)
+        except (ValueError, AttributeError):
+            pass
 
 
 # ── Telemetry ──────────────────────────────────────────────────
@@ -165,7 +199,8 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
 
 
 def _write_progress(file_path: str, status: str, current: int, total: int, message: str = "",
-                    run_id: int | None = None, error: str | None = None):
+                    run_id: int | None = None, error: str | None = None,
+                    original_filename: str | None = None):
     """Record progress for one file.
 
     ``run_id`` groups the files submitted together so the UI can report batch
@@ -177,7 +212,7 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
         file_path, status, current, total, message,
         run_id=run_id, error=error,
         worker=os.getenv('HOSTNAME') or socket.gethostname(),
-        original_filename=os.path.basename(file_path),
+        original_filename=original_filename or os.path.basename(file_path),
     )
 
 
@@ -197,6 +232,64 @@ def retry_db(fn, attempts: int = 3, base_delay: float = 1.0):
                 time.sleep(delay)
     logger.error(f"DB operation failed after {attempts} attempts: {last_exc}")
     raise last_exc
+
+
+_TRANSIENT_DB_ERRORS = (
+    OperationalError, InterfaceError, DisconnectionError, PoolTimeoutError,
+    # Raised on every use of a session whose transaction could not be rolled
+    # back — in an ingest that means the connection went away mid-savepoint
+    # (a constraint failure inside a savepoint rolls back cleanly instead).
+    PendingRollbackError,
+)
+
+
+def is_transient_db_error(exc: BaseException) -> bool:
+    """Whether *exc* is the database being unavailable, not the file being bad.
+
+    Transient errors are re-raised so Celery's ``autoretry_for`` retries the
+    task, which resumes from the stored offset. The cause chain is followed
+    because retry_db and SQLAlchemy both wrap the original error.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, _TRANSIENT_DB_ERRORS):
+            return True
+        if isinstance(exc, DBAPIError) and getattr(exc, 'connection_invalidated', False):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _select_columns(column_map: dict[str, str], available: list[str], file_name: str,
+                    explicit: bool) -> tuple[dict[str, str], list[str]]:
+    """The mapping restricted to the file's columns, and the columns to read.
+
+    The default/sidecar map names columns a given file may not have, and
+    asking pyarrow for a missing column fails the whole read. An explicit
+    upload map was already validated against the file, so it is left alone.
+    'XY' (the coordinate presence check) is read whenever the file has it.
+    """
+    if not explicit:
+        missing = [c for c in column_map if c not in available]
+        if missing:
+            logger.warning(f"{file_name}: mapped column(s) absent from the file, skipped: {missing}")
+            column_map = {k: v for k, v in column_map.items() if k in available}
+    columns = list(column_map)
+    if 'XY' in available and 'XY' not in columns:
+        columns.append('XY')
+    return column_map, columns
+
+
+def _coordinate_columns(column_map: dict[str, str], frame_columns) -> list[str]:
+    """Columns a row must have to be ingestable: XY if present, else lat/lon.
+
+    ``coordinates`` is NOT NULL, so a row without them would fail its batch.
+    """
+    if 'XY' in frame_columns:
+        return ['XY']
+    return [src for src, target in column_map.items()
+            if target in ('lat', 'lon') and src in frame_columns]
 
 
 def db_health_check():
@@ -316,15 +409,20 @@ def _iter_parquet_chunks(parquet_file, columns, start: int, chunk_size: int):
 
 
 def _log_batch_conflicts(session, mappings):
-    from sqlalchemy import tuple_
+    from sqlalchemy import and_, or_
     unique_cols = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date']
-    key_tuples = [
+    key_tuples = {
         tuple(m.get(c) for c in unique_cols)
         for m in mappings
-    ]
-    existing = session.query(PlantingRecommendation).filter(
-        tuple_(*[getattr(PlantingRecommendation, c) for c in unique_cols]).in_(key_tuples)
-    ).all()
+    }
+    # IS NOT DISTINCT FROM, not a tuple IN: `NULL = NULL` is never true, so a
+    # key with any NULL never matched and its conflict went unlogged — even
+    # though the constraint (NULLS NOT DISTINCT) does reject it.
+    existing = session.query(PlantingRecommendation).filter(or_(*[
+        and_(*[getattr(PlantingRecommendation, c).is_not_distinct_from(v)
+               for c, v in zip(unique_cols, key)])
+        for key in key_tuples
+    ])).all()
     existing_keys = {
         tuple(getattr(e, c) for c in unique_cols): e.check_sum
         for e in existing
@@ -360,6 +458,8 @@ def process_file(
     checkpoint_interval: int = 50,
     dry_run: bool = False,
     run_id: int | None = None,
+    column_map: dict[str, str] | None = None,
+    original_filename: str | None = None,
 ):
     """
     Processes a single file by reading its contents in chunks, converting data to
@@ -370,25 +470,53 @@ def process_file(
 
     ``run_id`` associates this file with a :class:`ProcessingRun` so a batch of
     files submitted together can be tracked and reported as a unit.
+
+    ``column_map`` comes from an upload the user mapped, and is used *as is*.
+    Merging it over the defaults (what the sidecar path does) meant a column the
+    user chose to skip was mapped anyway, and a default whose source column was
+    absent from the file made pyarrow fail the whole read.
     """
     start_time = time.time()
     file_name = os.path.basename(file_path)
 
-    original_filename = ""
-    meta_path = file_path + '.meta.json'
-    if os.path.isfile(meta_path):
-        try:
-            with open(meta_path) as f:
-                meta = json.load(f)
-            original_filename = meta.get('original_name', '')
-        except (json.JSONDecodeError, OSError):
-            pass
+    if original_filename is None:
+        original_filename = ""
+        meta_path = file_path + '.meta.json'
+        if os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                original_filename = meta.get('original_name', '')
+            except (json.JSONDecodeError, OSError):
+                pass
 
-    column_map = load_column_map(file_path=file_path)
+    # An explicit map (from an upload) was validated against the file; the
+    # default/sidecar map was not, so only that one is trimmed to the schema.
+    explicit_map = column_map is not None
+    if column_map is None:
+        column_map = load_column_map(file_path=file_path)
+
+    def progress(status, current, total, message="", **kw):
+        _write_progress(file_path, status, current, total, message, run_id=run_id,
+                        original_filename=original_filename or None, **kw)
+
+    lock = FileLock(file_path + INGEST_LOCK_SUFFIX, INGEST_LOCK_STALE_SECONDS)
+    # Initialised before the try so every error path can report the last
+    # known position. Reporting 0/0 used to wipe it from the Jobs page.
+    num_rows = 0
+    checkpoint_row = 0
 
     with _get_app().app_context():
+        session = MyDb.get_db().session
         checksum = None
         try:
+            if not dry_run and not lock.acquire():
+                # Another live worker owns this file. Writing an error here
+                # would mark *its* healthy job as failed, so say nothing.
+                logger.warning(f"{file_name} is already being ingested by another worker "
+                               f"({lock.path}); skipping this run")
+                return
+
             checksum = calculate_file_checksum(file_path, logger)
 
             if dry_run:
@@ -405,13 +533,16 @@ def process_file(
             resume_offset = 0
             if existing and existing.offset is None:
                 logger.warning(f"File {file_name} is already fully processed. Checksum: {checksum}")
+                # Report it, or a submitted duplicate shows nothing at all.
+                progress('completed', 0, 0, 'Already ingested — nothing to do')
                 return
             if existing and existing.offset is not None:
                 resume_offset = existing.offset
                 logger.info(f"Resuming {file_name} from row {resume_offset} (checksum: {checksum})")
+            checkpoint_row = resume_offset
 
-            column_names = list(column_map.keys())
-            is_parquet = file_path.endswith('.parquet')
+            # Case-insensitive: 'X.PARQUET' went down the pyreadr path and failed.
+            is_parquet = file_path.lower().endswith('.parquet')
 
             if is_parquet:
                 # Stream row groups instead of materialising the whole file.
@@ -421,8 +552,10 @@ def process_file(
                 import pyarrow.parquet as pq
                 parquet_file = pq.ParquetFile(file_path)
                 num_rows = parquet_file.metadata.num_rows
+                column_map, columns = _select_columns(
+                    column_map, parquet_file.schema_arrow.names, file_name, explicit_map)
                 chunk_source = _iter_parquet_chunks(
-                    parquet_file, column_names + ['XY'], resume_offset, chunk_size
+                    parquet_file, columns, resume_offset, chunk_size
                 )
             else:
                 # pyreadr has no chunksize parameter, so an RDS cannot be read
@@ -431,19 +564,25 @@ def process_file(
                 result = pyreadr.read_r(file_path)
                 data = result[None]
                 num_rows = len(data)
+                column_map, _ = _select_columns(
+                    column_map, list(data.columns), file_name, explicit_map)
                 chunk_source = _iter_frame_chunks(data, resume_offset, chunk_size)
-
-            _write_progress(file_path, 'processing', resume_offset, num_rows, 'Processing…', run_id=run_id)
+            lock.touch()  # a large RDS can take minutes to deserialise
 
             if resume_offset >= num_rows:
+                # Completed before the offset was cleared on success; finish
+                # the bookkeeping so dedupe recognises it from now on.
                 logger.warning(f"File {file_name} offset ({resume_offset}) >= total rows ({num_rows}), skipping")
+                file_import_repo.upsert_offset(checksum, file_name, None, original_filename)
+                progress('completed', num_rows, num_rows, 'Already ingested — nothing to do')
                 return
+
+            progress('processing', resume_offset, num_rows, 'Processing…')
 
             emit_event("file.processing_start", file=file_name, checksum=checksum,
                        total_rows=num_rows, resume_offset=resume_offset)
             logger.info(f"Processing file {file_name} in chunks of size {chunk_size}")
 
-            session = MyDb.get_db().session
             failed_batches = 0
             completed_batches = 0
             batches_since_checkpoint = 0
@@ -464,12 +603,14 @@ def process_file(
                         logger.warning("Shutdown requested — breaking after current chunk")
                         break
 
+                    lock.touch()
                     chunk_end = chunk_start + len(chunk)
                     pbar.update(len(chunk))
 
                     logger.debug(f"Processing chunk from rows {chunk_start} to {chunk_end} of {file_name}")
 
-                    filtered = chunk.dropna(subset=['XY'])
+                    required = _coordinate_columns(column_map, chunk.columns)
+                    filtered = chunk.dropna(subset=required) if required else chunk
                     skipped = len(chunk) - len(filtered)
                     if skipped:
                         logger.warning(f"Skipped {skipped} row(s) in chunk {chunk_start}-{chunk_end} due to empty coordinates")
@@ -502,11 +643,21 @@ def process_file(
                                         {
                                             **r.model_dump(),
                                             'coordinates': WKTElement(f"POINT({r.lon} {r.lat})", srid=4326)
-                                            if r.lat and r.lon
+                                            # `is not None`: 0 is a real
+                                            # coordinate, and a NULL here fails
+                                            # the NOT NULL column and with it the
+                                            # whole batch.
+                                            if r.lat is not None and r.lon is not None
                                             else None
                                         }
                                         for r in rows
                                     ]
+                                    # No conflict target: any unique violation
+                                    # is a duplicate. uq_planting_recommendation
+                                    # is NULLS NOT DISTINCT on Postgres (see
+                                    # migration f3a9c2d4e5b6), so a row with a
+                                    # NULL key column now conflicts as well
+                                    # instead of being inserted on every replay.
                                     stmt = insert(PlantingRecommendation).values(mappings).on_conflict_do_nothing()
                                     result = session.execute(stmt)
                                     if result.rowcount < len(mappings):
@@ -514,30 +665,47 @@ def process_file(
                             retry_db(lambda: _flush_batch(sub), attempts=2)
                             completed_batches += 1
                             batches_since_checkpoint += 1
-                        except SQLAlchemyError:
+                        except SQLAlchemyError as e:
+                            # A lost connection is not a bad batch: skipping
+                            # it would advance the offset past rows that were
+                            # never written. Abort the file and let the task
+                            # retry from the last checkpoint instead.
+                            if is_transient_db_error(e):
+                                raise
                             failed_batches += 1
                             logger.error(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
 
                     if not shutdown_requested:
                         last_committed_row = chunk_end
-                        _write_progress(file_path, 'processing', last_committed_row, num_rows, run_id=run_id)
+                        progress('processing', last_committed_row, num_rows)
 
                     if batches_since_checkpoint >= checkpoint_interval and not shutdown_requested:
+                        # Rows and offset in ONE transaction. Committing the
+                        # rows first left a window where a crash kept rows
+                        # past the stored offset, which a resume re-inserted.
+                        file_import_repo.upsert_offset(checksum, file_name, chunk_end,
+                                                       original_filename, commit=False)
                         session.commit()
-                        file_import_repo.upsert_offset(checksum, file_name, chunk_end, original_filename)
+                        checkpoint_row = chunk_end
                         batches_since_checkpoint = 0
                         logger.debug(f"Checkpoint committed at row {chunk_end}")
                     if shutdown_requested:
                         break
 
-            except BaseException:
-                _write_progress(file_path, 'error', last_committed_row, num_rows, "Interrupted", run_id=run_id, error="Interrupted")
+            except BaseException as exc:
                 pbar.close()
-                session.rollback()
+                # Roll back first, so nothing past the last checkpoint is kept.
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                # Exceptions are reported by the handlers below; this covers
+                # KeyboardInterrupt/SystemExit, which they do not catch.
+                if not isinstance(exc, Exception):
+                    progress('error', checkpoint_row, num_rows, "Interrupted", error="Interrupted")
                 raise
 
             pbar.close()
-            session.commit()
 
             # Drop references to the bulk frame before returning. Only the RDS
             # path holds one — Parquet streams batches — so a bare `del data`
@@ -545,34 +713,69 @@ def process_file(
             # delete: pandas/pyarrow return memory to the allocator in arenas,
             # so a large file's peak otherwise sticks around in the worker.
             data = None
+            chunk_source = None
             gc.collect()
+
+            if shutdown_requested:
+                file_import_repo.upsert_offset(checksum, file_name, last_committed_row,
+                                               original_filename, commit=False)
+                session.commit()
+                logger.warning(
+                    f"Graceful shutdown — committed {completed_batches} batches from {file_name}, "
+                    f"offset {last_committed_row} persisted"
+                )
+            else:
+                # offset=None is what every "already processed" check tests
+                # for. Storing num_rows here meant no file was ever recognised
+                # as done: re-uploads were reported "partial" and re-read.
+                # Committed together with the final rows, as at a checkpoint.
+                file_import_repo.upsert_offset(checksum, file_name, None,
+                                               original_filename, commit=False)
+                session.commit()
+                if failed_batches:
+                    note = f"{failed_batches} batch(es) failed and were skipped — see worker logs"
+                    progress('completed', num_rows, num_rows, f"Done with errors: {note}", error=note)
+                else:
+                    progress('completed', num_rows, num_rows, "Done")
+                # The API caches filters/coordinates/clusters in Redis for up
+                # to 5 minutes; without this, newly ingested rows stayed
+                # invisible until the cache expired.
+                try:
+                    from app.cache import invalidate_planting_data_cache
+                    invalidate_planting_data_cache()
+                except Exception:
+                    logger.warning("Could not invalidate the planting data cache", exc_info=True)
+                logger.info(f"File {file_name} fully processed and recorded")
 
             elapsed = time.time() - start_time
             emit_event("file.processing_end", file=file_name, checksum=checksum,
                        elapsed=round(elapsed, 2), completed_batches=completed_batches,
                        failed_batches=failed_batches, shutdown=shutdown_requested)
 
-            if shutdown_requested:
-                file_import_repo.upsert_offset(checksum, file_name, last_committed_row, original_filename)
-                logger.warning(
-                    f"Graceful shutdown — committed {completed_batches} batches from {file_name}, "
-                    f"offset {last_committed_row} persisted"
-                )
-            else:
-                file_import_repo.upsert_offset(checksum, file_name, num_rows, original_filename)
-                _write_progress(file_path, 'completed', num_rows, num_rows, "Done", run_id=run_id)
-                logger.info(f"File {file_name} fully processed and recorded")
-
             if failed_batches:
                 logger.warning(f"File {file_name} processed with {failed_batches} failed batch(es)")
 
-        except FileNotFoundError as e:
-            _write_progress(file_path, 'error', 0, 0, str(e), run_id=run_id, error=str(e))
-            logger.error(f"Failed to process file {file_name}: {e}")
         except Exception as e:
-            _write_progress(file_path, 'error', 0, 0, str(e), run_id=run_id, error=str(e))
-            logger.error(f"Unexpected error processing file {file_name}: {e}")
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            # The position reported is the last checkpoint: after the rollback
+            # nothing past it exists, and it is where a retry will resume.
+            if is_transient_db_error(e):
+                msg = f"Database unavailable, will retry from row {checkpoint_row}: {e}"
+                progress('error', checkpoint_row, num_rows, msg, error=str(e))
+                logger.error(f"Transient database error processing {file_name}: {e}")
+                # Re-raised so Celery's autoretry_for fires. Swallowing every
+                # exception here meant retries never happened at all.
+                raise
+            progress('error', checkpoint_row, num_rows, str(e), error=str(e))
+            if isinstance(e, FileNotFoundError):
+                logger.error(f"Failed to process file {file_name}: {e}")
+            else:
+                logger.error(f"Unexpected error processing file {file_name}: {e}")
         finally:
+            lock.release()
             elapsed_time = time.time() - start_time
             if elapsed_time > 60:
                 minutes, seconds = divmod(elapsed_time, 60)
@@ -607,10 +810,22 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
 
     failed_count = 0
     with _get_app().app_context():
+        # ONE run for the whole scan, so its files are reported as a batch and
+        # each gets its own history row instead of overwriting the last one.
+        run_id = None
+        if file_paths and not dry_run:
+            try:
+                from app.services.progress_store import start_run
+                run_id = start_run(label=f"Scan of {os.path.basename(os.path.normpath(data_folder))}",
+                                   source='scan', total_files=len(file_paths))
+            except Exception as e:
+                logger.warning(f"Could not open a processing run for the scan: {e}")
+
         failed_files = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(process_file, fp, batch_size, chunk_size, checkpoint_interval, dry_run): fp
+                executor.submit(process_file, fp, batch_size, chunk_size, checkpoint_interval,
+                                dry_run, run_id): fp
                 for fp in file_paths
             }
             for future in concurrent.futures.as_completed(futures):
@@ -687,15 +902,19 @@ def watch_directory(
 
 # ── Celery helpers ─────────────────────────────────────────────
 
-def _enqueue_or_warn(task, **kwargs):
-    """Enqueue a Celery task, or log a warning if the broker is unreachable."""
+def _enqueue_or_warn(task, **kwargs) -> bool:
+    """Enqueue a Celery task, or log a warning if the broker is unreachable.
+
+    Returns whether the task was published, so a caller can tell the user the
+    truth instead of "Processing started" regardless.
+    """
     if not celery_broker_available():
         logger.warning(
             f"Cannot enqueue {task.__name__} — Redis at "
             f"{CELERY_BROKER_URL} "
             f"is not reachable. Start Redis or disable HOUSEKEEPING_ENABLED."
         )
-        return
+        return False
 
     result = []
 
@@ -717,15 +936,18 @@ def _enqueue_or_warn(task, **kwargs):
             f"{CELERY_BROKER_URL}. "
             f"Run the worker in Docker for housekeeping, or set HOUSEKEEPING_ENABLED=false."
         )
-        return
+        return False
 
     if result and isinstance(result[0], Exception):
         logger.warning(f"Failed to enqueue {task.__name__}: {result[0]}")
+        return False
+    return True
 
 
 # ── Async wrappers (Flask integration) ─────────────────────────
 
-def process_file_async(file_path: str, app=None):
+def process_file_async(file_path: str, app=None, column_map: dict | None = None,
+                       original_filename: str | None = None) -> bool:
     """Enqueue a single file for processing via Celery (non-blocking).
 
     Used by the upload API endpoint.
@@ -738,15 +960,68 @@ def process_file_async(file_path: str, app=None):
     returned 200, so the file was stored and silently never ingested.
     """
     from app.tasks import process_file_task
-    _enqueue_or_warn(process_file_task, file_path=str(file_path))
+    kwargs = {'file_path': str(file_path)}
+    # Only when given, so tasks already queued by an older API keep the same
+    # shape and the worker falls back to the sidecar mapping for them.
+    if column_map is not None:
+        kwargs['column_map'] = column_map
+    if original_filename:
+        kwargs['original_filename'] = original_filename
+
+    # A run per submission. Without a run_id every attempt at a file matched
+    # the same progress row, so each one overwrote the previous attempt's
+    # history. Best effort: no run is better than no ingest.
+    run_id = None
+    try:
+        from app.services.progress_store import start_run
+        run_id = start_run(label=original_filename or os.path.basename(str(file_path)),
+                           source='upload', total_files=1)
+    except Exception as e:
+        logger.warning(f"Could not open a processing run for {file_path}: {e}")
+    if run_id is not None:
+        kwargs['run_id'] = int(run_id)
+
+    queued = bool(_enqueue_or_warn(process_file_task, **kwargs))
+    if not queued and run_id is not None:
+        # Nothing will ever report into it, and an empty run reads as
+        # 'pending' forever.
+        try:
+            from app.services.progress_store import discard_run
+            discard_run(run_id)
+        except Exception as e:
+            logger.warning(f"Could not discard unused run {run_id}: {e}")
+    return queued
+
+
+def _claim_process_pending() -> bool:
+    """Whether this process should enqueue the startup scan.
+
+    create_app() calls process_pending() in every gunicorn worker, so two
+    workers enqueued two identical scans of the data directory. A Redis
+    ``SET NX EX`` lets the first one through and drops the rest for a few
+    minutes. If Redis cannot be reached, fall through: the enqueue below will
+    hit the same broker and warn about it properly.
+    """
+    try:
+        from redis import Redis
+        client = Redis.from_url(CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
+        return bool(client.set(PROCESS_PENDING_DEDUPE_KEY, str(os.getpid()),
+                               nx=True, ex=PROCESS_PENDING_DEDUPE_SECONDS))
+    except Exception as e:
+        logger.debug(f"process_pending de-dupe unavailable, not de-duplicating: {e}")
+        return True
 
 
 def process_pending(app=None):
     """Enqueue background processing of unprocessed files via Celery.
 
-    Called once at Flask app startup.
+    Called once at Flask app startup — once per gunicorn worker, hence the
+    de-dupe guard.
     """
     from app.tasks import process_pending_task
+    if not _claim_process_pending():
+        logger.info("Startup scan already enqueued by another worker; skipping")
+        return
     _enqueue_or_warn(process_pending_task)
 
 
@@ -763,7 +1038,11 @@ def cli_run(args):
         if cli_val is not None:
             settings[key] = cli_val
 
-    data_folder = args.data_folder
+    # Only here: the CLI is the one entry point that owns its process. See
+    # install_signal_handlers() for why this is not done at import time.
+    install_signal_handlers()
+
+    data_folder = args.data_folder or DATA_DIR
     os.makedirs(data_folder, exist_ok=True)
     set_app(_get_app())
 
