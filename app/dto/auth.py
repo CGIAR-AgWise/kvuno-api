@@ -1,12 +1,34 @@
 
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# bcrypt only uses the first 72 bytes of a password. bcrypt < 5 silently
+# truncated; bcrypt 5.x raises ValueError instead, which turned an over-long
+# password into a 500 at registration. The limit is in BYTES of the UTF-8
+# encoding, not characters — 72 characters of non-ASCII text can be ~288 bytes
+# — so it needs a validator rather than max_length.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
+
+def password_too_long(password: str) -> bool:
+    return len(password.encode('utf-8')) > BCRYPT_MAX_PASSWORD_BYTES
 
 
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=100, description="Desired username", examples=["johndoe"])
     email: str = Field(..., description="Email address", examples=["john@example.com"])
-    password: str = Field(..., min_length=8, description="Password", examples=["securePass123"])
+    password: str = Field(..., min_length=8,
+                          description=f"Password (at most {BCRYPT_MAX_PASSWORD_BYTES} bytes when UTF-8 encoded)",
+                          examples=["securePass123"])
+
+    @field_validator('password')
+    @classmethod
+    def validate_password_bytes(cls, value: str) -> str:
+        if password_too_long(value):
+            raise ValueError(
+                f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes when UTF-8 encoded."
+            )
+        return value
 
 
 class RegisterResponse(BaseModel):

@@ -43,3 +43,31 @@ def batch_convert(data_dir: str, pattern: str = ".RDS", delete_originals: bool =
             if delete_originals:
                 os.remove(rds_path)
     return created
+
+
+def convert_for_ingestion(path: str) -> str:
+    """Return a Parquet path for *path*, converting an RDS file if needed.
+
+    Uploading an RDS means every later step re-parses it in full: the preview
+    has to show 5 rows, and the worker has to read the whole thing again. A
+    Parquet file answers both from the footer and a single batch, so
+    converting once at upload time removes the repeated full parses.
+
+    Returns the original path unchanged for non-RDS input, or if conversion
+    fails — a bad file should surface as a slow upload, not a failed one.
+    """
+    if not path.lower().endswith('.rds'):
+        return path
+
+    out = os.path.splitext(path)[0] + '.parquet'
+    try:
+        rds_to_parquet(path, out)
+    except Exception as e:  # noqa: BLE001 - conversion is best-effort
+        print(f"parquet conversion failed for {os.path.basename(path)}: {e}")
+        return path
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return out

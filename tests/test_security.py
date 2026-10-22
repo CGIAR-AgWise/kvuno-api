@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from flask import Flask
 from werkzeug.utils import safe_join
 
+from app.dto.pagination import DEFAULT_PER_PAGE, get_pagination
+
 
 @contextmanager
 def _test_request_context(headers=None):
@@ -198,10 +200,14 @@ class TestGetCurrentUser:
 
         token_id, secret = 1, "a" * 64
         bearer = f"{token_id}|{secret}"
+        # Naive UTC, which is what the `timestamp without time zone` column
+        # actually returns. This used to be an AWARE datetime, which hid the
+        # bug: production compared a naive DB value with an aware "now" and
+        # raised TypeError (500) for every token that had an expiry.
         mock_token_record = MagicMock(
             spec=UserToken, id=1,
             token=_hash_token(1, secret),
-            expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1),
         )
         mock_session = MagicMock()
         mock_token_query = MagicMock()
@@ -318,49 +324,138 @@ class TestRedisConfig:
 
 class TestPaginationBounds:
     def test_clamps_high_per_page(self):
-        from app.api.planting_data import _clamp_per_page, MAX_PER_PAGE
-        assert _clamp_per_page(1000) == MAX_PER_PAGE
-        assert _clamp_per_page(MAX_PER_PAGE) == MAX_PER_PAGE
+        from app.dto.pagination import MAX_PER_PAGE
+        with Flask(__name__).test_request_context('/?per_page=1000'):
+            assert get_pagination().per_page == MAX_PER_PAGE
+        with Flask(__name__).test_request_context(f'/?per_page={MAX_PER_PAGE}'):
+            assert get_pagination().per_page == MAX_PER_PAGE
 
     def test_clamps_low_per_page(self):
-        from app.api.planting_data import _clamp_per_page
-        assert _clamp_per_page(0) == 1
-        assert _clamp_per_page(-1) == 1
+        with Flask(__name__).test_request_context('/?per_page=0'):
+            assert get_pagination().per_page == 1
+        with Flask(__name__).test_request_context('/?per_page=-1'):
+            assert get_pagination().per_page == 1
 
     def test_accepts_normal_per_page(self):
-        from app.api.planting_data import _clamp_per_page
-        assert _clamp_per_page(50) == 50
-        assert _clamp_per_page(100) == 100
+        with Flask(__name__).test_request_context('/?per_page=50'):
+            assert get_pagination().per_page == 50
+        with Flask(__name__).test_request_context('/?per_page=100'):
+            assert get_pagination().per_page == 100
+
+    def test_defaults_to_100(self):
+        with Flask(__name__).test_request_context('/'):
+            assert get_pagination().per_page == DEFAULT_PER_PAGE == 100
+            assert get_pagination().page == 1
+
+    def test_page_is_floored_at_one(self):
+        with Flask(__name__).test_request_context('/?page=0'):
+            assert get_pagination().page == 1
+        with Flask(__name__).test_request_context('/?page=-5'):
+            assert get_pagination().page == 1
+
+    def test_offset_and_envelope(self):
+        with Flask(__name__).test_request_context('/?page=3&per_page=100'):
+            p = get_pagination()
+            assert p.offset == 200
+            assert p.envelope(450) == {'total': 450, 'pages': 5,
+                                       'current_page': 3, 'per_page': 100}
 
 
-class TestAuthPages:
-    def test_login_page_renders(self):
+class TestNoServerRenderedPages:
+    """The UI is a separate React SPA; this container serves only the API.
+
+    These routes used to render Jinja templates. They must now be gone, so a
+    stale link cannot silently serve a page whose scripts and data contract no
+    longer match the SPA.
+    """
+
+    RETIRED = ['/ui/login', '/ui/register', '/ui/jobs', '/ui/explore',
+               '/ui/upload', '/ui/quality', '/ui/tokens']
+
+    def test_retired_pages_are_404(self):
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/login')
-            assert resp.status_code == 200
-            assert b'Sign in' in resp.data
-            assert b'Register' in resp.data
+            for path in self.RETIRED:
+                assert c.get(path).status_code == 404, path
 
-    def test_register_page_renders(self):
+    def test_root_without_spa_url_returns_a_pointer(self):
+        """No redirect loop.
+
+        Defaulting SPA_ROOT_URL to '/' would point the browser back at this
+        same service, which redirects again forever. With it unset the root
+        must answer with a pointer instead.
+        """
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/register')
+            resp = c.get('/')
             assert resp.status_code == 200
-            assert b'Create an account' in resp.data
-            assert b'Sign in' in resp.data
+            assert resp.is_json
+            assert resp.get_json()['service'] == 'kvuno-api'
+
+    def test_root_redirects_to_configured_spa(self, monkeypatch):
+        from app import create_app
+        monkeypatch.setenv('SPA_ROOT_URL', 'http://127.0.0.1:5001')
+        app = create_app()
+        with app.test_client() as c:
+            resp = c.get('/')
+            assert resp.status_code == 302
+            assert resp.location == 'http://127.0.0.1:5001'
+
+    def test_endpoints_the_spa_needs_are_still_registered(self):
+        """Only the HTML pages were retired; the SPA's endpoints must remain.
+
+        These are the paths the React app calls. Losing one would surface as a
+        404 in the browser rather than a failure here, so assert on the URL map.
+        """
+        from app import create_app
+        app = create_app()
+        adapter = app.url_map.bind('')
+        # (path, method) — several are POST-only, and match() defaults to GET.
+        needed = [
+            ('/ui/columns', 'GET'),
+            ('/ui/jobs/data', 'GET'),
+            ('/ui/jobs/events', 'GET'),
+            ('/ui/progress/report.parquet', 'GET'),
+            ('/ui/process', 'POST'),
+            ('/ui/uploads', 'GET'),
+            ('/ui/uploads/tus', 'POST'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'HEAD'),
+            ('/ui/uploads/tus/' + 'a' * 32, 'PATCH'),
+            ('/ui/uploads/' + 'a' * 32, 'GET'),
+            ('/ui/uploads/' + 'a' * 32, 'DELETE'),
+            ('/ui/uploads/' + 'a' * 32 + '/process', 'POST'),
+        ]
+        for path, method in needed:
+            assert adapter.match(path, method=method), f'{method} {path} is gone'
+
+    def test_protected_spa_endpoints_still_require_auth(self):
+        """Retiring the pages must not have relaxed auth on what remains."""
+        from app import create_app
+        app = create_app()
+        with app.test_client() as c:
+            assert c.get('/ui/columns').status_code == 401
+            assert c.get('/ui/jobs/data').status_code == 401
+            assert c.get('/ui/uploads').status_code == 401
+            assert c.post('/ui/uploads/tus', headers={'Upload-Length': '10'}).status_code == 401
+            assert c.patch('/ui/uploads/tus/' + 'a' * 32, data=b'x',
+                           content_type='application/offset+octet-stream').status_code == 401
 
 
 class TestRequireAuth:
     def test_redirects_browser_to_login(self):
+        """A browser hitting a protected endpoint is bounced to the SPA login.
+
+        The SPA owns the login route, so the redirect target is expressed as a
+        query param the SPA reads rather than a server-rendered page.
+        """
         from app import create_app
         app = create_app()
         with app.test_client() as c:
-            resp = c.get('/ui/jobs', headers={'Accept': 'text/html'})
+            resp = c.get('/ui/columns', headers={'Accept': 'text/html'})
             assert resp.status_code == 302
-            assert resp.location.startswith('/ui/login?next=')
+            assert resp.location.startswith('/login?next=')
 
     def test_returns_401_for_api_client(self):
         from app import create_app
@@ -393,14 +488,29 @@ class TestRequireAuth:
         mock_session.query.side_effect = q_side
 
         app = create_app()
+        # The filters endpoint is paginated and now also returns per-column
+        # distinct counts, so the repo has to return real (serializable) data
+        # rather than letting a MagicMock leak into the response body.
+        mock_repo = MagicMock()
+        mock_repo.get_distinct_values.return_value = {
+            'country': ['Kenya'], 'province': [], 'variety': [], 'season_type': [],
+        }
+        mock_repo.count_distinct_values.return_value = {
+            'country': 1, 'province': 0, 'variety': 0, 'season_type': 0,
+        }
         with (
             app.test_client() as c,
             patch("app.api.user.MyDb.get_db", return_value=MagicMock(session=mock_session)),
+            patch("app.api.planting_data.repo", mock_repo),
         ):
             resp = c.get('/api/v1/planting-data/filters',
                          headers={'Authorization': f'Bearer {bearer}'})
             # Should succeed (we mocked the DB)
             assert resp.status_code in (200, 500)  # 500 if real DB fails, but auth passed
+            if resp.status_code == 200:
+                body = resp.get_json()
+                assert body['current_page'] == 1
+                assert body['per_page'] == 100
 
 
 class TestCookieAuth:
@@ -435,3 +545,44 @@ class TestCookieAuth:
             assert user is not None
             assert user.id == 1
             assert user.username == "cookie_user"
+
+
+class TestCeleryArgumentSerialisation:
+    """Task arguments are JSON-serialised before publishing.
+
+    Both call sites of process_file_async build a pathlib.Path while the
+    signature says str, and nothing checked. Celery then failed to publish with
+    "Object of type WindowsPath is not JSON serializable" — and because the
+    enqueue happens after the response is prepared, the upload still returned
+    200. The file was stored and silently never ingested.
+    """
+
+    def test_path_argument_is_coerced_to_str(self):
+        import json
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+
+        def fake_enqueue(task, **kwargs):
+            captured.update(kwargs)
+            json.dumps(kwargs)  # what Celery does before publishing
+
+        with patch('app.services.housekeeper._enqueue_or_warn', fake_enqueue):
+            process_file_async(file_path=Path('/tmp/data/sample.parquet'))
+
+        assert isinstance(captured['file_path'], str)
+        assert captured['file_path'] == str(Path('/tmp/data/sample.parquet'))
+
+    def test_str_argument_passes_through_unchanged(self):
+        from unittest.mock import patch
+
+        from app.services.housekeeper import process_file_async
+
+        captured = {}
+        with patch('app.services.housekeeper._enqueue_or_warn',
+                   lambda task, **kw: captured.update(kw)):
+            process_file_async(file_path='/tmp/data/sample.parquet')
+        assert captured['file_path'] == '/tmp/data/sample.parquet'

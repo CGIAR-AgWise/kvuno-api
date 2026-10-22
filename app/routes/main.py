@@ -1,63 +1,23 @@
 import json
 import os
 import time
-import uuid
 
-import pandas as pd
-import pyreadr
-from flask import abort, redirect, jsonify, render_template, request, Response, stream_with_context
+from flask import abort, redirect, jsonify, request, Response, stream_with_context
 
 from pathlib import Path
 
 from app.auth import require_auth
-from app.config import HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED
+from app.config import HOUSEKEEPING_DATA_DIR, MAX_FILE_SIZE
 from app.models.database_conn import MyDb
-from app.models.kvuno import PlantingRecommendation
+from app.routes.uploads import enqueue_upload, register_upload_routes
+from app.services import uploads as upload_service
+from app.services.uploads import COLUMN_ALIASES, DB_TARGET_COLUMNS, UploadError
+from app.utils.logging import SharedLogger
+
+logger = SharedLogger().get_logger()
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
-
-_EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
-DB_TARGET_COLUMNS = {
-    col.name for col in PlantingRecommendation.__table__.columns
-    if col.name not in _EXCLUDED
-}
-
-COLUMN_ALIASES = {
-    'cultivar': 'variety',
-    'season': 'season_type',
-    'sowing_date': 'opt_date',
-    'planting_date': 'opt_date',
-    'plantingdate': 'opt_date',
-    'date': 'opt_date',
-    'longitude': 'lon',
-    'long': 'lon',
-    'latitude': 'lat',
-    'lat_y': 'lat',
-    'lon_x': 'lon',
-}
-
-CHUNK_DIR = os.path.join(DATA_DIR, '.chunks')
-
-
-def _read_columns(path: str, ext: str):
-    if ext == '.parquet':
-        return pd.read_parquet(path, nrows=0).columns.tolist()
-    data = pyreadr.read_r(path)
-    return data[None].columns.tolist()
-
-
-def _read_rows(path: str, ext: str, n: int = 5):
-    if ext == '.parquet':
-        df = pd.read_parquet(path, nrows=n)
-    else:
-        data = pyreadr.read_r(path)
-        df = data[None].head(n)
-    return json.loads(df.to_json(orient='records'))
-
-
-def _chunk_path(identifier: str, number: int):
-    return os.path.join(CHUNK_DIR, identifier, str(number))
 
 
 def _load_jobs():
@@ -66,11 +26,21 @@ def _load_jobs():
 
 
 def _format_jobs(raw):
-    counts = {'completed': 0, 'processing': 0, 'error': 0, 'unknown': 0}
+    counts = {'completed': 0, 'processing': 0, 'error': 0, 'stale': 0, 'unknown': 0}
     for j in raw:
         st = j.get('status', 'unknown')
         counts[st] = counts.get(st, 0) + 1
     return raw, counts
+
+
+def _in_data_dir(file_name: str) -> Path | None:
+    """Resolve `file_name` inside the data directory, or None if it escapes it.
+
+    `is_relative_to`, not a string prefix: '/data2/x' starts with '/data'.
+    """
+    data_dir = Path(DATA_DIR).resolve()
+    file_path = (data_dir / file_name).resolve()
+    return file_path if file_path.is_relative_to(data_dir) else None
 
 
 def register_app_routes(app):
@@ -84,12 +54,26 @@ def register_app_routes(app):
     @app.route('/')
     def index():
         """
-        Route for the root URL.
+        Point browsers at the SPA.
 
-        Returns:
-            Response: Redirect to the upload UI.
+        The UI is a separate React app served by its own nginx container; this
+        service renders no HTML. Redirecting to '/' by default would point the
+        browser back at *this* service, which redirects again — an infinite
+        loop, reported as ERR_TOO_MANY_REDIRECTS or ERR_SOCKET_NOT_CONNECTED.
+
+        So SPA_ROOT_URL must name the SPA's actual origin. When it is unset,
+        return a small JSON pointer instead of a redirect.
         """
-        return redirect('/ui/jobs')
+        spa_root = os.getenv('SPA_ROOT_URL', '').strip()
+        if not spa_root:
+            return jsonify({
+                'service': 'kvuno-api',
+                'message': 'This service does not serve the web UI. '
+                           'Set SPA_ROOT_URL to the SPA origin, or open the web container.',
+                'api_docs': '/api-docs',
+                'health': '/health',
+            }), 200
+        return redirect(spa_root, code=302)
 
     @app.route('/health', methods=['GET'])
     def health_check():
@@ -108,165 +92,85 @@ def register_app_routes(app):
     @app.route('/ui/columns', methods=['GET'])
     @require_auth
     def ui_columns():
-        return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES)
+        # max_file_size lets the SPA refuse an oversized file before sending a
+        # byte, from the server's own limit rather than a hardcoded copy of it.
+        return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES,
+                       max_file_size=MAX_FILE_SIZE)
 
-    # ── Upload UI ──────────────────────────────────────────────
-
-    @app.route('/ui/upload', methods=['GET'])
-    @require_auth
-    def upload_ui():
-        max_size = int(os.getenv('MAX_FILE_SIZE_MB', '20'))
-        return render_template('upload.html', max_file_size=max_size * 1024 * 1024, active_nav='upload')
-
-    @app.route('/ui/upload/resumable', methods=['GET'])
-    @require_auth
-    def upload_resumable_test():
-        """Resumable.js test — return 200 if chunk exists, 204 otherwise."""
-        try:
-            identifier = request.args['resumableIdentifier']
-            number = int(request.args['resumableChunkNumber'])
-            path = _chunk_path(identifier, number)
-            if os.path.isfile(path) and os.path.getsize(path) > 0:
-                return '', 200
-        except (KeyError, ValueError, TypeError):
-            pass
-        return '', 204
-
-    @app.route('/ui/upload/resumable', methods=['POST'])
-    @require_auth
-    def upload_resumable_chunk():
-        """Receive a single chunk from resumable.js."""
-        try:
-            identifier = request.form['resumableIdentifier']
-            number = int(request.form['resumableChunkNumber'])
-        except (KeyError, ValueError):
-            return jsonify(error="Missing chunk metadata"), 400
-
-        chunk_file = request.files.get('file')
-        if not chunk_file:
-            return jsonify(error="No chunk data"), 400
-
-        chunk_dir = os.path.join(CHUNK_DIR, identifier)
-        os.makedirs(chunk_dir, exist_ok=True)
-        chunk_file.save(_chunk_path(identifier, number))
-        return jsonify(success=True)
-
-    @app.route('/ui/upload/complete', methods=['POST'])
-    @require_auth
-    def upload_resumable_complete():
-        """Merge chunks into final file and return column preview."""
-        body = request.get_json(silent=True) or {}
-        identifier = body.get('identifier')
-        total_chunks = body.get('totalChunks')
-        filename = body.get('filename', 'upload')
-
-        if not identifier or not total_chunks:
-            return jsonify(error="Missing identifier or totalChunks"), 400
-
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            return jsonify(error=f"Unsupported extension {ext}"), 400
-
-        unique_name = f"{uuid.uuid4().hex}{ext}"
-        dest = os.path.join(DATA_DIR, unique_name)
-
-        try:
-            with open(dest, 'wb') as out:
-                for i in range(1, total_chunks + 1):
-                    p = _chunk_path(identifier, i)
-                    with open(p, 'rb') as inp:
-                        out.write(inp.read())
-        except FileNotFoundError:
-            return jsonify(error="Missing chunk — upload may have failed"), 400
-
-        # clean up chunk dir
-        import shutil
-        shutil.rmtree(os.path.join(CHUNK_DIR, identifier), ignore_errors=True)
-
-        meta = {"original_name": filename}
-        with open(dest + '.meta.json', 'w') as f:
-            json.dump(meta, f)
-
-        try:
-            columns = _read_columns(dest, ext)
-            rows = _read_rows(dest, ext)
-        except Exception as e:
-            os.remove(dest)
-            return jsonify(error=f"Failed to read file: {e}"), 400
-
-        return jsonify(file=unique_name, columns=columns, rows=rows)
+    register_upload_routes(app)
 
     @app.route('/ui/process', methods=['POST'])
     @require_auth
     def upload_ui_process():
+        """(Re)process a stored file — the Jobs page's Retry.
+
+        Omitting `column_map` re-uses the mapping saved with the upload. Retry
+        used to send `{}`, which overwrote the user's mapping with nothing and
+        re-ingested the file with the defaults.
+        """
         body = request.get_json(silent=True) or {}
         file_name = body.get('file')
-        column_map = body.get('column_map', {})
+        column_map = body.get('column_map') or None
 
-        if not file_name:
+        if not file_name or not isinstance(file_name, str):
             return jsonify(error="No file specified"), 400
 
+        upload = upload_service.find_by_stored_name(file_name)
+        if upload is not None:
+            try:
+                upload_service.submit(upload, column_map)
+            except UploadError as e:
+                return jsonify(error=str(e)), e.status
+            return enqueue_upload(upload)
+
+        # A file placed in the data directory by hand or by the API upload,
+        # which has no upload row and keeps its mapping in a sidecar.
         ext = os.path.splitext(file_name)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             return jsonify(error=f"Unsupported extension '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}"), 400
 
-        data_dir = Path(DATA_DIR).resolve()
-        file_path = (data_dir / file_name).resolve()
-        if not str(file_path).startswith(str(data_dir)):
+        file_path = _in_data_dir(file_name)
+        if file_path is None:
             abort(404)
         if not file_path.is_file():
             return jsonify(error=f"File not found: {file_name}"), 404
 
-        invalid = [v for v in column_map.values() if v not in DB_TARGET_COLUMNS]
-        if invalid:
-            return jsonify(error=f"Invalid target columns: {invalid}"), 400
+        if column_map is not None:
+            if not isinstance(column_map, dict):
+                return jsonify(error="column_map must be an object"), 400
+            invalid = [v for v in column_map.values() if v not in DB_TARGET_COLUMNS]
+            if invalid:
+                return jsonify(error=f"Invalid target columns: {invalid}"), 400
+            with open(str(file_path) + '.map.json', 'w') as f:
+                json.dump(column_map, f)
 
-        mapping_path = str(file_path) + '.map.json'
-        with open(mapping_path, 'w') as f:
-            json.dump(column_map, f)
-
+        from app.config import HOUSEKEEPING_ENABLED
         if HOUSEKEEPING_ENABLED:
             from app.services.housekeeper import process_file_async
-            process_file_async(file_path=file_path)
-            return jsonify(id=file_name, message="Processing started")
+            if process_file_async(file_path=file_path):
+                return jsonify(id=file_name, message="Processing started")
+            return jsonify(error="The job queue is unreachable. Try again shortly."), 503
 
         return jsonify(id=file_name, message="File saved with mapping. Set HOUSEKEEPING_ENABLED=true and start a Celery worker.")
 
     @app.route('/ui/progress/<file_name>', methods=['GET'])
     @require_auth
     def ui_progress(file_name):
-        data_dir = Path(DATA_DIR).resolve()
-        file_path = (data_dir / file_name).resolve()
-        if not str(file_path).startswith(str(data_dir)):
+        """One job, in the same shape as an item of /ui/jobs/data.
+
+        This used to read a `.progress.json` sidecar that nothing has written
+        since progress moved to progress_store, so the Jobs detail modal (and
+        its Retry) always saw 'unknown'. The lookup is now Redis/Postgres, not
+        the filesystem, but a name with a path separator is still refused: job
+        keys are basenames, so such a name can only be a probe.
+        """
+        if '/' in file_name or '\\' in file_name or file_name in ('.', '..'):
             abort(404)
-        progress_path = file_path.with_name(file_path.name + '.progress.json')
-        if not progress_path.is_file():
+        from app.services.progress_store import get_job
+        job = get_job(file_name)
+        if job is None:
             return jsonify(status='unknown', current=0, total=0, message='')
-        try:
-            with open(progress_path) as f:
-                return jsonify(**json.load(f))
-        except (json.JSONDecodeError, OSError) as e:
-            return jsonify(status='error', current=0, total=0, message=str(e))
-
-    @app.route('/ui/jobs', methods=['GET'])
-    @require_auth
-    def ui_jobs_html():
-        return render_template('jobs.html', active_nav='jobs')
-
-    @app.route('/ui/explore', methods=['GET'])
-    @require_auth
-    def ui_explore():
-        return render_template('explore.html', active_nav='explore')
-
-    @app.route('/ui/tokens', methods=['GET'])
-    @require_auth
-    def ui_tokens():
-        return render_template('tokens.html', active_nav='tokens')
-
-    @app.route('/ui/quality', methods=['GET'])
-    @require_auth
-    def ui_quality():
-        return render_template('quality.html', active_nav='quality')
+        return jsonify(job)
 
     @app.route('/ui/jobs/data', methods=['GET'])
     @require_auth
@@ -274,54 +178,124 @@ def register_app_routes(app):
         jobs = _load_jobs()
         return jsonify(jobs=jobs)
 
+    @app.route('/ui/jobs/runs', methods=['GET'])
+    @require_auth
+    def ui_jobs_runs():
+        """Recent ingestion runs with aggregate progress, newest first.
+
+        Progress is tracked per file, so without this a multi-file upload
+        reported N unrelated jobs and there was no way to see how the batch as
+        a whole was doing.
+        """
+        from app.services.progress_store import list_runs
+        try:
+            limit = int(request.args.get('limit', default=20))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            return jsonify(runs=list_runs(limit=max(1, min(limit, 100))))
+        except Exception:
+            # Progress reporting is observability, not the product. If the
+            # table is missing (migrations not yet run) or the database is
+            # briefly unavailable, report no runs rather than returning 500 and
+            # making the jobs page look broken.
+            logger.warning("Unable to load processing runs", exc_info=True)
+            return jsonify(runs=[])
+
     # ── Auth UI ────────────────────────────────────────────────
-
-    @app.route('/ui/login', methods=['GET'])
-    def ui_login():
-        return render_template('login.html')
-
-    @app.route('/ui/register', methods=['GET'])
-    def ui_register():
-        return render_template('register.html')
 
     @app.route('/ui/jobs/events', methods=['GET'])
     @require_auth
     def ui_jobs_events():
-        def generate():
-            raw, counts = _format_jobs(_load_jobs())
-            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+        # A comment line, ignored by EventSource but seen by reverse proxies.
+        # Proxies commonly drop an idle connection, and a job list can be silent
+        # for minutes, so this is what keeps the stream alive.
+        KEEPALIVE = ': keepalive\n\n'
+        POLL_SECONDS = 15
 
-            use_redis = True
-            r = None
+        def snapshot():
+            raw, counts = _format_jobs(_load_jobs())
+            return f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+
+        def generate():
+            # Full snapshot on connect, then one message per changed job.
+            # The pubsub payload IS the job record, so a client no longer
+            # re-reads the whole keyspace on every progress write.
+            from app.services.progress_store import get_job
+            yield snapshot()
+
             pubsub = None
+            r = None
             try:
                 from redis import Redis
+                # No socket_timeout here. A subscription is supposed to block
+                # indefinitely; a 2s read timeout made the connection raise
+                # TimeoutError whenever a job list was simply quiet. The wait is
+                # bounded by get_message() instead.
                 r = Redis.from_url(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
-                                   socket_connect_timeout=2, socket_timeout=2)
+                                   socket_connect_timeout=2, socket_timeout=None,
+                                   health_check_interval=30)
                 r.ping()
-                pubsub = r.pubsub()
+                pubsub = r.pubsub(ignore_subscribe_messages=True)
                 pubsub.subscribe('jobs:updates')
             except Exception:
-                use_redis = False
+                pubsub = None
 
-            if use_redis and pubsub:
-                try:
-                    for message in pubsub.listen():
-                        if message['type'] == 'message':
-                            raw, counts = _format_jobs(_load_jobs())
-                            yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
-                except GeneratorExit:
-                    pass
-                finally:
-                    if pubsub:
-                        pubsub.unsubscribe()
-                        pubsub.close()
-                    if r:
-                        r.close()
-            else:
+            def polling():
+                # Used when pubsub is unavailable or the connection drops. The
+                # job list is small, so polling is acceptable as a fallback.
                 while True:
                     time.sleep(3)
-                    raw, counts = _format_jobs(_load_jobs())
-                    yield f"data: {json.dumps({'jobs': raw, 'counts': counts})}\n\n"
+                    yield snapshot()
+
+            if pubsub is not None:
+                last_sent = time.time()
+                try:
+                    while True:
+                        # get_message(timeout=...) returns None on idle rather
+                        # than blocking the socket, so keepalives and error
+                        # handling stay under our control.
+                        message = pubsub.get_message(timeout=1.0)
+                        if message is not None and message.get('type') == 'message':
+                            try:
+                                changed = json.loads(message['data'])
+                            except (ValueError, TypeError):
+                                changed = None
+                            if changed and 'file' in changed:
+                                # Prefer the stored record: the published message
+                                # may have been in flight when a job crossed the
+                                # staleness threshold.
+                                job = get_job(changed['file']) or changed
+                                yield f"data: {json.dumps({'job': job})}\n\n"
+                                last_sent = time.time()
+                        elif time.time() - last_sent >= POLL_SECONDS:
+                            yield KEEPALIVE
+                            last_sent = time.time()
+                except GeneratorExit:
+                    raise
+                except Exception:
+                    # A dropped or erroring subscription must not 500 the
+                    # response; degrade to polling instead.
+                    yield snapshot()
+                    try:
+                        yield from polling()
+                    except GeneratorExit:
+                        raise
+                finally:
+                    try:
+                        pubsub.unsubscribe()
+                        pubsub.close()
+                    except Exception:
+                        pass
+                    if r is not None:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+            else:
+                try:
+                    yield from polling()
+                except GeneratorExit:
+                    raise
 
         return Response(stream_with_context(generate()), mimetype='text/event-stream')

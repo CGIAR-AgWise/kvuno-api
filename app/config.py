@@ -1,8 +1,13 @@
 import os
 
 
-APP_NAME="KVuno API"
-APP_VERSION="1.0.0"
+APP_NAME = "KVuno API"
+
+# Sourced from the build, not hardcoded: the Dockerfiles pass the git tag (or
+# branch name) as APP_VERSION, so /health and the OpenAPI Info block report what
+# was actually deployed. `version-release.yml` derives the tag from git history,
+# so keeping a number here would only ever drift from it.
+APP_VERSION = os.getenv('APP_VERSION') or os.getenv('GITHUB_REF_NAME') or '0.0.0-dev'
 API_PREFIX = "/api"
 API_VERSION = "/v1"
 
@@ -72,6 +77,15 @@ RATE_LIMIT_REGISTER = os.getenv('RATE_LIMIT_REGISTER', '10 per hour')
 RATE_LIMIT_LOGIN = os.getenv('RATE_LIMIT_LOGIN', '20 per hour')
 RATE_LIMIT_UPLOAD = os.getenv('RATE_LIMIT_UPLOAD', '10 per hour')
 RATE_LIMIT_DATA = os.getenv('RATE_LIMIT_DATA', '120 per minute')
+# The bulk coordinates endpoint is one request instead of a page walk, so it
+# gets its own, looser limit: 4,566 sequential requests at the per-page limit
+# could never finish, while a single capped response is cheap by comparison.
+RATE_LIMIT_COORDINATES_BULK = os.getenv('RATE_LIMIT_COORDINATES_BULK', '20 per minute')
+# Backstop applied to every route without its own limit (UI pages, health).
+# Deliberately generous: raising this is the fix when legitimate users start
+# seeing 429s, since it is the limit that HTML page loads consume.
+RATE_LIMIT_DEFAULT_HOURLY = os.getenv('RATE_LIMIT_DEFAULT_HOURLY', '600')
+RATE_LIMIT_DEFAULT_DAILY = os.getenv('RATE_LIMIT_DEFAULT_DAILY', '5000')
 # Storage backend for rate limit counters.
 # Supports any flask-limiter storage URI:
 #   memory://          — in-process (default, resets on restart)
@@ -86,6 +100,22 @@ RATE_LIMIT_STORAGE = os.getenv('RATE_LIMIT_STORAGE', 'memory://')
 # There is no signing key and no JWT — revoking a row revokes the token.
 TOKEN_TTL_DAYS = int(os.getenv('TOKEN_TTL_DAYS', '0'))
 # Set to 0 for no expiry, or a positive number of days.
+
+
+def registration_allowed_domains() -> frozenset[str]:
+    """Email domains allowed to self-register (REGISTRATION_ALLOWED_DOMAINS).
+
+    Comma-separated and case-insensitive, e.g. ``cgiar.org,iita.org``. Matching
+    is on the exact domain after the '@' — ``x.cgiar.org`` is NOT covered by
+    ``cgiar.org``; list it explicitly. Empty or unset disables registration
+    entirely: the endpoint used to be open to anyone on the internet, so the
+    safe default is closed. Existing accounts and login are unaffected.
+
+    Read on each call rather than at import so a deployment (or a test) can
+    change it without re-importing the module.
+    """
+    raw = os.getenv('REGISTRATION_ALLOWED_DOMAINS', '')
+    return frozenset(d.strip().lower().lstrip('@') for d in raw.split(',') if d.strip())
 
 
 # ── Housekeeping / ingestion ───────────────────────────────────

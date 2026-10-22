@@ -8,7 +8,7 @@ import os
 import socket
 import time
 from typing import Optional
-from urllib.parse import urlparse, urlunparse, unquote
+from urllib.parse import urljoin, urlparse, urlunparse, unquote
 
 import requests
 
@@ -38,7 +38,8 @@ def configure_ssrf(allowed_domains: list[str] | None = None, require_https: bool
     """Configure SSRF protection settings at module level.
 
     Args:
-        allowed_domains: List of allowed hostnames (substring match). If None, all domains allowed.
+        allowed_domains: List of allowed domains; a host matches when it equals one or is a
+            subdomain of one (``cdn.example.org`` matches ``example.org``). If None, all domains allowed.
         require_https: If True (default), only HTTPS URLs are permitted.
     """
     global _SSRF_ALLOWED_DOMAINS, _SSRF_REQUIRE_HTTPS
@@ -105,12 +106,66 @@ def validate_remote_url(url: str) -> str:
     if _is_private_address(host):
         raise ValueError(f"Requests to private/internal addresses are blocked: {sanitize_url(url)}")
 
-    if _SSRF_ALLOWED_DOMAINS is not None:
-        allowed = any(d in host for d in _SSRF_ALLOWED_DOMAINS)
-        if not allowed:
-            raise ValueError(f"Domain not in allow-list: {sanitize_url(url)}")
+    if _SSRF_ALLOWED_DOMAINS is not None and not _host_allowed(host, _SSRF_ALLOWED_DOMAINS):
+        raise ValueError(f"Domain not in allow-list: {sanitize_url(url)}")
 
     return url
+
+
+def _host_allowed(host: str, allowed_domains: list[str]) -> bool:
+    """Exact host or a true subdomain of an allowed domain.
+
+    This used to be a substring test (`d in host`), so with `example.org`
+    allowed, `example.org.attacker.net` and `notexample.org` both passed.
+    """
+    host = host.lower().rstrip('.')
+    for d in allowed_domains:
+        d = d.strip().lower().rstrip('.')
+        if d and (host == d or host.endswith('.' + d)):
+            return True
+    return False
+
+
+# Redirects are followed by hand so every hop goes through validate_remote_url.
+# requests' own following (allow_redirects=True) would fetch an internal
+# Location before we could check it.
+MAX_REDIRECTS = 5
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+
+def _max_download_bytes() -> int:
+    """REMOTE_RDS_MAX_BYTES, default 1 GiB. Read per download, not at import."""
+    try:
+        value = int(os.getenv('REMOTE_RDS_MAX_BYTES', str(1024 ** 3)))
+    except ValueError:
+        value = 1024 ** 3
+    return value if value > 0 else 1024 ** 3
+
+
+def _peer_ip(resp) -> str | None:
+    """Best-effort: the IP address the response actually came from.
+
+    DNS rebinding: validate_remote_url resolves the host, then requests
+    resolves it AGAIN to connect, and a hostile DNS server can answer public
+    the first time and 127.0.0.1 the second. Pinning the resolved IP for the
+    connection would need a custom transport adapter (and breaks TLS SNI /
+    certificate checks unless done carefully), so instead the connected
+    socket's peer address is checked before any body is read. It relies on
+    urllib3 internals, so when they are not reachable this returns None and
+    the check is skipped rather than failing every download.
+    """
+    try:
+        sock = resp.raw._connection.sock
+        ip = sock.getpeername()[0]
+        return str(ipaddress.ip_address(ip))
+    except Exception:
+        return None
+
+
+def _is_blocked_ip(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip)
+    return (addr.is_private or addr.is_loopback or addr.is_link_local
+            or addr.is_multicast or addr.is_reserved or addr.is_unspecified)
 
 
 class RDSDownloader:
@@ -160,39 +215,99 @@ class RDSDownloader:
         self.logger.info(f"Downloading {sanitize_url(url)}")
         self.logger.info(f"Destination: {dest}")
 
+        max_bytes = _max_download_bytes()
         try:
-            resp = self.session.get(url, stream=True, timeout=300, allow_redirects=False)
-            resp.raise_for_status()
+            resp = self._get_following_redirects(url)
+            with resp:
+                total = int(resp.headers.get("content-length", 0) or 0)
+                # Refuse up front when the server admits the size; the streaming
+                # check below still applies, since Content-Length can lie or be
+                # absent (chunked encoding).
+                if total > max_bytes:
+                    raise ValueError(
+                        f"Remote file is {total} bytes, over REMOTE_RDS_MAX_BYTES={max_bytes}: {sanitize_url(url)}")
+                downloaded = 0
 
-            # Validate redirect target if redirected
-            if resp.history:
-                final_url = resp.url
-                try:
-                    validate_remote_url(final_url)
-                except ValueError as e:
-                    self.logger.error(f"Redirect target blocked by SSRF policy: {e}")
-                    raise
-
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
-
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total and downloaded % (1024 * 512) == 0:
-                        pct = downloaded / total * 100
-                        self.logger.debug(f"Downloaded {downloaded / 1024 / 1024:.1f}MB / {total / 1024 / 1024:.1f}MB ({pct:.0f}%)")
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise ValueError(
+                                f"Download exceeded REMOTE_RDS_MAX_BYTES={max_bytes}: {sanitize_url(url)}")
+                        f.write(chunk)
+                        if total and downloaded % (1024 * 512) == 0:
+                            pct = downloaded / total * 100
+                            self.logger.debug(f"Downloaded {downloaded / 1024 / 1024:.1f}MB / {total / 1024 / 1024:.1f}MB ({pct:.0f}%)")
 
             elapsed = time.time() - start
             self.logger.info(f"Downloaded {name} ({downloaded / 1024 / 1024:.1f}MB) in {elapsed:.1f}s")
             return dest
 
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError, OSError) as e:
+            # A partial file must not be left behind: the data directory is
+            # scanned for work, so a truncated download would be ingested.
             self.logger.error(f"Download failed for {sanitize_url(url)}: {e}")
             if os.path.exists(dest):
                 os.remove(dest)
             raise
+
+    def _get_following_redirects(self, url: str) -> requests.Response:
+        """GET ``url``, following up to MAX_REDIRECTS redirects by hand.
+
+        Previously the request used allow_redirects=False and then checked
+        ``resp.history`` — which is always empty in that mode — so the redirect
+        check was dead code and a 3xx response body was saved as the data file.
+        Each hop is now re-validated against the SSRF policy before it is
+        fetched, and the connected peer is checked against private ranges.
+        """
+        original_host = (urlparse(url).hostname or '').lower()
+        current = url
+        for _hop in range(MAX_REDIRECTS + 1):
+            validate_remote_url(current)
+            session = self.session
+            if (urlparse(current).hostname or '').lower() != original_host:
+                # Do not hand our credentials to whatever host a redirect names.
+                # A bare session rather than header overrides: cookies set via
+                # set_cookies are not domain-scoped, so the shared session would
+                # still send them to the new host.
+                session = requests.Session()
+                session.headers.update({k: v for k, v in self.session.headers.items()
+                                        if k.lower() != 'authorization'})
+                session.proxies = dict(self.session.proxies)
+                session.trust_env = self.session.trust_env
+            resp = session.get(current, stream=True, timeout=300, allow_redirects=False)
+
+            # Behind an HTTP(S) proxy the peer is the proxy itself, often on a
+            # private address, and the proxy does the resolving — skip there.
+            proxied = bool(self.session.proxies) or bool(
+                self.session.trust_env and requests.utils.get_environ_proxies(current))
+            peer = None if proxied else _peer_ip(resp)
+            if peer is not None and _is_blocked_ip(peer):
+                resp.close()
+                raise ValueError(
+                    f"Connected to a private/internal address ({peer}) for {sanitize_url(current)}; "
+                    "possible DNS rebinding")
+
+            if resp.status_code in _REDIRECT_CODES:
+                location = resp.headers.get('Location')
+                resp.close()
+                if not location:
+                    raise requests.HTTPError(
+                        f"Redirect ({resp.status_code}) without a Location header: {sanitize_url(current)}")
+                current = urljoin(current, location)
+                self.logger.info(f"Following redirect to {sanitize_url(current)}")
+                continue
+
+            if not 200 <= resp.status_code < 300:
+                resp.close()
+                # raise_for_status ignores 1xx/3xx, which would otherwise be
+                # saved as the file.
+                resp.raise_for_status()
+                raise requests.HTTPError(
+                    f"Unexpected status {resp.status_code} for {sanitize_url(current)}", response=resp)
+            return resp
+
+        raise requests.TooManyRedirects(f"More than {MAX_REDIRECTS} redirects: {sanitize_url(url)}")
 
     def download_batch(self, urls: list[str], filenames: Optional[list[str]] = None) -> list[str]:
         """Download multiple RDS files in sequence."""
