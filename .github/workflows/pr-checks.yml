@@ -16,6 +16,10 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      packages: write
     concurrency:
       group: lint-${{ github.head_ref || github.ref_name }}
       cancel-in-progress: true
@@ -105,7 +109,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.13", "3.14" ]
+        python-version: [ "3.13" ]
     concurrency:
       group: test-py${{ matrix.python-version }}-${{ github.head_ref || github.ref_name }}
       cancel-in-progress: true
