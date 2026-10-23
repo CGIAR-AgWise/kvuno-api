@@ -1,56 +1,82 @@
 name: Docker Build Reusable
 
+# Builds and pushes ONE image. The caller decides what to build and how to tag
+# it; this file only builds.
+#
+# Removed on purpose: the "skip if source unchanged" step. Its cache key held
+# no profile or tags, so a develop build made the main/tag build of the same
+# code skip — :latest/:production/<version> were never pushed — and its file
+# hash ignored nginx.conf, entrypoint *.sh, .css and more, so those changes
+# never rebuilt. The per-branch registry cache below makes an unchanged
+# rebuild fast without either failure.
+
 on:
   workflow_call:
     inputs:
+      name:
+        required: true
+        type: string
       dockerfile:
         required: true
         type: string
-      image_name:
-        required: true
-        type: string
       context:
+        description: Build context; `frontend` for the web image, `.` otherwise
         required: false
         type: string
-        # The SPA builds from ./frontend; the Python images from the repo root.
-        default: '.'
-      branch_ref:
+        default: .
+      image:
+        description: Full image name without a tag, e.g. ghcr.io/cgiar-agwise/kvuno-api
         required: true
         type: string
-      branch_name:
+      sha:
         required: true
         type: string
-      commit_sha:
-        required: false
+      version:
+        required: true
         type: string
-        default: ''
-      app_version:
-        required: false
+      tags:
+        description: Comma-separated tag NAMES only (develop,sha-abc1234); the image is prefixed here
+        required: true
         type: string
-        default: '0.0.0-dev'
-        description: Reported by /health and the OpenAPI Info block
-
+      cache_ref:
+        description: Registry cache key, one per branch so consecutive builds reuse layers
+        required: true
+        type: string
 
 jobs:
   build:
+    name: Build ${{ inputs.name }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
-    concurrency:
-      cancel-in-progress: true
-      group: docker-build-reusable-${{ inputs.image_name }}-${{ inputs.branch_ref }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.commit_sha || inputs.branch_ref }}
+          ref: ${{ inputs.sha }}
+
+      # build-push-action splits `tags` on commas and treats every entry as a
+      # full reference. Prefixing only the first one (`img:latest,1.2.3,production`)
+      # pushed `1.2.3` and `production` as bare Docker Hub names and failed.
+      - name: Expand image tags
+        id: tags
+        env:
+          IMAGE: ${{ inputs.image }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          refs=""
+          IFS=',' read -ra names <<< "$TAGS"
+          for name in "${names[@]}"; do
+            name="$(echo "$name" | xargs)"
+            [ -n "$name" ] && refs="${refs:+$refs,}$IMAGE:$name"
+          done
+          echo "refs=$refs" >> "$GITHUB_OUTPUT"
+          echo "Pushing: $refs"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # GHCR authenticates with the workflow's own GITHUB_TOKEN (packages: write),
-      # so no DOCKER_USERNAME / DOCKER_PASSWORD secrets are required.
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -58,22 +84,19 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ github.token }}
 
-      - name: Set Docker tags
-        id: docker_tags
-        uses: ./.github/actions/set-docker-tags
-        with:
-          image_name: ${{ inputs.image_name }}
-          ref: ${{ inputs.branch_ref }}
-          ref_name: ${{ inputs.branch_name }}
-
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
-          build-args: APP_VERSION=${{ inputs.app_version }}
+          build-args: APP_VERSION=${{ inputs.version }}
           push: true
-          provenance: false
-          tags: ${{ steps.docker_tags.outputs.tags }}
-          cache-from: type=registry,ref=${{ inputs.image_name }}:cache-${{ inputs.branch_name }}
-          cache-to: type=registry,ref=${{ inputs.image_name }}:cache-${{ inputs.branch_name }},mode=max
+          provenance: true
+          tags: ${{ steps.tags.outputs.refs }}
+          # One cache per branch (cache-develop, cache-main), falling back to
+          # develop's for a first build. Keyed by commit SHA it never hit and
+          # left a cache image per commit in GHCR forever.
+          cache-from: |
+            type=registry,ref=${{ inputs.image }}:cache-${{ inputs.cache_ref }}
+            type=registry,ref=${{ inputs.image }}:cache-develop
+          cache-to: type=registry,ref=${{ inputs.image }}:cache-${{ inputs.cache_ref }},mode=max

@@ -1,0 +1,132 @@
+name: Changed Areas
+description: >-
+  Classify the files changed between two commits so CI runs only what they can
+  affect. Uses the GitHub compare API, so no clone is needed. Anything it cannot
+  determine (no base commit, API error, 300+ files) counts as "everything changed".
+
+inputs:
+  base:
+    required: true
+    description: Base commit (PR base, or the push's `before`); empty or all-zero means unknown
+  head:
+    required: true
+    description: Head commit
+
+outputs:
+  python:
+    description: '"true" when the Python checks (lint, audit, tests) are needed'
+    value: ${{ steps.classify.outputs.python }}
+  frontend:
+    description: '"true" when the SPA typecheck/build/audit is needed'
+    value: ${{ steps.classify.outputs.frontend }}
+  image_python:
+    description: '"true" when the api/worker image contents changed'
+    value: ${{ steps.classify.outputs.image_python }}
+  image_web:
+    description: '"true" when the web image contents changed'
+    value: ${{ steps.classify.outputs.image_web }}
+  docker_matrix:
+    description: JSON list of {name, context, dockerfile} whose BUILD inputs changed (PR no-push check)
+    value: ${{ steps.classify.outputs.docker_matrix }}
+  docker_any:
+    description: '"true" when docker_matrix is non-empty'
+    value: ${{ steps.classify.outputs.docker_any }}
+
+runs:
+  using: composite
+  steps:
+    - id: classify
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        BASE: ${{ inputs.base }}
+        HEAD: ${{ inputs.head }}
+      run: |
+        set -uo pipefail
+        python=false frontend=false image_python=false image_web=false checks=""
+
+        add_check() { [[ " $checks " == *" $1 "* ]] || checks="$checks $1"; }
+        everything() {
+          python=true frontend=true image_python=true image_web=true
+          checks="api api-dev worker web"
+        }
+
+        if [[ -z "$BASE" || "$BASE" =~ ^0+$ ]]; then
+          echo "No base commit (new branch, dispatch or tag): treating everything as changed"
+          everything
+        elif ! files=$(gh api "repos/$GH_REPO/compare/$BASE...$HEAD" --jq '.files[].filename'); then
+          echo "::warning::compare $BASE...$HEAD failed: treating everything as changed"
+          everything
+        elif [ "$(printf '%s\n' "$files" | grep -c .)" -ge 300 ]; then
+          # The compare API lists at most 300 files; beyond that it is incomplete.
+          echo "300+ files changed: treating everything as changed"
+          everything
+        else
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+
+            # CI definition changes re-run everything they control.
+            case "$f" in
+              .github/workflows/pr-checks.yml|.github/actions/changed-areas/*)
+                python=true; frontend=true
+                add_check api; add_check api-dev; add_check worker; add_check web ;;
+            esac
+            # A changed build recipe (or this classifier) must rebuild the
+            # images even though no file inside them changed. Without this a
+            # CI-only push skipped every image — including after a pipeline
+            # fix, leaving :develop on the last image the broken pipeline made.
+            case "$f" in
+              .github/workflows/docker-build.yml|.github/workflows/docker-build-reusable.yml|.github/actions/changed-areas/*)
+                image_python=true; image_web=true ;;
+            esac
+
+            case "$f" in
+              app/*|tests/*|alembic/*|scripts/*|pyproject.toml|poetry.lock|alembic.ini|*.py) python=true ;;
+            esac
+            case "$f" in
+              frontend/*.md) ;;
+              frontend/*) frontend=true; image_web=true ;;
+            esac
+
+            # Image contents: a deny-list, so an unknown new file rebuilds rather
+            # than silently shipping a stale image.
+            case "$f" in
+              frontend/*|docs/*|tests/*|.github/*|*.md|Makefile|docker-compose.yml|.env.example|.gitignore|LICENSE) ;;
+              *) image_python=true ;;
+            esac
+
+            # Files that can break a Docker BUILD (as opposed to the app inside it).
+            case "$f" in
+              pyproject.toml|poetry.lock|.dockerignore) add_check api; add_check api-dev; add_check worker ;;
+              docker/entrypoint.sh) add_check api; add_check api-dev ;;
+              docker/Dockerfile.prod.dockerfile) add_check api ;;
+              docker/Dockerfile) add_check api-dev ;;
+              docker/Dockerfile.worker|docker/entrypoint.worker.sh) add_check worker ;;
+              frontend/Dockerfile|frontend/nginx.conf|frontend/security-headers.conf|frontend/package.json|frontend/pnpm-lock.yaml|frontend/pnpm-workspace.yaml) add_check web ;;
+            esac
+          done <<< "$files"
+        fi
+
+        matrix="[" sep=""
+        for name in $checks; do
+          case "$name" in
+            api)     ctx=.;        df=docker/Dockerfile.prod.dockerfile ;;
+            api-dev) ctx=.;        df=docker/Dockerfile ;;
+            worker)  ctx=.;        df=docker/Dockerfile.worker ;;
+            web)     ctx=frontend; df=frontend/Dockerfile ;;
+          esac
+          matrix="$matrix$sep{\"name\":\"$name\",\"context\":\"$ctx\",\"dockerfile\":\"$df\"}"
+          sep=","
+        done
+        matrix="$matrix]"
+
+        {
+          echo "python=$python"
+          echo "frontend=$frontend"
+          echo "image_python=$image_python"
+          echo "image_web=$image_web"
+          echo "docker_matrix=$matrix"
+          echo "docker_any=$([ -n "$checks" ] && echo true || echo false)"
+        } >> "$GITHUB_OUTPUT"
+        echo "python=$python frontend=$frontend image_python=$image_python image_web=$image_web docker-checks=[${checks# }]"

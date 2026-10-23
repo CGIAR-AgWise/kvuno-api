@@ -485,39 +485,44 @@ to keep in sync. `app/config.py` falls back to `GITHUB_REF_NAME`, then
 
 Images are published to **GitHub Container Registry**, not Docker Hub:
 
-| Trigger | Image | Source Dockerfile | Tags |
+Each build gets an immutable `:sha-<short>` tag to roll back to:
+
+| Trigger | Images | API Dockerfile | Tags |
 |---|---|---|---|
-| `develop` | `kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
-| `develop` | `kvuno-web` | `frontend/Dockerfile` (nginx + React bundle) | `:latest`, `:develop` |
-| `develop` | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:develop` |
-| `main` | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
-| any tag | `kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
-| any tag | `kvuno-web` | `frontend/Dockerfile` | `:latest`, `:<tag>`, `:production` |
-| any tag | `kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
+| push to `develop` (after `UnitTests` passes) | **only those whose contents changed** in that push | `docker/Dockerfile` (dev server) | `:develop`, `:sha-<short>` |
+| push to `main` (after `UnitTests` passes) → release tag | all three | `docker/Dockerfile.prod.dockerfile` | `:latest`, `:<tag>`, `:production`, `:sha-<short>` |
+| tag pushed by hand | all three | `docker/Dockerfile.prod.dockerfile` | same as a release |
+| manual `workflow_dispatch` | all three | dev, or prod on `main` | `:<branch>` or `:production`, `:sha-<short>` |
+
+`:latest` means **latest release**. The worker always uses `docker/Dockerfile.worker`; the web image uses `frontend/Dockerfile` with `frontend/` as its build context. ⚠️ `:develop` runs the Flask dev server; don't deploy it anywhere shared. Because develop skips unchanged images, `:sha-<short>` exists only for the images that commit actually rebuilt — `:develop` always points at the newest build of each.
 
 ### Build workflows
 
-| Workflow | Trigger | Builds |
+| Workflow | Trigger | Does |
 |---|---|---|
-| `docker-build.yml` | `workflow_run` of `UnitTests` (`pr-checks.yml`) completing, for `develop` / `main` | Branch images |
-| `docker-release.yml` | `push` on tags (`*`) | Release images |
+| `pr-checks.yml` (`UnitTests`) | PRs to `develop`/`main` (not drafts); pushes to `develop`/`main` | a `changes` job classifies the diff; then only the affected jobs run: Python (ruff, pip-audit, pytest on 3.14 in one job), frontend (typecheck, build, pnpm audit), and on PRs a no-push Docker build of only the images whose **build inputs** changed |
+| `docker-build.yml` | `workflow_run` of `UnitTests` (develop); `workflow_call` (releases); `push: tags`; `workflow_dispatch` | picks profile and tags, diffs develop pushes, calls the reusable build per image |
+| `docker-build-reusable.yml` | `workflow_call` | builds and pushes one image |
+| `version-release.yml` | `workflow_run` of `UnitTests` on a `main` push | tags the tested commit, publishes the GitHub release, then **calls** `docker-build.yml` with the tag |
+| `.github/actions/changed-areas` | composite action | GitHub compare API → `python`, `frontend`, `image_python`, `image_web`, `docker_matrix`; anything unknown (no base, API error, 300+ files) counts as "everything changed" |
 
-They are separate so neither needs compound branching. Branch builds only fire after `UnitTests` has finished, and each job re-checks `workflow_run.conclusion == 'success'` and `workflow_run.head_branch`; because `github.ref*` in a `workflow_run` describes the default branch, every ref (and `APP_VERSION`) is taken from `github.event.workflow_run.*`. ⚠️ A `workflow_run` fired from a **forked** pull request gets a read-only `GITHUB_TOKEN`, so a push there fails with `denied: permission_denied: read_package`; same-repo branches are unaffected.
+**CI-minute design.** GitHub bills every job rounded up to a whole minute, so the pipeline avoids jobs rather than shaving seconds:
 
-The release workflow triggers on the tag `push`, at the same time as `UnitTests` runs on that tag, so it runs a `gate` job first: it checks out `.github/actions` (a local action needs the repo in the workspace) and uses `.github/actions/wait-for-checks`, which polls the GitHub API until `UnitTests` reports a conclusion **for that exact commit**, then sets `passed`. The image jobs have `needs: [ gate ]` and `if: needs.gate.outputs.passed == 'true'`.
+- Only what a change can affect runs. A docs-only PR runs one tiny job; a frontend-only PR never installs Python. A job skipped by its `if` counts as passing for required status checks.
+- Lint, audit and tests share one job and one `poetry install` (they were three jobs with three installs). Tests run on 3.14 only — the runtime.
+- PR Docker builds run only for build-affecting files (Dockerfiles, entrypoints, `pyproject.toml`/`poetry.lock`, `.dockerignore`, nginx config, `package.json`/`pnpm-lock.yaml`), and only for the affected images. App code cannot break a Docker build.
+- `develop` rebuilds only changed images: the push's `before` commit comes from the repository activity API (`workflow_run` does not carry it); if it is not found, everything builds. A change to `docker-build.yml`, `docker-build-reusable.yml` or `changed-areas` rebuilds every image — a new build recipe must produce new images even though nothing inside them changed. To force a build at any time, run **Docker Build** from the Actions tab (`workflow_dispatch`), which builds all three.
+- `main` is built **once**, by the release — it used to build on the push and again for the tag. And the release starts from the successful `UnitTests` run, so no runner sits polling for tests.
+- Draft PRs run nothing; a new push to a PR cancels the run it replaces (push runs always finish — builds and releases hang off them). Every job has a `timeout-minutes`.
 
-| Outcome | Result |
-|---|---|
-| UnitTests succeeds | Images build |
-| UnitTests fails or is cancelled | `gate` **fails** (red run) with the conclusion and run URL; image jobs are skipped |
-| No run found within `timeout` (default 1800s) | Same — `gate` fails. A missing run never counts as a pass |
+Rules the pipeline relies on — each was a real failure:
 
-The gate marks the run failed rather than silently skipping, so a red push is visible in the Actions tab instead of looking like a no-op.
-
-The gate needs `actions: read` to read run status; the image jobs keep `packages: write`.
-
-Each job has a single-condition `if`. `main` builds **only** the production API image; the worker and `kvuno-web` are not built there, so deploy those from a release tag.
-
+- **Only a successful *push* run of `UnitTests` builds.** `docker-build` and `version-release` check `workflow_run.conclusion == 'success'` (`completed` also fires on failure) and `workflow_run.event == 'push'`. PR runs are ignored: `workflow_run` executes with this repo's `packages: write`, so building a PR head (possibly a fork) would publish untrusted code. This is why `pr-checks.yml` **must** keep its `develop`/`main` push trigger.
+- **Releases are built by `version-release.yml` calling `docker-build.yml`.** A tag pushed with `GITHUB_TOKEN` never triggers another workflow. Under `workflow_run`, `GITHUB_REF`/`GITHUB_SHA` describe the **default branch**, so the tag action gets `commit_sha: workflow_run.head_sha` and `release_branches: ".*"` (the job's `if` already limits it to `main`), and the called build checks `inputs.tag` before `github.event_name` (a called workflow sees its caller's event).
+- **Tags pushed by hand pass a `gate`** (`.github/actions/wait-for-checks`, with a `sha` input) that requires `UnitTests` to have passed for that exact commit — this is the only path that polls.
+- **Tags are expanded per image** in the reusable workflow (`img:latest,img:1.2.3,…`). Passing `img:latest,1.2.3,production` made `build-push-action` treat `1.2.3` as a Docker Hub image and fail.
+- **Only develop builds can be cancelled by a newer push**; releases always finish.
+- Do not reintroduce a "skip if source unchanged" cache: keyed without the profile, it made release builds skip.
 > `ghcr.io/masgeek/python-3.14-poetry` is **not** in this list: no CI workflow builds or pushes it. It is a general-purpose image, so it lives in the `masgeek` namespace rather than the `cgiar-agwise` one used by the kvuno images. Build it with `docker compose build base` and push it yourself if you want it available to others.
 
 ### Authentication
@@ -532,20 +537,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
 
 Packages are private by default. To make them public, set each package to public visibility in the GitHub org settings (or via the API); public packages can be pulled anonymously.
 
-### Tags
-
-Tags are generated by `.github/actions/set-docker-tags`:
-
-| Ref | Tags pushed |
-|---|---|
-| `refs/tags/<tag>` | `:latest`, `:<tag>`, `:production` |
-| `refs/heads/main` | `:latest`, `:production` |
-| `refs/heads/develop` | `:latest`, `:develop` |
-| any other branch | `:latest`, `:<branch-with-slashes-replaced-by-dashes>` — not reachable today: no workflow builds other branches |
-
-This matches the GHCR table above. Note that **every** build, including `develop`, also pushes `:latest`, so `:latest` means "most recently built", not "latest release" — pin `:production` or `:<tag>` for deployments.
-
-Build cache is stored in the same registry under `:<image>:cache-<branch>`.
+Build cache is stored in the same registry as `<image>:cache-<branch>` (`cache-develop`, `cache-main`; releases share `cache-main`), falling back to `cache-develop` on a first build. It used to be keyed by commit SHA, which never hit and left a cache image per commit in GHCR. PR builds use the GitHub Actions cache instead and push nothing.
 
 ### Referencing in compose
 

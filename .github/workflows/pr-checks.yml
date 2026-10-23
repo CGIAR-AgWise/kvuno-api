@@ -1,33 +1,71 @@
 name: "UnitTests"
 
+# Built to spend as few CI minutes as possible without dropping a check:
+#
+# - A `changes` job classifies the diff (GitHub compare API, no clone) and every
+#   other job runs only if its area changed. A docs-only PR costs one tiny job.
+#   A job skipped by its `if` still counts as passing for required checks.
+# - Lint, audit and tests share ONE job and one dependency install. Billing
+#   rounds every job up to a whole minute, so separate jobs each paid for a
+#   runner start and a `poetry install`.
+# - Tests run on 3.14 only, the version the images ship.
+# - Draft PRs run nothing; a new push to a PR cancels the run it replaces.
+#
+# develop/main pushes are REQUIRED here: docker-build.yml and version-release.yml
+# start from a *successful push run* of this workflow. Feature-branch pushes are
+# not built — their pull_request run covers them.
+
 on:
-  # Push runs are limited to the refs the image gates wait on: develop/main
-  # pushes (docker-build.yml) and tag pushes (docker-release.yml). A bare
-  # `on: push` would also run the suite on every feature-branch push, which
-  # the matching pull_request run already covers — doubling the CI minutes.
   push:
     branches: [ main, develop ]
-    tags: [ '*' ]
   pull_request:
     branches: [ main, develop ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
   workflow_dispatch:
 
-jobs:
-  lint:
-    name: lint
-    runs-on: ubuntu-latest
-    concurrency:
-      group: lint-${{ github.head_ref || github.ref_name }}
-      cancel-in-progress: true
+permissions:
+  contents: read
 
+concurrency:
+  group: unittests-${{ github.event.pull_request.number || github.ref }}
+  # PR runs are superseded by the next push. Push runs always finish: the image
+  # build and the release hang off their success.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect changes
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.areas.outputs.python }}
+      frontend: ${{ steps.areas.outputs.frontend }}
+      docker_matrix: ${{ steps.areas.outputs.docker_matrix }}
+      docker_any: ${{ steps.areas.outputs.docker_any }}
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          sparse-checkout: .github/actions
+      - id: areas
+        uses: ./.github/actions/changed-areas
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.before }}
+          head: ${{ github.event.pull_request.head.sha || github.sha }}
+
+  python:
+    name: Python (lint, audit, tests)
+    needs: [ changes ]
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          # The images run python:3.14-slim. pyproject.toml still allows 3.13.
+          python-version: "3.14"
 
       - name: Install Poetry
         uses: snok/install-poetry@v1
@@ -37,23 +75,13 @@ jobs:
           version: 2.3.2
           virtualenvs-in-project: true
 
-      - name: Cache pip
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-
-      - name: Cache Poetry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-
+      # The virtualenv is the only cache worth keeping: restored, `poetry
+      # install` is a no-op. Separate pip/Poetry caches only added save time.
       - name: Cache virtualenv
         uses: actions/cache@v5
         with:
           path: .venv
-          key: venv-lint-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+          key: venv-3.14-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
 
       - name: Install dependencies
         run: poetry install
@@ -64,9 +92,25 @@ jobs:
       - name: Audit Python dependencies
         run: poetry run pip-audit --strict --progress-spinner off
 
+      - name: Run tests
+        run: poetry run pytest -q --tb=short
+
+      # app/config.py raises at import if the DB env vars are missing, and
+      # pytest-env only injects them for pytest runs — a bare `python -c` gets
+      # nothing. Mirrors [tool.pytest.ini_options] env so both paths agree.
+      - name: Smoke-test app import
+        env:
+          DB_URL: "sqlite:///:memory:"
+          DB_DRIVER: "sqlite"
+          DB_NAME: ":memory:"
+        run: poetry run python -c "from app.config import build_db_url; print('import OK:', build_db_url())"
+
   frontend:
     name: Frontend (typecheck + build)
+    needs: [ changes ]
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -98,73 +142,31 @@ jobs:
         # Python side. Low/moderate findings are reported but do not fail CI.
         run: pnpm audit --audit-level high
 
-  test:
-    name: Test (Python ${{ matrix.python-version }})
-    needs: [ lint, frontend ]
-    runs-on: ubuntu-latest
+  # Builds, without pushing, only the images whose BUILD inputs changed
+  # (Dockerfiles, entrypoints, lockfiles, nginx config) — app code cannot break
+  # a Docker build, and the python/frontend jobs already cover it. Pushes
+  # nothing and logs in nowhere, so it is safe for fork PRs.
+  docker:
+    name: Docker build (${{ matrix.name }})
+    needs: [ changes ]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docker_any == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.13", "3.14" ]
-    concurrency:
-      group: test-py${{ matrix.python-version }}-${{ github.head_ref || github.ref_name }}
-      cancel-in-progress: true
-
+        include: ${{ fromJSON(needs.changes.outputs.docker_matrix) }}
     steps:
       - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
         with:
-          fetch-depth: 1
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Install Poetry
-        uses: snok/install-poetry@v1
-        with:
-          # Must match the Poetry that generated poetry.lock (and the images'
-          # POETRY_VERSION); other 2.x releases compute a different lock hash.
-          version: 2.3.2
-          virtualenvs-in-project: true
-
-      - name: Cache pip
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-
-      - name: Cache Poetry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pypoetry
-          key: poetry-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-
-      - name: Cache virtualenv
-        uses: actions/cache@v5
-        with:
-          path: .venv
-          key: venv-${{ matrix.python-version }}-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
-
-      - name: Install dependencies
-        run: poetry install
-
-      - name: Run tests
-        run: poetry run pytest -v --tb=short --junitxml=test-results.xml
-
-      # app/config.py raises at import if the DB env vars are missing, and
-      # pytest-env only injects them for pytest runs — a bare `python -c` gets
-      # nothing. Mirrors [tool.pytest.ini_options] env so both paths agree.
-      - name: Smoke-test app import
-        env:
-          DB_URL: "sqlite:///:memory:"
-          DB_DRIVER: "sqlite"
-          DB_NAME: ":memory:"
-        run: poetry run python -c "from app.config import build_db_url; print('import OK:', build_db_url())"
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-results-py${{ matrix.python-version }}
-          path: test-results.xml
-          retention-days: 1
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: APP_VERSION=pr-check
+          push: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max

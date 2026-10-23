@@ -289,17 +289,12 @@ docker compose up -d api web
 
 Images are published to GitHub Container Registry, not Docker Hub:
 
-| Trigger | Image | Dockerfile | Tags pushed |
-|---|---|---|---|
-| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
-| `develop` | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `:latest`, `:develop` |
-| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-web` | `frontend/Dockerfile` (nginx + React bundle) | `:latest`, `:<tag>`, `:production` |
+| Trigger | Images | Tags pushed |
+|---|---|---|
+| push to `develop`, after `UnitTests` passes | only the images whose contents changed (api = dev server) | `:develop`, `:sha-<short>` |
+| push to `main`, after `UnitTests` passes → automatic release tag | api (gunicorn), worker, web | `:latest`, `:<tag>`, `:production`, `:sha-<short>` |
 
-Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
-
+Images: `ghcr.io/cgiar-agwise/kvuno-api`, `-worker`, `-web`. `:latest` is the latest **release**; `:sha-<short>` is immutable, for rollbacks. CI is built to save minutes: it runs only the checks a change can affect (docs-only changes run almost nothing), PRs build only the Docker images whose build inputs changed, and `main` is built once per release. Details and the rules the pipeline depends on: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#9-container-registry-ghcr).
 CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
 ```bash
@@ -623,7 +618,7 @@ Key environment variables (see `.env.example`):
 
 GitHub Actions workflows:
 
-- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, a `frontend` job running `pnpm install` + `pnpm run build` in `frontend/`, then `pytest` on Python 3.13 and 3.14 (test job depends on lint and frontend)
+- **PR Checks** (`.github/workflows/pr-checks.yml`) — `ruff check .` + `pip-audit --strict`, a `frontend` job running `pnpm install` + `pnpm run build` in `frontend/`, and `pytest` on Python 3.14 — in one Python job; a `changes` job skips whichever of the Python, frontend and PR Docker jobs the diff cannot affect
 - **Version Bumping** — Automated version tags on main
 - **Auto PR** — Creates release PRs from version bumps
 - **TODO Scanner** — Scans codebase for TODO/FIXME markers
