@@ -32,27 +32,27 @@ jobs:
         include:
           - dockerfile: docker/Dockerfile
             image: ghcr.io/cgiar-agwise/kvuno-api
-            context: '.'
+            context: .
             profiles: [dev]
           - dockerfile: docker/Dockerfile.worker
             image: ghcr.io/cgiar-agwise/kvuno-worker
-            context: '.'
+            context: .
             profiles: [dev]
           - dockerfile: Dockerfile
             image: ghcr.io/cgiar-agwise/kvuno-web
-            context: './frontend'
+            context: frontend
             profiles: [dev]
           - dockerfile: docker/Dockerfile.prod.dockerfile
             image: ghcr.io/cgiar-agwise/kvuno-api
-            context: '.'
+            context: .
             profiles: [prod]
           - dockerfile: docker/Dockerfile.worker
             image: ghcr.io/cgiar-agwise/kvuno-worker
-            context: '.'
+            context: .
             profiles: [prod]
           - dockerfile: Dockerfile
             image: ghcr.io/cgiar-agwise/kvuno-web
-            context: './frontend'
+            context: frontend
             profiles: [prod]
 
     steps:
@@ -89,6 +89,27 @@ jobs:
         if: ${{ !contains(matrix.profiles, steps.profile.outputs.profile) }}
         run: echo "Skipping ${{ matrix.image }} for ${{ steps.profile.outputs.profile }} profile" && exit 0
 
+      - name: Compute source hash
+        id: source_hash
+        run: |
+          # Hash the build context + Dockerfile to detect changes
+          HASH=$(find ${{ matrix.context }} -type f \( -name "*.py" -o -name "*.toml" -o -name "*.lock" -o -name "*.txt" -o -name "Dockerfile*" -o -name "*.ts" -o -name "*.tsx" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
+          echo "hash=$HASH" >> $GITHUB_OUTPUT
+
+      - name: Check build cache
+        id: build_cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/build-marker
+          key: docker-build-${{ matrix.image }}-${{ steps.source_hash.outputs.hash }}
+          enableCrossOsArchive: true
+
+      - name: Skip if source unchanged
+        if: steps.build_cache.outputs.cache-hit == 'true'
+        run: |
+          echo "Source unchanged for ${{ matrix.image }} (hash: ${{ steps.source_hash.outputs.hash }}), skipping build"
+          echo "skipped=true" >> $GITHUB_OUTPUT
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ steps.profile.outputs.sha }}
@@ -105,6 +126,7 @@ jobs:
           password: ${{ github.token }}
 
       - name: Build and push
+        if: steps.build_cache.outputs.cache-hit != 'true'
         uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
@@ -115,3 +137,7 @@ jobs:
           tags: ${{ steps.profile.outputs.tags }}
           cache-from: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }}
           cache-to: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }},mode=max
+
+      - name: Write build marker
+        if: steps.build_cache.outputs.cache-hit != 'true'
+        run: mkdir -p /tmp/build-marker && echo "${{ steps.source_hash.outputs.hash }}" > /tmp/build-marker/hash
