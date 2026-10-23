@@ -6,7 +6,7 @@ on:
   # `on: push` would also run the suite on every feature-branch push, which
   # the matching pull_request run already covers — doubling the CI minutes.
   push:
-    branches: [ main, develop ]
+#    branches: [ main, develop ]
     tags: [ '*' ]
   pull_request:
     branches: [ main, develop ]
