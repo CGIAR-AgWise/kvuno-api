@@ -1,26 +1,35 @@
 name: Version Release
+
+# Runs after UnitTests passes on a push to main — not on the push itself — so
+# the release build needs no gate polling for tests on a billed runner.
+# It tags that exact commit, publishes the GitHub release, then builds the
+# release images by CALLING docker-build.yml: a tag pushed with GITHUB_TOKEN
+# never triggers another workflow, so `push: tags` would never fire for it.
+
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["UnitTests"]
+    types: [completed]
 
 jobs:
   bump-tag-version:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     concurrency:
-      cancel-in-progress: true
-      group: semver-${{ github.ref }}
+      group: semver-main
+      # Never cancel a release half-way: it could leave a tag with no release.
+      cancel-in-progress: false
     outputs:
       tag: ${{ steps.tag_version.outputs.new_tag }}
+    # No checkout: the tag action and the release action both work through
+    # the GitHub API.
     steps:
-      - uses: actions/checkout@v7
-        with:
-          # The tag action reads earlier tags and the commits since them to
-          # choose the bump; a depth-1 clone has neither.
-          fetch-depth: 0
-
       - name: Bump version and push tag
         id: tag_version
         uses: masgeek/github-tag-action@release
@@ -28,20 +37,24 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           tag_prefix: ""
           create_annotated_tag: true
+          # The tested commit — not GITHUB_SHA, which under workflow_run is the
+          # default branch's head.
+          commit_sha: ${{ github.event.workflow_run.head_sha }}
+          # The action decides "release branch" from GITHUB_REF, which under
+          # workflow_run is the DEFAULT branch (develop), not main. The job's
+          # `if` already restricts this to main, so accept any branch here.
+          release_branches: ".*"
 
       - name: Create a GitHub release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ steps.tag_version.outputs.new_tag }}
+          commit: ${{ github.event.workflow_run.head_sha }}
           name: Version ${{ steps.tag_version.outputs.new_tag }}
           body: ${{ steps.tag_version.outputs.changelog }}
           allowUpdates: true
           makeLatest: true
 
-  # Called directly rather than left to docker-build's `on: push: tags`: a tag
-  # pushed with GITHUB_TOKEN never triggers another workflow, so releases
-  # produced no images at all. docker-build's gate still waits for this
-  # commit's UnitTests run before anything is pushed.
   build-images:
     needs: [ bump-tag-version ]
     if: needs.bump-tag-version.outputs.tag != ''
@@ -52,4 +65,4 @@ jobs:
       actions: read
     with:
       tag: ${{ needs.bump-tag-version.outputs.tag }}
-      sha: ${{ github.sha }}
+      sha: ${{ github.event.workflow_run.head_sha }}

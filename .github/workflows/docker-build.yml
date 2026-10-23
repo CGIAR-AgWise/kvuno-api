@@ -2,19 +2,25 @@ name: Docker Build
 
 # What builds, and when. Every path builds a commit whose UnitTests passed.
 #
-#   push to develop -> UnitTests -> dev images    :develop, :sha-<short>
-#   push to main    -> UnitTests -> prod images   :production, :sha-<short>
-#   release tag     -> (gate)    -> prod images   :latest, :<tag>, :sha-<short>
+#   push to develop -> UnitTests -> changed dev images   :develop, :sha-<short>
+#   push to main    -> UnitTests -> version-release.yml tags it and calls this
+#                                   -> all prod images   :latest, :<tag>, :production, :sha-<short>
+#   tag pushed by a person          -> gate -> all prod images (same tags)
+#   workflow_dispatch               -> all images for that branch
 #
-# Release tags come from version-release.yml, which calls this workflow
-# directly: a tag pushed with GITHUB_TOKEN cannot trigger another workflow, so
-# `on: push: tags` alone never fired for automated releases. Tags pushed by a
-# person still arrive through `push: tags`.
+# CI-minute choices:
+# - develop rebuilds ONLY the images whose contents changed in that push (a
+#   docs or frontend-only merge does not rebuild api/worker). The push's
+#   `before` commit comes from the repository activity API; if it cannot be
+#   found, everything builds.
+# - main is built ONCE, by the release. It used to build here as well, then
+#   again for the tag: two full image sets per merge.
+# - Only a tag pushed by hand waits on a polling `gate` (a billed runner
+#   sitting idle). Releases arrive after UnitTests already passed.
 #
-# Pull-request runs of UnitTests are deliberately ignored. workflow_run
-# executes with this repository's packages:write permission, so building a
-# PR's head — possibly a fork's — would publish untrusted code to GHCR, and it
-# used to push every feature branch as :develop.
+# Pull-request runs of UnitTests are deliberately ignored: workflow_run executes
+# with this repository's packages:write, so building a PR head — possibly a
+# fork's — would publish untrusted code to GHCR.
 
 on:
   workflow_run:
@@ -39,34 +45,41 @@ permissions:
 
 concurrency:
   group: docker-${{ inputs.tag || github.event.workflow_run.head_branch || github.ref_name }}
-  # Only develop builds may be superseded. Cancelling a main or release build
-  # part-way would leave :production / :latest pointing at the previous image.
-  cancel-in-progress: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'develop' }}
+  # Only develop builds may be superseded. Cancelling a release part-way would
+  # leave :latest / :production pointing at a half-published set.
+  cancel-in-progress: ${{ !inputs.tag && github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'develop' }}
 
 jobs:
   determine-profile:
     name: Determine build profile
     runs-on: ubuntu-24.04
-    # Only a successful *push* run of UnitTests. `completed` also fires on
-    # failure, and PR runs are excluded for the reason in the header.
+    timeout-minutes: 5
+    # A release call (inputs.tag) always proceeds. A direct workflow_run must
+    # be a *successful push* run on develop: `completed` also fires on
+    # failure, PR runs are excluded (see header), and main is built by the
+    # release instead.
     if: >-
+      inputs.tag ||
       github.event_name != 'workflow_run' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
-       contains(fromJSON('["develop", "main"]'), github.event.workflow_run.head_branch))
+       github.event.workflow_run.head_branch == 'develop')
     permissions:
       contents: read
-      actions: read
     outputs:
       profile: ${{ steps.profile.outputs.profile }}
       version: ${{ steps.profile.outputs.version }}
       tags: ${{ steps.profile.outputs.tags }}
       sha: ${{ steps.profile.outputs.sha }}
       cache_ref: ${{ steps.profile.outputs.cache_ref }}
+      build_python: ${{ steps.areas.outputs.image_python || 'true' }}
+      build_web: ${{ steps.areas.outputs.image_web || 'true' }}
     steps:
       - name: Determine build profile
         id: profile
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
@@ -77,27 +90,30 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = "workflow_run" ]; then
-            kind=branch; name="$RUN_BRANCH"; sha="$RUN_SHA"
-          elif [ -n "$CALL_TAG" ]; then
+          # inputs.tag first: a called workflow sees the CALLER's event, which
+          # for a release is workflow_run on main.
+          if [ -n "$CALL_TAG" ]; then
             kind=tag; name="$CALL_TAG"; sha="$CALL_SHA"
+          elif [ "$EVENT" = "workflow_run" ]; then
+            kind=branch; name="$RUN_BRANCH"; sha="$RUN_SHA"
           else
             kind="$REF_TYPE"; name="$REF_NAME"; sha="$SHA"
           fi
           short="sha-${sha:0:7}"
+          before=""
 
           if [ "$kind" = "tag" ]; then
             echo "profile=prod" >> "$GITHUB_OUTPUT"
             echo "version=$name" >> "$GITHUB_OUTPUT"
-            echo "tags=latest,$name,$short" >> "$GITHUB_OUTPUT"
+            echo "tags=latest,$name,production,$short" >> "$GITHUB_OUTPUT"
             echo "cache_ref=main" >> "$GITHUB_OUTPUT"
           elif [ "$name" = "main" ]; then
+            # Manual dispatch only; merges to main build through the release.
             echo "profile=prod" >> "$GITHUB_OUTPUT"
             echo "version=main-${sha:0:7}" >> "$GITHUB_OUTPUT"
             echo "tags=production,$short" >> "$GITHUB_OUTPUT"
             echo "cache_ref=main" >> "$GITHUB_OUTPUT"
           else
-            # develop, or a manual dispatch from any branch
             safe="$(echo "$name" | tr '/' '-')"
             echo "profile=dev" >> "$GITHUB_OUTPUT"
             echo "version=${safe}-dev" >> "$GITHUB_OUTPUT"
@@ -107,38 +123,66 @@ jobs:
               echo "tags=$safe,$short" >> "$GITHUB_OUTPUT"
             fi
             echo "cache_ref=$safe" >> "$GITHUB_OUTPUT"
+            # The commit develop pointed at before this push, so only changed
+            # images rebuild. workflow_run carries no `before`; the activity
+            # API records it per push. Not found -> empty -> build everything.
+            if [ "$EVENT" = "workflow_run" ]; then
+              before="$(gh api "repos/$GH_REPO/activity?ref=refs/heads/develop&activity_type=push&per_page=50" \
+                --jq ".[] | select(.after == \"$sha\") | .before" 2>/dev/null | head -n1 || true)"
+            fi
           fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "Building $kind '$name' at ${sha:0:7}"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "Building $kind '$name' at ${sha:0:7} (before: ${before:-unknown})"
 
-  # A tag can point at any commit and a tag push runs no tests of its own, so
-  # it must show the commit already passed UnitTests (from its branch push).
-  # workflow_run builds were gated by the `if` above; dispatches are manual.
+      # Only develop pushes are diffed; every other path builds every image
+      # (the build_* outputs default to 'true' when these steps are skipped).
+      - uses: actions/checkout@v7
+        if: steps.profile.outputs.before != ''
+        with:
+          sparse-checkout: .github/actions
+      - id: areas
+        if: steps.profile.outputs.before != ''
+        uses: ./.github/actions/changed-areas
+        with:
+          base: ${{ steps.profile.outputs.before }}
+          head: ${{ steps.profile.outputs.sha }}
+
+  # Only a tag pushed by a person: it runs no tests itself, so it must show its
+  # commit already passed UnitTests (from the branch push). This job polls on a
+  # billed runner, which is why releases do not come this way.
   gate:
     name: Require passing UnitTests
     needs: [ determine-profile ]
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    timeout-minutes: 35
     permissions:
       contents: read
       actions: read
     steps:
       - uses: actions/checkout@v7
-        if: github.event_name == 'push' || github.event_name == 'workflow_call'
         with:
           sparse-checkout: .github/actions
       - id: checks
-        if: github.event_name == 'push' || github.event_name == 'workflow_call'
         uses: ./.github/actions/wait-for-checks
         with:
           workflow: UnitTests
           sha: ${{ needs.determine-profile.outputs.sha }}
-      - if: steps.checks.outputs.passed == 'false'
+      - if: steps.checks.outputs.passed != 'true'
         run: |
           echo "::error::UnitTests did not pass for this commit (${{ steps.checks.outputs.conclusion }}): ${{ steps.checks.outputs.url }}"
           exit 1
 
   build-api:
     needs: [ determine-profile, gate ]
+    # always() lets a skipped gate through; the result checks keep a failed
+    # gate or profile from building.
+    if: >-
+      always() &&
+      needs.determine-profile.result == 'success' &&
+      needs.gate.result != 'failure' && needs.gate.result != 'cancelled' &&
+      needs.determine-profile.outputs.build_python == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -156,6 +200,11 @@ jobs:
 
   build-worker:
     needs: [ determine-profile, gate ]
+    if: >-
+      always() &&
+      needs.determine-profile.result == 'success' &&
+      needs.gate.result != 'failure' && needs.gate.result != 'cancelled' &&
+      needs.determine-profile.outputs.build_python == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
@@ -171,6 +220,11 @@ jobs:
 
   build-web:
     needs: [ determine-profile, gate ]
+    if: >-
+      always() &&
+      needs.determine-profile.result == 'success' &&
+      needs.gate.result != 'failure' && needs.gate.result != 'cancelled' &&
+      needs.determine-profile.outputs.build_web == 'true'
     uses: ./.github/workflows/docker-build-reusable.yml
     permissions:
       contents: read
