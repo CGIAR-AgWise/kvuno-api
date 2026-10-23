@@ -27,9 +27,9 @@ from app.dto.pagination import get_pagination
 from app.models.database_conn import MyDb
 from app.models.kvuno import User, UserToken
 from app.services import mailer
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 __bp__ = "/admin"
 url_prefix = API_PREFIX + API_VERSION + __bp__

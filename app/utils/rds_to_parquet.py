@@ -2,6 +2,10 @@
 import os
 import pyreadr
 
+from app.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def rds_to_parquet(rds_path: str, parquet_path: str | None = None, compression: str = "zstd") -> str:
     """Read an RDS file and write it as Parquet.
@@ -63,7 +67,8 @@ def convert_for_ingestion(path: str) -> str:
     try:
         rds_to_parquet(path, out)
     except Exception as e:  # noqa: BLE001 - conversion is best-effort
-        print(f"parquet conversion failed for {os.path.basename(path)}: {e}")
+        logger.warning(f"Parquet conversion failed for {os.path.basename(path)}; keeping the RDS: {e}",
+                       exc_info=True)
         return path
 
     try:

@@ -2,13 +2,15 @@ import os
 import subprocess
 
 from dotenv import load_dotenv
-from loguru import logger
 from sqlalchemy import create_engine, MetaData
 
 from app.config import build_db_url
+from app.utils.logging import get_logger
 
 # Load environment variables from .env file
 load_dotenv()
+
+logger = get_logger('model-generator')
 
 
 def create_dummy_file(filepath):

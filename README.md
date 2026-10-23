@@ -37,7 +37,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | RDS Parsing | pyreadr + pandas |
 | Authentication | Opaque bearer tokens (`{id}|{secret}`, SHA-256 at rest) + bcrypt |
 | Background Tasks | Celery + Redis (Kombu transport) |
-| Logging | loguru |
+| Logging | structlog (JSON in production, console in development) |
 | Serving | Waitress (dev) / Gunicorn (prod) |
 | Frontend | React 18 + TypeScript, Vite 6, pnpm, react-router 6; served by nginx |
 | Containerization | Docker + docker-compose |
@@ -85,7 +85,7 @@ kvuno/
 │   │   └── watch_handler.py  # watchdog directory watcher
 │   ├── static/               # css/ favicon served by Flask
 │   └── utils/
-│       ├── logging.py        # SharedLogger (loguru wrapper)
+│       ├── logging.py        # setup_logging() / get_logger() (structlog)
 │       ├── downloader.py     # RDSDownloader (auth, SSRF guards)
 │       ├── rds_to_parquet.py # RDS → Parquet batch converter
 │       └── migration_utils.py# Dialect-aware column utilities
@@ -621,7 +621,10 @@ Key environment variables (see `.env.example`):
 | `THREADS` | Threads per worker | `4` | |
 | `TIMEOUT` | Request timeout (s) — raised from the 30s default for large uploads | `120` | |
 | `ACCESSLOG` / `ERRORLOG` | Gunicorn log targets; `-` means stdout/stderr | `-` | |
-| `LOG_LEVEL` | Log level for both the app logger and Gunicorn | `INFO` | |
+| `LOG_LEVEL` | Log level for the app (all loggers, incl. Flask/SQLAlchemy/Celery) and Gunicorn | `INFO` | |
+| `ENVIRONMENT` | `production`/`prod` → JSON log lines (for Loki etc.); anything else → readable console logs | `development` (compose: `production`) | |
+| `LOG_DESTINATION` | `stdout`, `stderr`, or `file` (keep `stdout` in containers) | `stdout` | |
+| `LOG_FILE_PATH` / `LOG_ROTATION` / `LOG_MAX_BYTES` / `LOG_BACKUP_COUNT` | File sink settings when `LOG_DESTINATION=file`; rotation `size` or `daily` | — / `size` / `10485760` / `5` | |
 | `DEBUG_DB` | Echo SQL statements | `false` | |
 | `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |
 | `MAX_FILE_SIZE_MB` | Upload size cap, enforced at tus creation before any bytes are accepted | `20` | |

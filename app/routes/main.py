@@ -12,9 +12,9 @@ from app.models.database_conn import MyDb
 from app.routes.uploads import enqueue_upload, register_upload_routes
 from app.services import uploads as upload_service
 from app.services.uploads import COLUMN_ALIASES, DB_TARGET_COLUMNS, UploadError
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 DATA_DIR = HOUSEKEEPING_DATA_DIR
 ALLOWED_EXTENSIONS = {'.rds', '.parquet'}

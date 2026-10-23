@@ -37,6 +37,9 @@ services:
     env_file:
       - .env
     environment: &api-environment
+      # production = JSON log lines (app/utils/logging.py); set development for
+      # readable console output.
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       FLASK_DEBUG: ${FLASK_DEBUG:-false}
       DEBUG_DB: ${DEBUG_DB:-false}
       DB_DRIVER: ${DB_DRIVER:-postgresql}
@@ -149,6 +152,8 @@ services:
     environment:
       DEBUG_DB: ${DEBUG_DB:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # JSON log lines, matching the api (app/utils/logging.py).
+      ENVIRONMENT: ${ENVIRONMENT:-production}
       DB_DRIVER: ${DB_DRIVER:-postgresql}
       DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
       DB_PORT: ${DB_PORT:-5432}

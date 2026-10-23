@@ -20,9 +20,9 @@ from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
 from app import config
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 
 def _app_url(path: str) -> str | None:

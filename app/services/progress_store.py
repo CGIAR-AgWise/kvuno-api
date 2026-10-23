@@ -41,9 +41,8 @@ import json
 import os
 import time
 
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-_shared_logger = SharedLogger()
 
 PROGRESS_CHANNEL = 'jobs:updates'
 KEY_PREFIX = 'job:'
@@ -239,7 +238,7 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
 
 
 def _logger():
-    return _shared_logger.get_logger()
+    return get_logger(__name__)
 
 
 def _should_write_db(stem: str, status: str, now: float) -> bool:

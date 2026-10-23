@@ -21,9 +21,9 @@ import sys
 import time
 from dataclasses import dataclass
 
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 
 @dataclass

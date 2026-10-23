@@ -5,14 +5,13 @@ from sqlalchemy.orm import Query
 from app.dto.data_filters import CONFLICT_SORT_COLUMNS, QualityFilter
 from app.models.database_conn import MyDb
 from app.models.kvuno import ImportConflict
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-shared_logger = SharedLogger()
 
 
 class ImportConflictRepo:
     def __init__(self):
-        self.logger = shared_logger.get_logger()
+        self.logger = get_logger(__name__)
 
     def _get_session(self):
         self.db = MyDb.get_db()

@@ -48,12 +48,11 @@ from app.repo.file_import import FileImportRepo
 from app.utils import calculate_file_checksum
 from app.utils.downloader import RDSDownloader
 from app.utils.file_lock import FileLock
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
 load_dotenv()
 
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 _app = None
 DATA_DIR = HOUSEKEEPING_DATA_DIR
@@ -156,10 +155,14 @@ def install_signal_handlers():
 # ── Telemetry ──────────────────────────────────────────────────
 
 def emit_event(event: str, **kwargs):
-    """Write a structured JSON event line to stderr for monitoring ingestion."""
-    record = {"event": event, "timestamp": time.time()}
-    record.update(kwargs)
-    print(json.dumps(record), file=__import__('sys').stderr, flush=True)
+    """Log a structured ingestion event (file.processing_start, …).
+
+    These used to be hand-built JSON printed to stderr — a second stream in a
+    second format. They now go through the shared logger, so they carry the
+    task id and timestamp like every other line and render as JSON fields in
+    production.
+    """
+    logger.info(event, **kwargs)
 
 
 # ── Column mapping ─────────────────────────────────────────────
@@ -673,7 +676,7 @@ def process_file(
                             if is_transient_db_error(e):
                                 raise
                             failed_batches += 1
-                            logger.error(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
+                            logger.exception(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
 
                     if not shutdown_requested:
                         last_committed_row = chunk_end
@@ -771,9 +774,9 @@ def process_file(
                 raise
             progress('error', checkpoint_row, num_rows, str(e), error=str(e))
             if isinstance(e, FileNotFoundError):
-                logger.error(f"Failed to process file {file_name}: {e}")
+                logger.exception(f"Failed to process file {file_name}: {e}")
             else:
-                logger.error(f"Unexpected error processing file {file_name}: {e}")
+                logger.exception(f"Unexpected error processing file {file_name}: {e}")
         finally:
             lock.release()
             elapsed_time = time.time() - start_time
@@ -836,7 +839,7 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
                 except Exception as e:
                     failed_files.append((fp, e))
                     failed_count += 1
-                    logger.error(f"Failed to process {os.path.basename(fp)}: {e}")
+                    logger.exception(f"Failed to process {os.path.basename(fp)}: {e}")
 
         if failed_files:
             logger.error(

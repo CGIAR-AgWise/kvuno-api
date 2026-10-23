@@ -172,6 +172,10 @@ class TestInspection:
 
     def test_unreadable_file_fails_with_a_reason(self, env):
         upload_id = _upload(env, b'not a parquet file')
+        # Inspection committed through its own session; requests here share the
+        # fixture's, which still holds the object as the PATCH left it. A real
+        # request starts with a fresh session.
+        env.session.expire_all()
         body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
         assert body['status'] == 'failed'
         assert body['error'].startswith('Could not read the file')

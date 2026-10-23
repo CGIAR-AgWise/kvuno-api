@@ -15,7 +15,7 @@ from app.dto.pagination import get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
 from app.rate_limit import limiter
 from app.repo.planting_recommendation import PlantingRecommendationRepo
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 from pydantic import BaseModel, Field
 
 __bp__ = "/planting-data"
@@ -40,8 +40,7 @@ protected_api = APIBlueprint(
     abp_security=[{"jwt": []}]
 )
 
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 repo = PlantingRecommendationRepo()
 

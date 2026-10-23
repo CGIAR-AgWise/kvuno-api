@@ -44,3 +44,34 @@ celery_app.config_from_object({
 })
 
 celery_app.autodiscover_tasks(['app'])
+
+
+# ── Logging ────────────────────────────────────────────────────
+# As in budget-assist: a receiver on Celery's setup_logging signal stops it
+# from configuring (hijacking) the root logger, so worker and task records go
+# through app.utils.logging like everything else — same format, same level
+# (LOG_LEVEL), JSON in production. The worker's --loglevel no longer matters.
+
+from celery.signals import setup_logging as _celery_setup_logging  # noqa: E402
+from celery.signals import task_postrun, task_prerun  # noqa: E402
+
+
+@_celery_setup_logging.connect
+def _configure_logging(**_kwargs):
+    from app.utils.logging import setup_logging
+    setup_logging(force=True)
+
+
+@task_prerun.connect
+def _bind_task_context(task_id=None, task=None, **_kwargs):
+    # Every line logged while a task runs carries its id and name, so one
+    # file's ingest can be followed through the worker log.
+    import structlog
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(task_id=task_id, task=getattr(task, 'name', None))
+
+
+@task_postrun.connect
+def _clear_task_context(**_kwargs):
+    import structlog
+    structlog.contextvars.clear_contextvars()

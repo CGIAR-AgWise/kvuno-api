@@ -171,8 +171,8 @@ def run_migrations():
     database that is still booting will not block the app from starting.
     """
     if not _db_available():
-        from app.utils.logging import SharedLogger
-        _log = SharedLogger().get_logger()
+        from app.utils.logging import get_logger
+        _log = get_logger(__name__)
         _log.warning(
             f"Database at {_sanitize_db_url(build_db_url())} is not reachable — skipping migrations. "
             f"The app will start, but requests will fail until the database is available. "
@@ -203,6 +203,11 @@ def register_apis(app: OpenAPI):
 
 def create_app():
     """Create and configure the Flask app."""
+    # First, so everything below — Flask, SQLAlchemy, our own modules — logs
+    # through the one configured handler (app/utils/logging.py).
+    from app.utils.logging import setup_logging
+    setup_logging()
+
     app = OpenAPI(
         __name__,
         servers=servers,
@@ -236,7 +241,7 @@ def create_app():
     # The tus upload protocol is driven by response headers, which a
     # cross-origin client cannot read unless they are exposed.
     CORS(app, origins=origins, supports_credentials=True,
-         expose_headers=['Location', 'Upload-Offset', 'Upload-Length', 'Tus-Resumable'])
+         expose_headers=['Location', 'Upload-Offset', 'Upload-Length', 'Tus-Resumable', 'X-Request-ID'])
 
     # Rate limiting
     from app.rate_limit import limiter
@@ -265,9 +270,45 @@ def create_app():
 
     @app.errorhandler(500)
     def server_error(e):
-        return {"error": "Internal server error"}, 500
+        # The request_id lets a user's report be matched to the logged traceback.
+        from flask import g
+        return {"error": "Internal server error", "request_id": getattr(g, 'request_id', None)}, 500
 
     # Security headers for all responses
+    # ── Request context for logs ──────────────────────────────
+    # Every line logged while handling a request carries its request_id,
+    # method and path (structlog contextvars). The id comes from X-Request-ID
+    # when a proxy set one — kvuno-web's nginx does — so one id follows a
+    # request from nginx through the API; otherwise one is generated. It is
+    # returned in the response header, so a user or the SPA can quote it.
+    import re
+    import uuid
+
+    import structlog
+    from flask import g, request
+
+    _request_id_ok = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+    @app.before_request
+    def bind_request_context():
+        incoming = request.headers.get('X-Request-ID', '')
+        # Only accept a sane id from outside: it lands in every log line.
+        g.request_id = incoming if _request_id_ok.match(incoming) else uuid.uuid4().hex
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=g.request_id, method=request.method,
+                                               path=request.path)
+
+    @app.after_request
+    def return_request_id(response):
+        request_id = getattr(g, 'request_id', None)
+        if request_id:
+            response.headers['X-Request-ID'] = request_id
+        return response
+
+    @app.teardown_request
+    def clear_request_context(_exc=None):
+        structlog.contextvars.clear_contextvars()
+
     @app.after_request
     def add_security_headers(response):
         response.headers.setdefault('X-Content-Type-Options', 'nosniff')
@@ -341,7 +382,7 @@ def create_app():
         from werkzeug.middleware.proxy_fix import ProxyFix
         hops = int(_hops)
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops)
-        from app.utils.logging import SharedLogger
-        SharedLogger().get_logger().info(f"ProxyFix enabled for {hops} proxy hop(s)")
+        from app.utils.logging import get_logger
+        get_logger(__name__).info(f"ProxyFix enabled for {hops} proxy hop(s)")
 
     return app

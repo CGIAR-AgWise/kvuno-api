@@ -7,7 +7,7 @@ from app.dto.import_conflict import ImportConflictRecord
 from app.dto.pagination import PaginatedResponse, get_pagination
 from app.dto.planting_recommendation import Unauthorized
 from app.repo.import_conflict import ImportConflictRepo
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 from pydantic import BaseModel, Field
 
 __bp__ = "/quality"
@@ -20,8 +20,7 @@ tag = Tag(name="quality", description="Data quality endpoints")
 # blueprint used to rely on the label alone, so these were public.
 api = APIBlueprint(__bp__, __name__, url_prefix=url_prefix, abp_tags=[tag], abp_security=[{"jwt": []}])
 
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 repo = ImportConflictRepo()
 

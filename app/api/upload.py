@@ -12,11 +12,11 @@ from app.config import API_PREFIX, API_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEP
 from app.config import MAX_FILE_SIZE, ALLOWED_EXTENSIONS
 from app.dto.upload import UploadResponse
 from app.rate_limit import limiter
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 from app.utils.preview import read_columns
 from app.utils.rds_to_parquet import convert_for_ingestion
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 __bp__ = "/data"
 url_prefix = API_PREFIX + API_VERSION + __bp__

@@ -11,14 +11,13 @@ from app.dto.planting_recommendation import PlantingRecommendationCreate
 from app.dto.data_filters import PLANTING_SORT_COLUMNS, PlantingDataFilter
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, ImportConflict
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-shared_logger = SharedLogger()
 
 
 class PlantingRecommendationRepo:
     def __init__(self):
-        self.logger = shared_logger.get_logger()
+        self.logger = get_logger(__name__)
 
     def _get_session(self):
         self.db = MyDb.get_db()
@@ -30,7 +29,7 @@ class PlantingRecommendationRepo:
             session.add(record)
             session.commit()
             session.refresh(record)
-            self.logger.info(f"Added PlantingRecommendation with ID: {record.id}")
+            self.logger.debug(f"Added PlantingRecommendation with ID: {record.id}")
             return record
         except Exception as e:
             session.rollback()
@@ -41,7 +40,7 @@ class PlantingRecommendationRepo:
         session = self._get_session()
         try:
             record = session.query(PlantingRecommendation).filter_by(id=record_id).first()
-            self.logger.info(f"Retrieved PlantingRecommendation with ID: {record_id}")
+            self.logger.debug(f"Retrieved PlantingRecommendation with ID: {record_id}")
             return record
         except Exception as e:
             self.logger.error(f"Failed to retrieve PlantingRecommendation with ID {record_id}: {e}")
@@ -55,7 +54,7 @@ class PlantingRecommendationRepo:
                        .offset(offset)
                        .limit(per_page)
                        .all())
-            self.logger.info("Retrieved all PlantingRecommendation records")
+            self.logger.debug("Retrieved all PlantingRecommendation records")
             return records
         except Exception as e:
             self.logger.error(f"Failed to retrieve all PlantingRecommendation records: {e}")
@@ -217,7 +216,7 @@ class PlantingRecommendationRepo:
         try:
             session.commit()
             session.refresh(record)
-            self.logger.info(f"Updated PlantingRecommendation with ID: {record.id}")
+            self.logger.debug(f"Updated PlantingRecommendation with ID: {record.id}")
             return record
         except Exception as e:
             session.rollback()
@@ -229,7 +228,7 @@ class PlantingRecommendationRepo:
         try:
             session.delete(record)
             session.commit()
-            self.logger.info(f"Deleted PlantingRecommendation with ID: {record.id}")
+            self.logger.debug(f"Deleted PlantingRecommendation with ID: {record.id}")
         except Exception as e:
             session.rollback()
             self.logger.error(f"Failed to delete PlantingRecommendation with ID {record.id}: {e}")
@@ -240,7 +239,7 @@ class PlantingRecommendationRepo:
         try:
             record = (session.query(PlantingRecommendation)
                       .filter_by(check_sum=check_sum).first())
-            self.logger.info(f"Retrieved PlantingRecommendation with checksum: {check_sum}")
+            self.logger.debug(f"Retrieved PlantingRecommendation with checksum: {check_sum}")
             return record
         except Exception as e:
             self.logger.error(f"Failed to find PlantingRecommendation with checksum {check_sum}: {e}")
@@ -272,7 +271,7 @@ class PlantingRecommendationRepo:
                     query = query.limit(limit).offset(offset)
                 result[col] = [v[0] for v in query.all()]
             except Exception as e:
-                self.logger.error(f"Failed to get distinct values for {col}: {e}")
+                self.logger.exception(f"Failed to get distinct values for {col}: {e}")
                 result[col] = []
         return result
 
@@ -291,7 +290,7 @@ class PlantingRecommendationRepo:
                     .scalar() or 0
                 )
             except Exception as e:
-                self.logger.error(f"Failed to count distinct values for {col}: {e}")
+                self.logger.exception(f"Failed to count distinct values for {col}: {e}")
                 result[col] = 0
         return result
 
@@ -357,12 +356,12 @@ class PlantingRecommendationRepo:
             self._log_conflicts(session, mappings, inserted)
             session.commit()
             if inserted:
-                self.logger.info(
+                self.logger.debug(
                     f"Inserted {inserted} new PlantingRecommendation records "
                     f"({len(mappings) - inserted} duplicates logged)"
                 )
             else:
-                self.logger.info(f"All {len(mappings)} records were duplicates — logged")
+                self.logger.debug(f"All {len(mappings)} records were duplicates — logged")
             return inserted
         except SQLAlchemyError as e:
             session.rollback()

@@ -42,9 +42,9 @@ from sqlalchemy import or_, update
 from app.config import ALLOWED_EXTENSIONS, HOUSEKEEPING_DATA_DIR
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, Upload
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 TUS_VERSION = '1.0.0'
 
@@ -454,7 +454,7 @@ def inspect(upload_id: str, app=None):
         upload.status = 'ready'
         upload.error = None
     except Exception as e:
-        logger.error(f'Upload {upload_id}: inspection failed: {e}')
+        logger.exception(f'Upload {upload_id}: inspection failed: {e}')
         session.rollback()
         upload = session.get(Upload, upload_id)
         upload.status = 'failed'

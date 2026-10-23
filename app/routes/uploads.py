@@ -24,9 +24,9 @@ from app.config import MAX_FILE_SIZE
 from app.rate_limit import limiter
 from app.services import uploads as service
 from app.services.uploads import TUS_VERSION, UploadError
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 TUS_PATH = '/ui/uploads/tus'
 

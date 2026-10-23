@@ -12,10 +12,9 @@ from urllib.parse import urljoin, urlparse, urlunparse, unquote
 
 import requests
 
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-_shared_logger = SharedLogger()
-_logger = _shared_logger.get_logger()
+_logger = get_logger(__name__)
 
 DEFAULT_DATA_DIR = os.path.join("static", "data")
 
