@@ -69,6 +69,9 @@ pythonpath = ["."]
 env = [
     "DB_URL=sqlite:///:memory:",
     "DB_DRIVER=sqlite",
-    "DB_NAME=:memory:"
+    "DB_NAME=:memory:",
+    # Off unless a test turns it on: a developer .env with it true made every
+    # create_app() in the suite try Redis, ~6s each when Redis was down.
+    "HOUSEKEEPING_ENABLED=false"
 ]
 
