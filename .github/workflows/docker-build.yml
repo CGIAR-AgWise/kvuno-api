@@ -6,12 +6,14 @@ name: Docker Build
 #   tags    -> prod images (api, worker, web), tagged :latest, :<tag>, :production
 #
 # Because the trigger is workflow_run, images are only ever built from a commit
-# whose UnitTests run succeeded.
+# whose UnitTests run succeeded (for branches). Tag pushes run directly.
 
 on:
   workflow_run:
     workflows: ["UnitTests"]
     types: [completed]
+  push:
+    tags: [ '*' ]
   workflow_dispatch:
 
 permissions:
@@ -23,50 +25,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.name }}
-    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+  determine-profile:
+    name: Determine build profile
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: API (dev)
-            dockerfile: docker/Dockerfile
-            image: ghcr.io/cgiar-agwise/kvuno-api
-            context: .
-            profiles: [dev]
-          - name: Worker (dev)
-            dockerfile: docker/Dockerfile.worker
-            image: ghcr.io/cgiar-agwise/kvuno-worker
-            context: .
-            profiles: [dev]
-          - name: Web (dev)
-            dockerfile: frontend/Dockerfile
-            image: ghcr.io/cgiar-agwise/kvuno-web
-            context: .
-            profiles: [dev]
-          - name: API (prod)
-            dockerfile: docker/Dockerfile.prod.dockerfile
-            image: ghcr.io/cgiar-agwise/kvuno-api
-            context: .
-            profiles: [prod]
-          - name: Worker (prod)
-            dockerfile: docker/Dockerfile.worker
-            image: ghcr.io/cgiar-agwise/kvuno-worker
-            context: .
-            profiles: [prod]
-          - name: Web (prod)
-            dockerfile: frontend/Dockerfile
-            image: ghcr.io/cgiar-agwise/kvuno-web
-            context: .
-            profiles: [prod]
-
+    outputs:
+      profile: ${{ steps.profile.outputs.profile }}
+      version: ${{ steps.profile.outputs.version }}
+      tags: ${{ steps.profile.outputs.tags }}
+      sha: ${{ steps.profile.outputs.sha }}
+      ref_type: ${{ steps.profile.outputs.ref_type }}
+      ref_name: ${{ steps.profile.outputs.ref_name }}
     steps:
       - name: Determine build profile
         id: profile
         run: |
-          # In workflow_run context, use event.workflow_run.*; in dispatch, use github.*
           if [[ -n "${{ github.event.workflow_run.head_branch }}" ]]; then
             REF_TYPE="branch"
             REF_NAME="${{ github.event.workflow_run.head_branch }}"
@@ -77,74 +49,70 @@ jobs:
             SHA="${{ github.sha }}"
           fi
 
-          if [[ "$REF_TYPE" == "tag" ]]; then
+          if [[ "$REF_TYPE" == "tag" ]] || [[ "$REF_NAME" == "main" ]]; then
             echo "profile=prod" >> $GITHUB_OUTPUT
             echo "version=$REF_NAME" >> $GITHUB_OUTPUT
-            echo "tags=${{ matrix.image }}:latest,${{ matrix.image }}:$REF_NAME,${{ matrix.image }}:production" >> $GITHUB_OUTPUT
-          elif [[ "$REF_NAME" == "main" ]]; then
-            echo "profile=prod" >> $GITHUB_OUTPUT
-            echo "version=main" >> $GITHUB_OUTPUT
-            echo "tags=${{ matrix.image }}:latest,${{ matrix.image }}:production" >> $GITHUB_OUTPUT
+            if [[ "$REF_TYPE" == "tag" ]]; then
+              echo "tags=latest,${{ github.ref_name }},production" >> $GITHUB_OUTPUT
+            else
+              echo "tags=latest,production" >> $GITHUB_OUTPUT
+            fi
           else
             echo "profile=dev" >> $GITHUB_OUTPUT
             echo "version=${REF_NAME}-dev" >> $GITHUB_OUTPUT
-            echo "tags=${{ matrix.image }}:develop" >> $GITHUB_OUTPUT
+            echo "tags=develop" >> $GITHUB_OUTPUT
           fi
           echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "ref_type=$REF_TYPE" >> $GITHUB_OUTPUT
+          echo "ref_name=$REF_NAME" >> $GITHUB_OUTPUT
 
-      - name: Skip if profile mismatch
-        if: ${{ !contains(matrix.profiles, steps.profile.outputs.profile) }}
-        run: echo "Skipping ${{ matrix.image }} for ${{ steps.profile.outputs.profile }} profile" && exit 0
+  build-api:
+    needs: [ determine-profile ]
+    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      name: API (${{ needs.determine-profile.outputs.profile }})
+      dockerfile: ${{ needs.determine-profile.outputs.profile == 'dev' && 'docker/Dockerfile' || 'docker/Dockerfile.prod.dockerfile' }}
+      image: ghcr.io/cgiar-agwise/kvuno-api
+      profile: ${{ needs.determine-profile.outputs.profile }}
+      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
+      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
+      sha: ${{ needs.determine-profile.outputs.sha }}
+      version: ${{ needs.determine-profile.outputs.version }}
+      tags: ghcr.io/cgiar-agwise/kvuno-api:${{ needs.determine-profile.outputs.tags }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ steps.profile.outputs.sha }}
-          fetch-depth: 0
+  build-worker:
+    needs: [ determine-profile ]
+    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      name: Worker (${{ needs.determine-profile.outputs.profile }})
+      dockerfile: docker/Dockerfile.worker
+      image: ghcr.io/cgiar-agwise/kvuno-worker
+      profile: ${{ needs.determine-profile.outputs.profile }}
+      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
+      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
+      sha: ${{ needs.determine-profile.outputs.sha }}
+      version: ${{ needs.determine-profile.outputs.version }}
+      tags: ghcr.io/cgiar-agwise/kvuno-worker:${{ needs.determine-profile.outputs.tags }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute source hash
-        id: source_hash
-        run: |
-          # Hash the build context + Dockerfile to detect changes
-          HASH=$(find ${{ matrix.context }} -type f \( -name "*.py" -o -name "*.toml" -o -name "*.lock" -o -name "*.txt" -o -name "Dockerfile*" -o -name "*.ts" -o -name "*.tsx" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" \) -exec sha256sum {} + | sort | sha256sum | cut -d' ' -f1)
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
-
-      - name: Check build cache
-        id: build_cache
-        uses: actions/cache@v5
-        with:
-          path: /tmp/build-marker
-          key: docker-build-${{ matrix.image }}-${{ steps.source_hash.outputs.hash }}
-          enableCrossOsArchive: true
-
-      - name: Skip if source unchanged
-        if: steps.build_cache.outputs.cache-hit == 'true'
-        run: |
-          echo "Source unchanged for ${{ matrix.image }} (hash: ${{ steps.source_hash.outputs.hash }}), skipping build"
-          echo "skipped=true" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
-
-      - name: Build and push
-        if: steps.build_cache.outputs.cache-hit != 'true'
-        uses: docker/build-push-action@v7
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          build-args: APP_VERSION=${{ steps.profile.outputs.version }}
-          push: true
-          provenance: true
-          tags: ${{ steps.profile.outputs.tags }}
-          cache-from: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }}
-          cache-to: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }},mode=max
-
-      - name: Write build marker
-        if: steps.build_cache.outputs.cache-hit != 'true'
-        run: mkdir -p /tmp/build-marker && echo "${{ steps.source_hash.outputs.hash }}" > /tmp/build-marker/hash
+  build-web:
+    needs: [ determine-profile ]
+    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    uses: ./.github/workflows/docker-build-reusable.yml
+    with:
+      name: Web (${{ needs.determine-profile.outputs.profile }})
+      dockerfile: frontend/Dockerfile
+      image: ghcr.io/cgiar-agwise/kvuno-web
+      profile: ${{ needs.determine-profile.outputs.profile }}
+      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
+      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
+      sha: ${{ needs.determine-profile.outputs.sha }}
+      version: ${{ needs.determine-profile.outputs.version }}
+      tags: ghcr.io/cgiar-agwise/kvuno-web:${{ needs.determine-profile.outputs.tags }}
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
