@@ -54,17 +54,25 @@ def register_app_routes(app):
     @app.route('/')
     def index():
         """
-        Point browsers at the SPA.
+        A landing page for browsers; a pointer for everything else.
 
-        The UI is a separate React app served by its own nginx container; this
-        service renders no HTML. Redirecting to '/' by default would point the
-        browser back at *this* service, which redirects again — an infinite
-        loop, reported as ERR_TOO_MANY_REDIRECTS or ERR_SOCKET_NOT_CONNECTED.
+        A browser (Accept: text/html) gets a small dashboard linking the web
+        app (SPA_ROOT_URL), the API docs, the OpenAPI spec and /health. The UI
+        itself is a separate React app served by its own nginx container.
 
-        So SPA_ROOT_URL must name the SPA's actual origin. When it is unset,
-        return a small JSON pointer instead of a redirect.
+        API clients keep the old behaviour: a redirect to SPA_ROOT_URL when it
+        is set, otherwise a JSON pointer. SPA_ROOT_URL must never default to
+        '/': that pointed the redirect back at *this* service, an infinite
+        loop reported as ERR_TOO_MANY_REDIRECTS.
         """
         spa_root = os.getenv('SPA_ROOT_URL', '').strip()
+        # Explicit text/html only: curl, fetch and test clients send */*, and
+        # must keep getting JSON or the redirect.
+        if 'text/html' in request.headers.get('Accept', ''):
+            from app.config import APP_NAME, APP_VERSION
+            from app.routes.dashboard import render_dashboard
+            return Response(render_dashboard(APP_NAME, APP_VERSION, spa_root),
+                            mimetype='text/html')
         if not spa_root:
             return jsonify({
                 'service': 'kvuno-api',
