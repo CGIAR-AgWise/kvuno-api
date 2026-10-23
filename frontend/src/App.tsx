@@ -17,6 +17,7 @@ const Explore = lazy(() => import('./pages/Explore'))
 const Upload = lazy(() => import('./pages/Upload'))
 const Quality = lazy(() => import('./pages/Quality'))
 const Tokens = lazy(() => import('./pages/Tokens'))
+const AdminUsers = lazy(() => import('./pages/AdminUsers'))
 
 function Loading() {
   return <div className="container py-5 text-center text-muted">Loading…</div>
@@ -41,6 +42,18 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return <>{children}</>
 }
 
+/**
+ * Administrators only (the server's ADMIN_EMAILS). Waits for `me` so an admin
+ * reloading the page is not bounced before their account has loaded; the API
+ * enforces this too — the guard only keeps others off a page that would 403.
+ */
+function RequireAdmin({ children }: { children: ReactNode }) {
+  const { me, isAdmin } = useAuth()
+  if (!me) return <Loading />
+  if (!isAdmin) return <Navigate to="/jobs" replace />
+  return <>{children}</>
+}
+
 export default function App() {
   return (
     <ToastProvider>
@@ -62,6 +75,14 @@ export default function App() {
               <Route path="/upload" element={<Upload />} />
               <Route path="/quality" element={<Quality />} />
               <Route path="/tokens" element={<Tokens />} />
+              <Route
+                path="/admin/users"
+                element={
+                  <RequireAdmin>
+                    <AdminUsers />
+                  </RequireAdmin>
+                }
+              />
             </Route>
             <Route path="*" element={<Navigate to="/jobs" replace />} />
           </Routes>

@@ -1,6 +1,34 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { fetchAdminUsers } from '../api'
 import { useAuth } from '../context/AuthContext'
+
+/**
+ * How many accounts await approval, for the admin's navbar badge. Refreshed on
+ * navigation and when the Accounts page changes something, so the badge is
+ * current without polling.
+ */
+function usePendingCount(enabled: boolean, pathname: string): number {
+  const [count, setCount] = useState(0)
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    const bump = () => setNonce((n) => n + 1)
+    window.addEventListener('kvuno:accounts-changed', bump)
+    return () => window.removeEventListener('kvuno:accounts-changed', bump)
+  }, [])
+
+  useEffect(() => {
+    if (!enabled) return
+    const controller = new AbortController()
+    fetchAdminUsers({ status: 'pending' }, controller.signal)
+      .then((res) => setCount(res.counts.pending ?? 0))
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [enabled, pathname, nonce])
+
+  return enabled ? count : 0
+}
 
 const LINKS = [
   { to: '/jobs', label: 'Jobs', icon: 'bi-list-check' },
@@ -11,9 +39,10 @@ const LINKS = [
 ]
 
 export default function Layout() {
-  const { logout } = useAuth()
+  const { logout, isAdmin, me } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
+  const pending = usePendingCount(isAdmin, location.pathname)
   // Bootstrap's JS is not loaded (CSS only), so the navbar collapse is driven
   // by React state: `show` is the class Bootstrap's own plugin would toggle.
   const [navOpen, setNavOpen] = useState(false)
@@ -64,7 +93,30 @@ export default function Layout() {
                   </NavLink>
                 </li>
               ))}
+              {isAdmin && (
+                <li className="nav-item">
+                  <NavLink
+                    className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}
+                    to="/admin/users"
+                  >
+                    <i className="bi bi-people me-1" />
+                    Accounts
+                    {pending > 0 && (
+                      <span className="badge rounded-pill text-bg-warning ms-1">
+                        {pending}
+                        <span className="visually-hidden"> awaiting approval</span>
+                      </span>
+                    )}
+                  </NavLink>
+                </li>
+              )}
             </ul>
+            {me && (
+              <span className="navbar-text small text-white-50 me-sm-3 py-2 py-sm-0" title={me.email}>
+                <i className="bi bi-person-circle me-1" aria-hidden="true" />
+                {me.username}
+              </span>
+            )}
             {/* A plain link, not a router <Link>: Swagger UI is served by the
                 API (flask-openapi3, doc_prefix /api-docs), which nginx and the
                 Vite dev server both proxy — the SPA has no route for it. */}

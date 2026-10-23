@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_REGISTER, RATE_LIMIT_LOGIN, TOKEN_TTL_DAYS
-from app.config import registration_allowed_domains
+from app.config import admin_emails
 from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, CreateTokenRequest
 from app.dto.auth import password_too_long
 from app.dto.pagination import get_pagination
@@ -86,25 +86,67 @@ def _email_domain(email: str) -> str | None:
     return domain.lower()
 
 
+# ── Account approval ───────────────────────────────────────────
+#
+# New accounts start `pending` and are inert until an administrator approves
+# them (app/api/admin.py). Administrators have role 'admin', or are "owners"
+# listed in ADMIN_EMAILS — owners bootstrap the first admin with no data change.
+
+STATUS_PENDING = 'pending'
+STATUS_APPROVED = 'approved'
+STATUS_REJECTED = 'rejected'
+STATUS_DISABLED = 'disabled'
+
+_STATUS_MESSAGES = {
+    STATUS_PENDING: "your account is awaiting approval by an administrator",
+    STATUS_REJECTED: "your account request was not approved",
+    STATUS_DISABLED: "your account has been disabled",
+}
+
+
+ROLE_USER = 'user'
+ROLE_ADMIN = 'admin'
+ROLES = (ROLE_USER, ROLE_ADMIN)
+
+
+def is_owner(user) -> bool:
+    """Listed in ADMIN_EMAILS: an administrator no one can demote or disable,
+    so access can always be recovered from the server's configuration."""
+    return bool(user is not None and user.email and user.email.strip().lower() in admin_emails())
+
+
+def is_admin(user) -> bool:
+    """May see and use the Accounts screens: an owner, or role 'admin'."""
+    return is_owner(user) or (user is not None and user.role == ROLE_ADMIN)
+
+
+def is_active(user) -> bool:
+    """May this account sign in and use its tokens?
+
+    A missing status counts as approved: the column is NOT NULL with a server
+    default of 'approved', so only an unsaved object has None.
+    """
+    if user is None:
+        return False
+    # Owners only: a role-'admin' account that was disabled is disabled.
+    return is_owner(user) or (user.status or STATUS_APPROVED) == STATUS_APPROVED
+
+
 @api.post('/register',
           responses={201: RegisterResponse,
-                     403: {"description": "Registration is disabled, or the email domain is not allowed"},
+                     400: {"description": "Not a valid email address"},
                      409: {"description": "Username or email already exists"}},
           summary="Register a new user account",
-          description="Create a new user with username, email, and password. Only email addresses whose "
-                      "domain is listed in REGISTRATION_ALLOWED_DOMAINS may register; when that is unset, "
-                      "registration is disabled.",
+          description="Create a new account. It starts **pending** and can do nothing until an "
+                      "administrator approves it; the user gets an activation email then (when "
+                      "email is configured). Addresses in ADMIN_EMAILS are approved at once.",
           security=[])
 @limiter.limit(RATE_LIMIT_REGISTER)
 def register(body: RegisterRequest):
-    # Registration used to be open to anyone who could reach the API. It is
-    # now limited to an explicit allow-list of email domains, closed by default.
-    allowed = registration_allowed_domains()
-    if not allowed:
-        return {"msg": "registration is disabled on this server; ask an administrator for an account"}, 403
-    domain = _email_domain(body.email)
-    if domain is None or domain not in allowed:
-        return {"msg": "registration is not open to this email domain"}, 403
+    # Open to any address: administrator approval is the gate (it replaced the
+    # REGISTRATION_ALLOWED_DOMAINS allow-list).
+    if _email_domain(body.email) is None:
+        return {"msg": "a valid email address is required"}, 400
 
     db = MyDb.get_db()
     existing = db.session.query(User).filter(
@@ -114,16 +156,29 @@ def register(body: RegisterRequest):
         return {"msg": "username or email already exists"}, 409
 
     password_hash = bcrypt.hashpw(body.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    user = User(username=body.username, email=body.email, password_hash=password_hash)
+    user = User(username=body.username, email=body.email, password_hash=password_hash, role=ROLE_USER)
+    admin = is_owner(user)
+    user.status = STATUS_APPROVED if admin else STATUS_PENDING
+    if admin:
+        user.reviewed_at = _utcnow()
     db.session.add(user)
     db.session.commit()
-    return {"msg": "registration success"}, 201
+
+    if admin:
+        return {"msg": "registration success", "status": user.status}, 201
+
+    from app.services.mailer import send_new_registration
+    send_new_registration(user.username, user.email)
+    return {"msg": "registration received: an administrator must approve your account "
+                   "before you can sign in", "status": user.status}, 201
 
 
 @api.post('/login',
-          responses={200: LoginResponse, 401: {"description": "Invalid credentials"}},
+          responses={200: LoginResponse, 401: {"description": "Invalid credentials"},
+                     403: {"description": "Account pending approval, rejected or disabled"}},
           summary="Authenticate and get a Bearer token",
-          description="Exchange valid credentials for a JWT access token (id|secret format). Token TTL is configurable via TOKEN_TTL_DAYS.",
+          description="Exchange valid credentials for an opaque access token ({id}|{secret}). Accounts must be "
+                      "approved by an administrator first. Token TTL is configurable via TOKEN_TTL_DAYS.",
           security=[])
 @limiter.limit(RATE_LIMIT_LOGIN)
 def login(body: LoginRequest):
@@ -136,12 +191,19 @@ def login(body: LoginRequest):
     user = db.session.query(User).filter(User.username == body.username).first()
     if not user or not bcrypt.checkpw(body.password.encode('utf-8'), user.password_hash.encode('utf-8')):
         return {"msg": "invalid credentials"}, 401
+    # Only after the password checks out, so the status of an account is not
+    # revealed to someone who does not know its password.
+    if not is_active(user):
+        return {"msg": _STATUS_MESSAGES.get(user.status, "your account is not active"),
+                "status": user.status}, 403
 
     secret = secrets.token_hex(32)
+    # created_at is bound, not SQL now(): naive UTC like every token timestamp,
+    # and portable (SQLite has no now()).
     token_id = db.session.execute(
         text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
-             "VALUES (:uid, '', :exp, now()) RETURNING id"),
-        {"uid": user.id, "exp": None if TOKEN_TTL_DAYS <= 0
+             "VALUES (:uid, '', :exp, :created) RETURNING id"),
+        {"uid": user.id, "created": _utcnow(), "exp": None if TOKEN_TTL_DAYS <= 0
          else _utcnow() + timedelta(days=TOKEN_TTL_DAYS)},
     ).scalar()
     token_hash = _hash_token(token_id, secret)
@@ -176,7 +238,10 @@ def _resolve_token(raw: str):
     if last_used is None or now - last_used >= LAST_USED_UPDATE_INTERVAL:
         token_record.last_used_at = now
         db.session.commit()
-    return db.session.query(User).filter(User.id == token_record.user_id).first()
+    user = db.session.query(User).filter(User.id == token_record.user_id).first()
+    # A disabled (or not-yet-approved) account's tokens stop working at once,
+    # without having to find and delete them.
+    return user if is_active(user) else None
 
 
 def get_current_user():
@@ -203,6 +268,29 @@ def get_current_user():
             return user
 
     return None
+
+
+class MeResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    status: str
+    role: str = Field('user', description="'user' or 'admin'")
+    is_admin: bool = Field(False, description="May use the Accounts screens (role admin, or listed in ADMIN_EMAILS)")
+
+
+@api.get('/me',
+         responses={200: MeResponse, 401: {"description": "Authentication required"}},
+         summary="The signed-in account",
+         description="Who the token belongs to, including whether they are an administrator.",
+         security=[{"jwt": []}])
+def me():
+    user = get_current_user()
+    if not user:
+        return {"msg": "authentication required"}, 401
+    return MeResponse(id=user.id, username=user.username, email=user.email,
+                      status=user.status or STATUS_APPROVED, role=user.role or ROLE_USER,
+                      is_admin=is_admin(user)).model_dump(), 200
 
 
 class TokenInfoResponse(BaseModel):
@@ -267,8 +355,8 @@ def create_token(body: CreateTokenRequest):
     ttl = body.expires_in_days if body.expires_in_days is not None else TOKEN_TTL_DAYS
     token_id = _db.session.execute(
         text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
-             "VALUES (:uid, '', :exp, now()) RETURNING id"),
-        {"uid": user.id, "exp": None if ttl <= 0
+             "VALUES (:uid, '', :exp, :created) RETURNING id"),
+        {"uid": user.id, "created": _utcnow(), "exp": None if ttl <= 0
          else _utcnow() + timedelta(days=ttl)},
     ).scalar()
     token_hash = _hash_token(token_id, secret)

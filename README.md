@@ -19,7 +19,8 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
 - **React Frontend** — Standalone Vite + React 18 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx
-- **Login & Registration UI** — SPA routes `/login` and `/register`; self-registration is limited to the email domains in `REGISTRATION_ALLOWED_DOMAINS` and is **disabled when that is unset**
+- **Login & Registration UI** — SPA routes `/login` and `/register`; anyone can register, but a new account is **pending** until an administrator approves it
+- **Account Approval** — Administrators (`ADMIN_EMAILS`, or accounts given the admin role) approve, reject, disable, and promote accounts at the SPA route `/admin/users`; optional SMTP email tells users and admins what happened
 - **Token Management** — List and revoke tokens at the SPA route `/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
@@ -54,6 +55,7 @@ kvuno/
 │   ├── tasks.py              # Celery task definitions
 │   ├── auth.py               # require_auth decorator
 │   ├── api/
+│   │   ├── admin.py          # Account approval + roles (/api/v1/admin, admins only)
 │   │   ├── planting_data.py  # Planting data API (public_api + protected_api)
 │   │   ├── quality.py        # Data quality endpoints
 │   │   ├── upload.py         # File upload API blueprint
@@ -77,6 +79,7 @@ kvuno/
 │   │   └── uploads.py        # tus upload server + upload lifecycle (/ui/uploads/*)
 │   ├── services/
 │   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
+│   │   ├── mailer.py         # Optional SMTP: activation, rejection, new-registration emails
 │   │   ├── uploads.py        # Upload storage, background inspection, column-mapping rules
 │   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
 │   │   └── watch_handler.py  # watchdog directory watcher
@@ -91,7 +94,7 @@ kvuno/
 │   ├── src/
 │   │   ├── App.tsx           # Client-side routes (lazy-loaded, code-split)
 │   │   ├── api.ts            # Typed fetch client for /api and /ui
-│   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens
+│   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens, AdminUsers
 │   │   ├── components/       # Layout, Pagination
 │   │   ├── context/          # AuthContext, ToastContext
 │   │   └── hooks/            # useJobStream (SSE)
@@ -252,7 +255,7 @@ The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with 
 
 Database migrations are applied by the `api` container's entrypoint when `RUN_MIGRATIONS=true` — the entrypoint's own default — but `docker-compose.yml` overrides it to `${RUN_MIGRATIONS:-false}`, so under compose either set it or run `docker compose exec api python scripts/run_migrations.py` after every upgrade. Keep it `false` if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
-> **Set `REGISTRATION_ALLOWED_DOMAINS`** (e.g. `cgiar.org,iita.org`) on the `api`, or nobody can sign up: unset or empty disables `POST /api/v1/users/register` (`403`). Existing accounts and login are unaffected.
+> **Set `ADMIN_EMAILS`** (e.g. `you@cgiar.org`) on the `api`, or nobody can approve new accounts: anyone can register, but every new account stays `pending` until an administrator approves it. Accounts that existed before the approval migration are `approved` and unaffected. See [Accounts and approval](#accounts-and-approval).
 
 > PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
@@ -443,7 +446,26 @@ curl http://localhost:5000/api/v1/planting-data/ \
 
 Or sign in through the SPA at `/login` — the token is stored as a cookie for browser navigation (`Secure` when the page is served over HTTPS). An unauthenticated browser hitting a protected endpoint is redirected to `SPA_LOGIN_PATH` (default `/login`); API clients still get a `401` JSON body. In the SPA, a `401` from any API call (an expired or revoked token) signs the user out and returns them to `/login?next=<page>`.
 
-Registration (`POST /api/v1/users/register`) is open only to email addresses whose domain is listed in `REGISTRATION_ALLOWED_DOMAINS` — exact, case-insensitive match, so `sub.cgiar.org` is not covered by `cgiar.org`. When the variable is unset or empty, registration is **disabled** (`403`). Passwords longer than 72 UTF-8 bytes (bcrypt's limit) are rejected at registration (`422`); a login with one is simply `401`.
+Registration (`POST /api/v1/users/register`) is open to any valid email address, but the new account is **pending** until an administrator approves it — see [Accounts and approval](#accounts-and-approval). Passwords longer than 72 UTF-8 bytes (bcrypt's limit) are rejected at registration (`422`); a login with one is simply `401`.
+
+### Accounts and approval
+
+Every new account starts `pending` (the register response is `201` with `"status": "pending"`) and can neither sign in nor use a token until an administrator approves it. A login with the right password for an account that is not active is `403` with `{"msg", "status"}` (`pending`, `rejected`, or `disabled`); a wrong password is always `401`, so an account's status is only revealed to someone who knows its password. Disabling or rejecting an account revokes all its tokens, and any token of an inactive account stops working at once (`401`).
+
+Administrators are:
+
+- **Owners** — the addresses in `ADMIN_EMAILS` (comma-separated, case-insensitive, read on every request). Registering with one of them skips the queue, and an owner cannot be disabled or demoted from the UI; access can always be recovered by editing that variable.
+- Approved accounts that an administrator gave the **admin** role.
+
+To bootstrap the first administrator:
+
+1. Set `ADMIN_EMAILS=you@example.org` on the `api` and restart it.
+2. Register at `/register` with that address — the account is approved immediately and you are signed in.
+3. The navbar shows **Accounts** (`/admin/users`), with a badge counting pending requests. Approve, reject (with an optional reason), disable, re-activate, or make other approved accounts admins from there. You cannot change your own account, and owners show no actions.
+
+Accounts that existed before migration `a8c4e2f1d9b3` are backfilled `approved`, so the upgrade locks nobody out.
+
+Email is optional. With `SMTP_HOST` and `MAIL_FROM` set, the API sends an activation email on approval (linking `SPA_ROOT_URL` + `/login`), a rejection email with the optional reason, and a new-registration notice to every `ADMIN_EMAILS` address (linking `SPA_ROOT_URL` + `/admin/users`); the reviewer can untick "Email the user about my decision" to skip the user's email. Links are only included when `SPA_ROOT_URL` is an absolute `http(s)` URL. Without SMTP configured nothing is sent and the API log shows `would send …` for each message instead. Sending runs on a background thread and a failure is logged, never raised.
 
 Error responses never carry exception text: a failing endpoint returns a generic `500` body and logs the exception server-side. Request validation errors (bad query/body parameters, including an unknown `sort_col`/`sort_dir`) are `422`, flask-openapi3's validation status.
 
@@ -461,6 +483,7 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `GET` | `/upload` | Required | SPA route — file upload (nginx) |
 | `GET` | `/quality` | Required | SPA route — data quality dashboard (nginx) |
 | `GET` | `/tokens` | Required | SPA route — token management (nginx) |
+| `GET` | `/admin/users` | Admin | SPA route — account approval (nginx; non-admins are sent to `/jobs`) |
 | `GET` | `/ui/jobs/data` | Required | JSON: job list |
 | `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
 | `POST` | `/ui/uploads/tus` | Required | tus create — `Upload-Length` + `Upload-Metadata filename`; size and extension checked before any bytes (`413`/`415`) |
@@ -473,8 +496,14 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `POST` | `/ui/process` | Required | (Re)process a stored file — Jobs page Retry; omit `column_map` to re-use the saved one |
 | `GET` | `/ui/progress/<file_name>` | Required | One job's progress record (same shape as a `/ui/jobs/data` item), or `status: unknown` |
 | `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, and `max_file_size` |
-| `POST` | `/api/v1/users/register` | — | Register a new account (email domain must be in `REGISTRATION_ALLOWED_DOMAINS`, else `403`) |
-| `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
+| `POST` | `/api/v1/users/register` | — | Register a new account — `201` with `status: pending` (or `approved` for an `ADMIN_EMAILS` address); `400` invalid email, `409` taken |
+| `POST` | `/api/v1/users/login` | — | Authenticate and get a token (`401` wrong credentials, `403` + `status` when the account is pending/rejected/disabled) |
+| `GET` | `/api/v1/users/me` | Required | The signed-in account: `id`, `username`, `email`, `status`, `role`, `is_admin` |
+| `GET` | `/api/v1/admin/users` | Admin | Accounts, newest first (paginated; filter `status`, search `q` on username/email) plus `counts` per status |
+| `POST` | `/api/v1/admin/users/<id>/approve` | Admin | Approve a pending, rejected, or disabled account; optional body `{"notify": true}` |
+| `POST` | `/api/v1/admin/users/<id>/reject` | Admin | Reject a pending account and revoke its tokens; optional body `{"reason": "...", "notify": true}` (reason ≤ 500 chars) |
+| `POST` | `/api/v1/admin/users/<id>/disable` | Admin | Disable an approved account and revoke all its tokens |
+| `POST` | `/api/v1/admin/users/<id>/role` | Admin | `{"role": "admin"}` or `{"role": "user"}` — approved accounts only (`409` otherwise) |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token (bearer header or `token` cookie) |
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
@@ -562,7 +591,14 @@ Key environment variables (see `.env.example`):
 | `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
 | `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
 | `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
-| `REGISTRATION_ALLOWED_DOMAINS` | Comma-separated email domains allowed to self-register (exact, case-insensitive; no subdomain matching). **Unset/empty disables registration** (`403`) | — (disabled) | To allow sign-up |
+| `ADMIN_EMAILS` | Comma-separated owner addresses (case-insensitive, read per request): administrators who cannot be demoted, approved at once on registration, and sent new-registration notices. **Unset means nobody can approve new accounts** (unless an account already holds the admin role) | — | To approve accounts |
+| `SMTP_HOST` | SMTP server; unset → no email is sent (the log shows `would send …`) | — | For email |
+| `SMTP_PORT` | SMTP port | `587` | |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP login; skipped when the username is empty | — | |
+| `SMTP_SECURITY` | `starttls`, `ssl` (implicit TLS, usually port 465), or `none` (local relay) | `starttls` | |
+| `SMTP_TIMEOUT_SECONDS` | SMTP connect/command timeout | `15` | |
+| `MAIL_FROM` | Sender address; unset → no email is sent | — | For email |
+| `MAIL_APP_NAME` | From display name and the name used in message text | `KVuno` | |
 | `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
 | `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
 | `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
@@ -573,7 +609,7 @@ Key environment variables (see `.env.example`):
 | `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs. Set `0` if nothing proxies the app, or `X-Forwarded-For` can be forged | `1` | |
 | `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
 | `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173` | |
-| `SPA_ROOT_URL` | Target of the `GET /` redirect | `/` | |
+| `SPA_ROOT_URL` | Target of the `GET /` redirect; also the base of links in emails (only when it is an absolute `http(s)` URL) | `/` | |
 | `SPA_LOGIN_PATH` | Where `require_auth` sends an unauthenticated browser | `/login` | |
 | `FLASK_DEBUG` | Enable debug mode | `false` | |
 | `SERVER_HOST` | Bind address | `0.0.0.0` | |

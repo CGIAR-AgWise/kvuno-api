@@ -37,3 +37,21 @@ def require_auth(f):
             return {"error": "Authentication required"}, 401
         return f(*args, **kwargs)
     return decorated
+
+
+def require_admin(f):
+    """Like require_auth, but the account must also be listed in ADMIN_EMAILS.
+
+    Signed in but not an administrator is a 403, not a 401: the token is fine,
+    the account just may not do this.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from app.api.user import is_admin
+        user = get_current_user()
+        if user is None:
+            return {"error": "Authentication required"}, 401
+        if not is_admin(user):
+            return {"error": "Administrator access required"}, 403
+        return f(*args, **kwargs)
+    return decorated

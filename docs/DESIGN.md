@@ -48,7 +48,7 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 |---|---|
 | Framework | React 18 + react-router 6 + TypeScript 5.7 |
 | Build tool | Vite 6, package manager pnpm |
-| Client routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Client routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens`, `/admin/users` (admins only) |
 | Runtime | nginx (`ghcr.io/cgiar-agwise/kvuno-web`, compose host `127.0.0.1:5001`) |
 | Dev server | `pnpm dev` → Vite on `:5173` |
 
@@ -98,6 +98,22 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 - No per-job conflict detail linking back to the source file
 - No data quality trend/history over time
 - No automated quality checks (null counts, outlier detection)
+
+### Page: Accounts (`/admin/users`)
+
+Administrators only — owners in `ADMIN_EMAILS` and accounts with the `admin` role. The route is wrapped in `RequireAdmin` (`App.tsx`), which waits for `me` and sends everyone else to `/jobs`; the server enforces the same with `@require_admin` (`403`).
+
+**What exists:**
+- Navbar **Accounts** link, shown only to administrators, with a badge counting pending requests; the signed-in username is shown in the navbar
+- Status tabs Pending (default — the only one that needs action) / Approved / Rejected / Disabled / All, each with its count, plus a username/email search
+- Row actions: **Approve** (pending) or **Re-activate** (rejected/disabled), **Reject** with an inline optional reason, **Disable** with an inline confirm, **Make admin** / **Remove admin** on approved accounts
+- An "Email the user about my decision" switch (sent as `notify`); emails only go out when SMTP is configured
+- **Owner** and **Admin** badges; owners and your own row show no actions, so nobody can lock themselves out
+
+Around it: `/register` shows "Request received" for a pending account instead of signing in (an `ADMIN_EMAILS` address is approved and signed straight in), and `/login` shows a warning notice for a `403` (pending, rejected, or disabled) instead of "invalid credentials".
+
+**Gaps:**
+- No audit history beyond `reviewed_at` / `reviewed_by` and the API log
 
 ---
 
@@ -150,6 +166,7 @@ Client-side (React, served by nginx — no Flask route):
   /upload                  → upload page (lib/tus.ts)
   /quality                 → data quality dashboard
   /tokens                  → token management
+  /admin/users             → account approval (RequireAdmin; others → /jobs)
 
 Flask (JSON, reverse-proxied by nginx):
 GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_file_size
@@ -165,12 +182,19 @@ DELETE /ui/uploads/<id>            → discard an unsubmitted upload
 POST   /ui/process                 → re-process a stored file (Jobs Retry; re-uses the saved mapping)
 GET    /ui/progress/<file>         → JSON: one job record from progress_store (or status "unknown")
 
-POST   /api/v1/users/register          → create account (REGISTRATION_ALLOWED_DOMAINS only; 403 when unset)
-POST   /api/v1/users/login             → {id}|{secret} token
+POST   /api/v1/users/register          → create account, status pending (approved for an ADMIN_EMAILS address)
+POST   /api/v1/users/login             → {id}|{secret} token (403 + status when not approved)
+GET    /api/v1/users/me                → id, username, email, status, role, is_admin
 POST   /api/v1/users/logout            → revoke current token (bearer or token cookie)
 GET    /api/v1/users/tokens            → list tokens
 POST   /api/v1/users/tokens            → create token
 DELETE /api/v1/users/tokens/<id>       → revoke token
+
+GET    /api/v1/admin/users                → accounts (status, q, paged) + counts per status (admin)
+POST   /api/v1/admin/users/<id>/approve   → pending/rejected/disabled → approved (admin)
+POST   /api/v1/admin/users/<id>/reject    → pending → rejected, tokens revoked (admin)
+POST   /api/v1/admin/users/<id>/disable   → approved → disabled, tokens revoked (admin)
+POST   /api/v1/admin/users/<id>/role      → {role: user|admin}, approved accounts only (admin)
 
 GET  /api/v1/planting-data             → JSON: filtered data (public, rate-limited)
 GET  /api/v1/planting-data/filters     → JSON: distinct filter values (per-column paged)

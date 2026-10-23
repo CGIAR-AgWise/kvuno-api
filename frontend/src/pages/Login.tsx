@@ -10,17 +10,24 @@ export default function Login() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  // A 403 is a known account that may not sign in yet (awaiting approval,
+  // rejected, disabled) — shown as a notice, not as a failed attempt.
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       await login(username.trim(), password)
       navigate(params.get('next') ?? '/jobs', { replace: true })
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Login failed')
+      const message = err instanceof ApiError ? err.message : 'Login failed'
+      const sentence = message.charAt(0).toUpperCase() + message.slice(1) + '.'
+      if (err instanceof ApiError && err.status === 403) setNotice(sentence)
+      else setError(sentence)
       setBusy(false)
     }
   }
@@ -28,6 +35,12 @@ export default function Login() {
   return (
     <div className="container py-5" style={{ maxWidth: '26rem' }}>
       <h1 className="h4 mb-4 text-center">Sign in to kvuno</h1>
+      {notice && (
+        <div className="alert alert-warning d-flex gap-2" role="status">
+          <i className="bi bi-hourglass-split" aria-hidden="true" />
+          <div>{notice}</div>
+        </div>
+      )}
       {error && <div className="alert alert-danger">{error}</div>}
       <form onSubmit={submit} className="kvuno-card p-4">
         <div className="mb-3">

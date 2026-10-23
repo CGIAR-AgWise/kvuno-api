@@ -191,12 +191,14 @@ def register_apis(app: OpenAPI):
     from app.api.planting_data import protected_api as pd_protected_api
     from app.api.upload import api as upload_api
     from app.api.quality import api as quality_api
+    from app.api.admin import api as admin_api
 
     app.register_api(user_api)
     app.register_api(pd_public_api)
     app.register_api(pd_protected_api)
     app.register_api(upload_api)
     app.register_api(quality_api)
+    app.register_api(admin_api)
 
 
 def create_app():

@@ -340,6 +340,12 @@ Index: `idx_conflict_created_at`.
 | `email` | VARCHAR(255) UNIQUE NOT NULL | Email |
 | `password_hash` | VARCHAR(255) NOT NULL | bcrypt hash |
 | `created_at` | DATETIME | Auto-set on insert |
+| `status` | VARCHAR(20) NOT NULL | `pending` / `approved` / `rejected` / `disabled`. Server default `approved`, which backfilled existing accounts; registration writes `pending` explicitly (`approved` for an `ADMIN_EMAILS` address). Only `approved` accounts (and owners) can sign in or use a token |
+| `role` | VARCHAR(20) NOT NULL | `user` (default) or `admin`. Owners in `ADMIN_EMAILS` are administrators whatever this says |
+| `reviewed_at` | DATETIME | Last status/role change by an administrator (naive UTC) |
+| `reviewed_by` | BIGINT | `users.id` of that administrator (no FK; INTEGER on SQLite) |
+
+Index: `ix_users_status`. Added by migrations `a8c4e2f1d9b3` (`20261023100000_add_user_approval_status.py`: `status`, `reviewed_at`, `reviewed_by`, the index; `batch_alter_table` so it also runs on SQLite) and `e16b8fad5988` (`20261023142312_add_role_column_to_users_table.py`: `role`).
 
 ### `user_tokens`
 
@@ -421,8 +427,10 @@ Indexes: `ix_processing_jobs_run_id`, `ix_processing_jobs_status`, `ix_processin
 | API | `app/api/planting_data.py` | `public_api` (query) + `protected_api` (filters, coordinates, clusters, export) |
 | API | `app/api/upload.py` | `POST /api/v1/data/upload` |
 | API | `app/api/quality.py` | `GET /api/v1/quality/stats`, `/conflicts` — both `@require_auth` |
-| API | `app/api/user.py` | Register (gated by `REGISTRATION_ALLOWED_DOMAINS`; passwords ≤ 72 UTF-8 bytes), login, logout (bearer or `token` cookie), token management |
-| Auth | `app/auth.py` | `require_auth` — Bearer header or `token` cookie |
+| API | `app/api/user.py` | Register (open to any address, new accounts `pending`; passwords ≤ 72 UTF-8 bytes), login (`403` + `status` when not active), `/me`, logout (bearer or `token` cookie), token management; `is_owner` / `is_admin` / `is_active` |
+| API | `app/api/admin.py` | `/api/v1/admin/users` — list with per-status counts, approve / reject / disable (revokes tokens), role; all `@require_admin` |
+| Mail | `app/services/mailer.py` | Optional SMTP (stdlib `smtplib`, daemon thread, never raises): activation, rejection, new-registration notice to `ADMIN_EMAILS`; logs `would send …` when `SMTP_HOST`/`MAIL_FROM` are unset |
+| Auth | `app/auth.py` | `require_auth` — Bearer header or `token` cookie; `require_admin` — `401` unauthenticated, `403` not an administrator |
 | Cache | `app/cache.py` | `@api_cache` (2xx `dict`/`list` bodies only) / `invalidate_planting_data_cache()` (Redis, no-op if unavailable) |
 | Locking | `app/utils/file_lock.py` | `FileLock` — O_EXCL lock file with stale takeover; the per-file `.ingest.lock` |
 | Routes | `app/routes/main.py` | `/` redirect (`SPA_ROOT_URL`), `/health`, the JSON `/ui/*` endpoints, `/ui/process` (Retry), SSE stream |

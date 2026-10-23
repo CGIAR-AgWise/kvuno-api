@@ -102,20 +102,42 @@ TOKEN_TTL_DAYS = int(os.getenv('TOKEN_TTL_DAYS', '0'))
 # Set to 0 for no expiry, or a positive number of days.
 
 
-def registration_allowed_domains() -> frozenset[str]:
-    """Email domains allowed to self-register (REGISTRATION_ALLOWED_DOMAINS).
+# Registration is open to any email address: every new account starts
+# `pending` and can do nothing until an administrator approves it. That
+# approval replaced REGISTRATION_ALLOWED_DOMAINS (an email-domain allow-list),
+# which is no longer read.
 
-    Comma-separated and case-insensitive, e.g. ``cgiar.org,iita.org``. Matching
-    is on the exact domain after the '@' — ``x.cgiar.org`` is NOT covered by
-    ``cgiar.org``; list it explicitly. Empty or unset disables registration
-    entirely: the endpoint used to be open to anyone on the internet, so the
-    safe default is closed. Existing accounts and login are unaffected.
 
+def admin_emails() -> frozenset[str]:
+    """Email addresses with administrator rights (ADMIN_EMAILS, comma-separated).
+
+    These are the "owners": administrators while listed, whatever their `role`
+    column says, approved at sign-up, and impossible to demote or disable from
+    the UI — so the first admin needs no database change and access can always
+    be recovered from configuration. Owners promote other accounts to role
+    'admin' from the Accounts screen.
     Read on each call rather than at import so a deployment (or a test) can
     change it without re-importing the module.
     """
-    raw = os.getenv('REGISTRATION_ALLOWED_DOMAINS', '')
-    return frozenset(d.strip().lower().lstrip('@') for d in raw.split(',') if d.strip())
+    raw = os.getenv('ADMIN_EMAILS', '')
+    return frozenset(e.strip().lower() for e in raw.split(',') if e.strip())
+
+
+# ── Email ──────────────────────────────────────────────────────
+#
+# Optional. With SMTP_HOST unset, nothing is sent: each message is logged
+# instead, so approval works the same without a mail server and the log shows
+# what would have gone out.
+SMTP_HOST = os.getenv('SMTP_HOST', '')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '587'))
+SMTP_USERNAME = os.getenv('SMTP_USERNAME', '')
+SMTP_PASSWORD = os.getenv('SMTP_PASSWORD', '')
+# 'starttls' (port 587), 'ssl' (implicit TLS, port 465) or 'none' (local relay).
+SMTP_SECURITY = os.getenv('SMTP_SECURITY', 'starttls').lower()
+SMTP_TIMEOUT_SECONDS = int(os.getenv('SMTP_TIMEOUT_SECONDS', '15'))
+MAIL_FROM = os.getenv('MAIL_FROM', '')
+# Shown in the From: display name and the message text.
+MAIL_APP_NAME = os.getenv('MAIL_APP_NAME', 'KVuno')
 
 
 # ── Housekeeping / ingestion ───────────────────────────────────
