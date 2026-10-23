@@ -3,14 +3,24 @@ on:
   push:
     branches:
       - main
+
 jobs:
   bump-tag-version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     concurrency:
       cancel-in-progress: true
       group: semver-${{ github.ref }}
+    outputs:
+      tag: ${{ steps.tag_version.outputs.new_tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The tag action reads earlier tags and the commits since them to
+          # choose the bump; a depth-1 clone has neither.
+          fetch-depth: 0
+
       - name: Bump version and push tag
         id: tag_version
         uses: masgeek/github-tag-action@release
@@ -27,3 +37,19 @@ jobs:
           body: ${{ steps.tag_version.outputs.changelog }}
           allowUpdates: true
           makeLatest: true
+
+  # Called directly rather than left to docker-build's `on: push: tags`: a tag
+  # pushed with GITHUB_TOKEN never triggers another workflow, so releases
+  # produced no images at all. docker-build's gate still waits for this
+  # commit's UnitTests run before anything is pushed.
+  build-images:
+    needs: [ bump-tag-version ]
+    if: needs.bump-tag-version.outputs.tag != ''
+    uses: ./.github/workflows/docker-build.yml
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    with:
+      tag: ${{ needs.bump-tag-version.outputs.tag }}
+      sha: ${{ github.sha }}

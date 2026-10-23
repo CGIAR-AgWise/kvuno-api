@@ -1,12 +1,20 @@
 name: Docker Build
 
-# Triggered by UnitTests completing — never on a raw push.
-#   develop -> dev images (api, worker, web), tagged :develop
-#   main    -> prod images (api, worker, web), tagged :latest, :production
-#   tags    -> prod images (api, worker, web), tagged :latest, :<tag>, :production
+# What builds, and when. Every path builds a commit whose UnitTests passed.
 #
-# Because the trigger is workflow_run, images are only ever built from a commit
-# whose UnitTests run succeeded (for branches). Tag pushes run directly.
+#   push to develop -> UnitTests -> dev images    :develop, :sha-<short>
+#   push to main    -> UnitTests -> prod images   :production, :sha-<short>
+#   release tag     -> (gate)    -> prod images   :latest, :<tag>, :sha-<short>
+#
+# Release tags come from version-release.yml, which calls this workflow
+# directly: a tag pushed with GITHUB_TOKEN cannot trigger another workflow, so
+# `on: push: tags` alone never fired for automated releases. Tags pushed by a
+# person still arrive through `push: tags`.
+#
+# Pull-request runs of UnitTests are deliberately ignored. workflow_run
+# executes with this repository's packages:write permission, so building a
+# PR's head — possibly a fork's — would publish untrusted code to GHCR, and it
+# used to push every feature branch as :develop.
 
 on:
   workflow_run:
@@ -14,102 +22,167 @@ on:
     types: [completed]
   push:
     tags: [ '*' ]
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to build (passed by version-release.yml)
+        required: true
+        type: string
+      sha:
+        description: Commit the tag points at
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
-  group: docker-${{ github.event.workflow_run.head_branch || github.ref_name }}
-  cancel-in-progress: true
+  group: docker-${{ inputs.tag || github.event.workflow_run.head_branch || github.ref_name }}
+  # Only develop builds may be superseded. Cancelling a main or release build
+  # part-way would leave :production / :latest pointing at the previous image.
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'develop' }}
 
 jobs:
   determine-profile:
     name: Determine build profile
     runs-on: ubuntu-24.04
+    # Only a successful *push* run of UnitTests. `completed` also fires on
+    # failure, and PR runs are excluded for the reason in the header.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       contains(fromJSON('["develop", "main"]'), github.event.workflow_run.head_branch))
+    permissions:
+      contents: read
+      actions: read
     outputs:
       profile: ${{ steps.profile.outputs.profile }}
       version: ${{ steps.profile.outputs.version }}
       tags: ${{ steps.profile.outputs.tags }}
       sha: ${{ steps.profile.outputs.sha }}
-      ref_type: ${{ steps.profile.outputs.ref_type }}
-      ref_name: ${{ steps.profile.outputs.ref_name }}
+      cache_ref: ${{ steps.profile.outputs.cache_ref }}
     steps:
       - name: Determine build profile
         id: profile
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          CALL_TAG: ${{ inputs.tag }}
+          CALL_SHA: ${{ inputs.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
-          if [[ -n "${{ github.event.workflow_run.head_branch }}" ]]; then
-            REF_TYPE="branch"
-            REF_NAME="${{ github.event.workflow_run.head_branch }}"
-            SHA="${{ github.event.workflow_run.head_sha }}"
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_run" ]; then
+            kind=branch; name="$RUN_BRANCH"; sha="$RUN_SHA"
+          elif [ -n "$CALL_TAG" ]; then
+            kind=tag; name="$CALL_TAG"; sha="$CALL_SHA"
           else
-            REF_TYPE="${{ github.ref_type }}"
-            REF_NAME="${{ github.ref_name }}"
-            SHA="${{ github.sha }}"
+            kind="$REF_TYPE"; name="$REF_NAME"; sha="$SHA"
           fi
+          short="sha-${sha:0:7}"
 
-          if [[ "$REF_TYPE" == "tag" ]] || [[ "$REF_NAME" == "main" ]]; then
-            echo "profile=prod" >> $GITHUB_OUTPUT
-            echo "version=$REF_NAME" >> $GITHUB_OUTPUT
-            if [[ "$REF_TYPE" == "tag" ]]; then
-              echo "tags=latest,${{ github.ref_name }},production" >> $GITHUB_OUTPUT
-            else
-              echo "tags=latest,production" >> $GITHUB_OUTPUT
-            fi
+          if [ "$kind" = "tag" ]; then
+            echo "profile=prod" >> "$GITHUB_OUTPUT"
+            echo "version=$name" >> "$GITHUB_OUTPUT"
+            echo "tags=latest,$name,$short" >> "$GITHUB_OUTPUT"
+            echo "cache_ref=main" >> "$GITHUB_OUTPUT"
+          elif [ "$name" = "main" ]; then
+            echo "profile=prod" >> "$GITHUB_OUTPUT"
+            echo "version=main-${sha:0:7}" >> "$GITHUB_OUTPUT"
+            echo "tags=production,$short" >> "$GITHUB_OUTPUT"
+            echo "cache_ref=main" >> "$GITHUB_OUTPUT"
           else
-            echo "profile=dev" >> $GITHUB_OUTPUT
-            echo "version=${REF_NAME}-dev" >> $GITHUB_OUTPUT
-            echo "tags=develop" >> $GITHUB_OUTPUT
+            # develop, or a manual dispatch from any branch
+            safe="$(echo "$name" | tr '/' '-')"
+            echo "profile=dev" >> "$GITHUB_OUTPUT"
+            echo "version=${safe}-dev" >> "$GITHUB_OUTPUT"
+            if [ "$name" = "develop" ]; then
+              echo "tags=develop,$short" >> "$GITHUB_OUTPUT"
+            else
+              echo "tags=$safe,$short" >> "$GITHUB_OUTPUT"
+            fi
+            echo "cache_ref=$safe" >> "$GITHUB_OUTPUT"
           fi
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "ref_type=$REF_TYPE" >> $GITHUB_OUTPUT
-          echo "ref_name=$REF_NAME" >> $GITHUB_OUTPUT
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Building $kind '$name' at ${sha:0:7}"
+
+  # A tag can point at any commit and a tag push runs no tests of its own, so
+  # it must show the commit already passed UnitTests (from its branch push).
+  # workflow_run builds were gated by the `if` above; dispatches are manual.
+  gate:
+    name: Require passing UnitTests
+    needs: [ determine-profile ]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'push' || github.event_name == 'workflow_call'
+        with:
+          sparse-checkout: .github/actions
+      - id: checks
+        if: github.event_name == 'push' || github.event_name == 'workflow_call'
+        uses: ./.github/actions/wait-for-checks
+        with:
+          workflow: UnitTests
+          sha: ${{ needs.determine-profile.outputs.sha }}
+      - if: steps.checks.outputs.passed == 'false'
+        run: |
+          echo "::error::UnitTests did not pass for this commit (${{ steps.checks.outputs.conclusion }}): ${{ steps.checks.outputs.url }}"
+          exit 1
 
   build-api:
-    needs: [ determine-profile ]
-    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    needs: [ determine-profile, gate ]
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
       name: API (${{ needs.determine-profile.outputs.profile }})
+      # The dev image runs the Flask dev server (run.py) — fine for :develop on
+      # a dev box, never for anything shared. Prod images run gunicorn.
       dockerfile: ${{ needs.determine-profile.outputs.profile == 'dev' && 'docker/Dockerfile' || 'docker/Dockerfile.prod.dockerfile' }}
       image: ghcr.io/cgiar-agwise/kvuno-api
-      profile: ${{ needs.determine-profile.outputs.profile }}
-      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
-      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
-      tags: ghcr.io/cgiar-agwise/kvuno-api:${{ needs.determine-profile.outputs.tags }}
-    
+      tags: ${{ needs.determine-profile.outputs.tags }}
+      cache_ref: ${{ needs.determine-profile.outputs.cache_ref }}
 
   build-worker:
-    needs: [ determine-profile ]
-    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    needs: [ determine-profile, gate ]
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
       name: Worker (${{ needs.determine-profile.outputs.profile }})
       dockerfile: docker/Dockerfile.worker
       image: ghcr.io/cgiar-agwise/kvuno-worker
-      profile: ${{ needs.determine-profile.outputs.profile }}
-      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
-      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
-      tags: ghcr.io/cgiar-agwise/kvuno-worker:${{ needs.determine-profile.outputs.tags }}
-    
+      tags: ${{ needs.determine-profile.outputs.tags }}
+      cache_ref: ${{ needs.determine-profile.outputs.cache_ref }}
 
   build-web:
-    needs: [ determine-profile ]
-    if: needs.determine-profile.outputs.profile == 'dev' || needs.determine-profile.outputs.profile == 'prod'
+    needs: [ determine-profile, gate ]
     uses: ./.github/workflows/docker-build-reusable.yml
+    permissions:
+      contents: read
+      packages: write
     with:
       name: Web (${{ needs.determine-profile.outputs.profile }})
+      # Its own build context: everything it copies lives under frontend/, and
+      # the root .dockerignore is written for the Python images.
+      context: frontend
       dockerfile: frontend/Dockerfile
       image: ghcr.io/cgiar-agwise/kvuno-web
-      profile: ${{ needs.determine-profile.outputs.profile }}
-      ref_type: ${{ needs.determine-profile.outputs.ref_type }}
-      ref_name: ${{ needs.determine-profile.outputs.ref_name }}
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
-      tags: ghcr.io/cgiar-agwise/kvuno-web:${{ needs.determine-profile.outputs.tags }}
-    
+      tags: ${{ needs.determine-profile.outputs.tags }}
+      cache_ref: ${{ needs.determine-profile.outputs.cache_ref }}

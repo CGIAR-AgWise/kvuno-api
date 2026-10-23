@@ -5,6 +5,10 @@ inputs:
   workflow:
     required: true
     description: Workflow name to wait for, e.g. "UnitTests"
+  sha:
+    required: false
+    description: Commit to check; defaults to the triggering commit
+    default: ''
   timeout:
     required: false
     description: Seconds to wait before giving up
@@ -33,7 +37,7 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         GH_REPO: ${{ github.repository }}
-        SHA: ${{ github.sha }}
+        SHA: ${{ inputs.sha || github.sha }}
         WORKFLOW: ${{ inputs.workflow }}
         TIMEOUT: ${{ inputs.timeout }}
         INTERVAL: ${{ inputs.interval }}

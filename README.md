@@ -289,17 +289,13 @@ docker compose up -d api web
 
 Images are published to GitHub Container Registry, not Docker Hub:
 
-| Trigger | Image | Dockerfile | Tags pushed |
-|---|---|---|---|
-| `develop` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile` (dev) | `:latest`, `:develop` |
-| `develop` | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` (Celery) | `:latest`, `:develop` |
-| `main` | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-api` | `docker/Dockerfile.prod.dockerfile` (prod) | `:latest`, `:<tag>`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-worker` | `docker/Dockerfile.worker` | `:latest`, `:<tag>`, `:production` |
-| any tag | `ghcr.io/cgiar-agwise/kvuno-web` | `frontend/Dockerfile` (nginx + React bundle) | `:latest`, `:<tag>`, `:production` |
+| Trigger | Images | Tags pushed |
+|---|---|---|
+| push to `develop`, after `UnitTests` passes | api (dev server), worker, web | `:develop`, `:sha-<short>` |
+| push to `main`, after `UnitTests` passes | api (gunicorn), worker, web | `:production`, `:sha-<short>` |
+| release tag (created by `version-release.yml` on each `main` push) | api (gunicorn), worker, web | `:latest`, `:<tag>`, `:sha-<short>` |
 
-Branch builds live in `docker-build.yml` (triggered by PR Checks); tag builds live in `docker-release.yml` (triggered by `push: tags`). Splitting them keeps each job's condition to a single branch check. **The worker is not built on `main`** — production should deploy the worker from a release tag.
-
+All three images (`ghcr.io/cgiar-agwise/kvuno-api`, `-worker`, `-web`) are built on every path. `:latest` is the latest **release**; `:sha-<short>` is immutable, for rollbacks. Pull requests build every Dockerfile without pushing, so a broken image fails the PR. Details and the rules the pipeline depends on: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#9-container-registry-ghcr).
 CI publishes with the built-in `GITHUB_TOKEN` (`permissions: packages: write`) — no `DOCKER_USERNAME` / `DOCKER_PASSWORD` secrets are needed. To pull on a server, authenticate with a classic PAT that has `read:packages`:
 
 ```bash

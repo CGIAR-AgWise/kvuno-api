@@ -1,25 +1,25 @@
 name: "UnitTests"
 
 on:
-  # Push runs are limited to the refs the image gates wait on: develop/main
-  # pushes (docker-build.yml) and tag pushes (docker-release.yml). A bare
-  # `on: push` would also run the suite on every feature-branch push, which
-  # the matching pull_request run already covers — doubling the CI minutes.
+  # develop/main pushes are required, not optional: docker-build.yml builds
+  # images only from a *successful push run* of this workflow, so with these
+  # off no image was ever built on merge. Feature-branch pushes stay off —
+  # their pull_request run already covers them. No tag trigger: a release
+  # tag points at a main commit that was tested by its push run, which is
+  # what docker-build's gate checks.
   push:
-#    branches: [ main, develop ]
-    tags: [ '*' ]
+    branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: read
-      packages: write
     concurrency:
       group: lint-${{ github.head_ref || github.ref_name }}
       cancel-in-progress: true
@@ -109,7 +109,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ "3.13" ]
+        # 3.14 is what the images run (python:3.14-slim); 3.13 is the floor
+        # pyproject.toml allows.
+        python-version: [ "3.13", "3.14" ]
     concurrency:
       group: test-py${{ matrix.python-version }}-${{ github.head_ref || github.ref_name }}
       cancel-in-progress: true
@@ -172,3 +174,45 @@ jobs:
           name: test-results-py${{ matrix.python-version }}
           path: test-results.xml
           retention-days: 1
+
+  # Build every image without pushing, so a broken Dockerfile, build context
+  # or .dockerignore fails the PR instead of the post-merge build. Pushes
+  # nothing and needs no registry login, so it is safe for fork PRs.
+  docker:
+    name: Docker build (${{ matrix.name }})
+    # PRs only: on develop/main pushes docker-build.yml builds these for real.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            context: .
+            dockerfile: docker/Dockerfile.prod.dockerfile
+          - name: api-dev
+            context: .
+            dockerfile: docker/Dockerfile
+          - name: worker
+            context: .
+            dockerfile: docker/Dockerfile.worker
+          - name: web
+            context: frontend
+            dockerfile: frontend/Dockerfile
+    concurrency:
+      group: docker-check-${{ matrix.name }}-${{ github.head_ref || github.ref_name }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: APP_VERSION=pr-check
+          push: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
