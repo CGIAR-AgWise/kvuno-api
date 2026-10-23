@@ -80,8 +80,7 @@ jobs:
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
       tags: ghcr.io/cgiar-agwise/kvuno-api:${{ needs.determine-profile.outputs.tags }}
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
 
   build-worker:
     needs: [ determine-profile ]
@@ -97,8 +96,7 @@ jobs:
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
       tags: ghcr.io/cgiar-agwise/kvuno-worker:${{ needs.determine-profile.outputs.tags }}
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
 
   build-web:
     needs: [ determine-profile ]
@@ -114,5 +112,4 @@ jobs:
       sha: ${{ needs.determine-profile.outputs.sha }}
       version: ${{ needs.determine-profile.outputs.version }}
       tags: ghcr.io/cgiar-agwise/kvuno-web:${{ needs.determine-profile.outputs.tags }}
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
