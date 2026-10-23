@@ -138,16 +138,16 @@ export default function Jobs() {
         {visible.length === 0 ? (
           <p className="text-muted text-center py-5 mb-0">No matching jobs.</p>
         ) : (
-          <div className="table-responsive">
+          <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">
               <thead className="table-light">
                 <tr>
                   <th>File</th>
                   <th>Status</th>
-                  <th>Rows</th>
-                  <th style={{ minWidth: 140 }}>Progress</th>
+                  <th className="d-none d-md-table-cell">Rows</th>
+                  <th className="d-none d-sm-table-cell" style={{ minWidth: '5rem' }}>Progress</th>
                   <th>Message</th>
-                  <th>Updated</th>
+                  <th className="d-none d-md-table-cell">Updated</th>
                   <th />
                 </tr>
               </thead>
@@ -183,10 +183,10 @@ export default function Jobs() {
                       <td>
                         <span className={'badge rounded-pill text-bg-' + meta.color}>{meta.label}</span>
                       </td>
-                      <td className="text-nowrap small text-muted kvuno-status">
+                      <td className="d-none d-md-table-cell text-nowrap small text-muted kvuno-status">
                         {(job.current ?? 0).toLocaleString()} / {total.toLocaleString()}
                       </td>
-                      <td>
+                      <td className="d-none d-sm-table-cell">
                         <div className="progress" style={{ height: 6 }}>
                           <div
                             className={
@@ -225,7 +225,7 @@ export default function Jobs() {
                           </div>
                         )}
                       </td>
-                      <td className="small text-muted text-nowrap">
+                      <td className="d-none d-md-table-cell small text-muted">
                         {job.mtime ? new Date(job.mtime * 1000).toLocaleString() : '—'}
                       </td>
                       <td onClick={(e) => e.stopPropagation()}>

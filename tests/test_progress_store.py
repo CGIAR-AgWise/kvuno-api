@@ -182,6 +182,61 @@ class TestRuns:
         assert row.finished_at is not None
 
 
+class _FakeRedis:
+    """Just enough of redis-py for the read paths: a ZSET index and hashes."""
+
+    def __init__(self, hashes=None):
+        self.hashes = hashes or {}
+
+    def zrevrange(self, key, start, end):
+        stems = sorted(self.hashes, key=lambda s: float(self.hashes[s]['mtime']), reverse=True)
+        return [s.encode() for s in stems]
+
+    def hgetall(self, key):
+        return self.hashes.get(key[len(ps.KEY_PREFIX):], {})
+
+    def exists(self, key):
+        return 0
+
+    def keys(self, pattern):
+        return []
+
+
+class TestListingMergesRedisAndPostgres:
+    """The Jobs page used to be empty whenever Redis answered but held nothing.
+
+    load_all_jobs returned Redis *instead of* Postgres, so a flushed or
+    restarted Redis — or an API and worker on different Redis DBs — hid every
+    job that was safely recorded in the database.
+    """
+
+    def test_reachable_but_empty_redis_still_lists_db_jobs(self, db, monkeypatch):
+        ps.save_progress('m.parquet', 'completed', 5, 5, 'done')
+        monkeypatch.setattr(ps, '_redis_client', lambda: _FakeRedis())
+
+        assert [j['file'] for j in ps.load_all_jobs()] == ['m.parquet']
+        assert ps.get_job('m.parquet')['status'] == 'completed'
+
+    def test_fresher_redis_state_wins_over_the_db_checkpoint(self, db, monkeypatch):
+        ps.save_progress('n.parquet', 'processing', 10, 100, 'checkpoint')
+        live = {'status': 'processing', 'current': '60', 'total': '100',
+                'message': 'live', 'mtime': str(time.time() + 5), 'started_at': '1'}
+        monkeypatch.setattr(ps, '_redis_client', lambda: _FakeRedis({'n.parquet': live}))
+
+        (job,) = ps.load_all_jobs()
+        assert job['current'] == 60
+
+    def test_one_entry_per_file_even_with_several_runs(self, db):
+        first = ps.start_run('first')
+        second = ps.start_run('retry')
+        ps.save_progress('o.parquet', 'error', 3, 9, 'failed', run_id=first, error='x')
+        ps.save_progress('o.parquet', 'completed', 9, 9, 'done', run_id=second)
+
+        jobs = [j for j in ps.load_all_jobs() if j['file'] == 'o.parquet']
+        assert len(jobs) == 1
+        assert jobs[0]['status'] == 'completed'
+
+
 class TestClipping:
     def test_overlong_message_and_error_are_truncated(self, db):
         """Postgres would raise DataError on an oversized value mid-ingest."""

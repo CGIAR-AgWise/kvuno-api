@@ -8,6 +8,50 @@
 
 body {
   background: var(--kvuno-bg);
+  /* Last-resort guard against a sideways page scrollbar. `clip`, not
+     `hidden`: it creates no scroll container, so position: sticky (the map,
+     table headers) keeps working. Layouts below are built to fit anyway. */
+  overflow-x: clip;
+}
+
+/* Tables fit their container instead of scrolling sideways.
+   Replaces Bootstrap's .table-responsive, which adds a horizontal scrollbar
+   as soon as any cell refuses to shrink. `overflow-wrap: anywhere` (unlike
+   `break-word`) lowers each cell's min-content width, so the auto table
+   layout can always squeeze into the available width; long values such as
+   file names and coordinates wrap instead. Secondary columns are hidden on
+   narrow screens with d-none d-md-table-cell so what remains stays legible. */
+.kvuno-table-fit {
+  width: 100%;
+}
+
+.kvuno-table-fit > .table {
+  width: 100%;
+}
+
+.kvuno-table-fit td {
+  overflow-wrap: anywhere;
+}
+
+/* Headers wrap between words only, and controls never wrap: a header broken
+   mid-word ("Progres s") or a button stacked letter by letter is worse than
+   a slightly wider column. */
+.kvuno-table-fit th {
+  overflow-wrap: normal;
+}
+
+.kvuno-table-fit .btn,
+.kvuno-table-fit .badge {
+  overflow-wrap: normal;
+  white-space: nowrap;
+}
+
+/* Inside a fitted table a file name wraps rather than truncating at a fixed
+   22rem, which on its own was wider than a phone. */
+.kvuno-table-fit .kvuno-truncate {
+  display: inline;
+  max-width: none;
+  white-space: normal;
 }
 
 .kvuno-card {

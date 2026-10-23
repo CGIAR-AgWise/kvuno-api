@@ -127,7 +127,7 @@ export default function Tokens() {
         ) : tokens.length === 0 ? (
           <p className="text-muted text-center py-4 mb-0">No active tokens found.</p>
         ) : (
-          <div className="table-responsive">
+          <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">
               <thead className="table-light">
                 <tr>

@@ -65,6 +65,18 @@ export default function Layout() {
                 </li>
               ))}
             </ul>
+            {/* A plain link, not a router <Link>: Swagger UI is served by the
+                API (flask-openapi3, doc_prefix /api-docs), which nginx and the
+                Vite dev server both proxy — the SPA has no route for it. */}
+            <a
+              className="nav-link text-white-50 me-sm-3 py-2 py-sm-0"
+              href="/api-docs/swagger"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <i className="bi bi-braces me-1" />
+              API docs
+            </a>
             <button
               type="button"
               className="btn btn-outline-light btn-sm"

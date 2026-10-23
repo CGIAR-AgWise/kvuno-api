@@ -449,13 +449,13 @@ export default function Upload() {
                   {record.total_rows !== null ? ', ' + record.total_rows.toLocaleString() + ' rows' : ''}.
                   Map each file column to a database column; lat and lon are required.
                 </p>
-                <div className="table-responsive">
+                <div className="kvuno-table-fit">
                   <table className="table table-sm mb-0">
                     <thead className="table-light">
                       <tr>
                         <th>File column</th>
                         <th>Sample</th>
-                        <th style={{ width: '18rem' }}>Database column</th>
+                        <th style={{ width: '40%' }}>Database column</th>
                       </tr>
                     </thead>
                     <tbody>

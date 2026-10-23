@@ -259,41 +259,69 @@ def _should_write_db(stem: str, status: str, now: float) -> bool:
     return True
 
 
+def _newer(redis_job: dict | None, db_job: dict | None) -> dict | None:
+    """Pick whichever record of the same file was written last."""
+    if redis_job is None or db_job is None:
+        return redis_job or db_job
+    return redis_job if redis_job.get('mtime', 0) >= db_job.get('mtime', 0) else db_job
+
+
+def _redis_jobs(r, limit: int | None) -> dict[str, dict]:
+    _migrate_legacy(r)
+    jobs = {}
+    for stem in r.zrevrange(INDEX_KEY, 0, -1 if limit is None else limit - 1):
+        stem = stem.decode() if isinstance(stem, bytes) else stem
+        h = r.hgetall(f"{KEY_PREFIX}{stem}")
+        if h:
+            jobs[stem] = _to_job(stem, h)
+    return jobs
+
+
 def get_job(stem: str) -> dict | None:
-    """Fetch a single job. Used by the SSE delta path."""
+    """Fetch a single job: the fresher of its Redis and Postgres records."""
+    redis_job = None
     r = _redis_client()
     if r is not None:
         try:
             h = r.hgetall(f"{KEY_PREFIX}{stem}")
-            if h:
-                return mark_stale(_to_job(stem, h))
-            return None
+            redis_job = _to_job(stem, h) if h else None
         except Exception:
             pass
-
-    return _db_get_job(stem)
+    try:
+        db_job = _db_get_job(stem)
+    except Exception:
+        _logger().warning(f"Could not read job {stem} from the database", exc_info=True)
+        db_job = None
+    job = _newer(redis_job, db_job)
+    return mark_stale(job) if job is not None else None
 
 
 def load_all_jobs(limit: int | None = None) -> list[dict]:
-    """All known jobs, most recently updated first."""
+    """All known jobs, most recently updated first.
+
+    Postgres is the base list and Redis is overlaid on it, newest record per
+    file winning. This used to return Redis *instead of* Postgres whenever
+    Redis answered, so a reachable but empty or flushed Redis (a restart, an
+    expired key, an API and worker pointed at different Redis DBs) emptied the
+    Jobs page even though every job was safely in the database.
+    """
+    jobs: dict[str, dict] = {}
+    try:
+        jobs = _db_latest_per_file()
+    except Exception:
+        # Missing table (not migrated) or DB down: Redis alone is still useful.
+        _logger().warning("Could not load jobs from the database", exc_info=True)
+
     r = _redis_client()
     if r is not None:
         try:
-            _migrate_legacy(r)
-            stems = r.zrevrange(INDEX_KEY, 0, -1 if limit is None else limit - 1)
-            jobs = []
-            for stem in stems:
-                stem = stem.decode() if isinstance(stem, bytes) else stem
-                h = r.hgetall(f"{KEY_PREFIX}{stem}")
-                if h:
-                    jobs.append(mark_stale(_to_job(stem, h)))
-            # The index score is mtime, but mark_stale does not change it, so
-            # the ZSET order is already correct.
-            return jobs
+            for stem, redis_job in _redis_jobs(r, limit).items():
+                jobs[stem] = _newer(redis_job, jobs.get(stem))
         except Exception:
             pass
 
-    return [mark_stale(j) for j in _db_load_all()][:limit]
+    ordered = sorted(jobs.values(), key=lambda j: j.get('mtime', 0), reverse=True)
+    return [mark_stale(j) for j in ordered][:limit]
 
 
 def delete_job(stem: str):
@@ -483,6 +511,19 @@ def _db_load_all(limit: int | None = None) -> list[dict]:
         return [_row_to_job(r) for r in query.all()]
 
 
+def _db_latest_per_file() -> dict[str, dict]:
+    """The newest row for each file, keyed by file name.
+
+    processing_jobs keeps one row per (run, file), so a retried file has
+    several. The Jobs list is one entry per file — its run history is what
+    /ui/jobs/runs is for — so only the latest row is listed.
+    """
+    jobs = {}
+    for job in _db_load_all():  # newest first
+        jobs.setdefault(job['file'], job)
+    return jobs
+
+
 def _db_get_job(stem: str) -> dict | None:
     """The latest DB row for one file, or None."""
     from app.models.kvuno import ProcessingJob
@@ -490,7 +531,7 @@ def _db_get_job(stem: str) -> dict | None:
     with _db_session() as session:
         row = (session.query(ProcessingJob).filter_by(file_name=stem)
                .order_by(ProcessingJob.id.desc()).first())
-        return mark_stale(_row_to_job(row)) if row is not None else None
+        return _row_to_job(row) if row is not None else None
 
 
 # ── Runs ───────────────────────────────────────────────────────
