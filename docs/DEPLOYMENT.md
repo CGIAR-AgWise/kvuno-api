@@ -481,6 +481,19 @@ to keep in sync. `app/config.py` falls back to `GITHUB_REF_NAME`, then
 
 ---
 
+### Web container → API (`API_UPSTREAM`)
+
+The `kvuno-web` nginx proxies `/api`, `/ui`, `/api-docs` and `/health` to `API_UPSTREAM`, rendered into its config at start (`frontend/nginx.conf` is a template). Set it to the API **by a name unique on the network**:
+
+| Deployment | `API_UPSTREAM` |
+|---|---|
+| this repo's `docker-compose.yml` | `http://kvuno-api:80` (default) |
+| production stack (`proxy-tool/stacks/kvuno`, API service `kvuno`) | `http://kvuno:80` |
+| UI hosted apart from the API | the API's public URL, e.g. `https://kvuno.akilimo.org` |
+
+⚠️ Never a bare `api`: on `dokploy-network`, which other projects share, it resolved to another project's container — `kvuno-ui.akilimo.org/health` returned someone else's JSON and every `/api`, `/ui` call a 404 page. A public-URL upstream works but goes out through the router and back; if that router replaces `X-Forwarded-For`, the API rate-limits every UI user as one client — prefer the internal name.
+
+Behind Caddy, nginx takes the client address from Caddy's `X-Forwarded-For` (trusted from private ranges only) and forwards just that, so `PROXY_FIX_HOPS=1` is right for both paths: browser → Caddy → API, and browser → Caddy → kvuno-web → API.
 ## 9. Container Registry (GHCR)
 
 Images are published to **GitHub Container Registry**, not Docker Hub:

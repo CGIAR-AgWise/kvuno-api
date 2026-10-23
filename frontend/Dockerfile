@@ -22,10 +22,16 @@ RUN pnpm run build
 
 FROM nginx:1.27-alpine AS runtime
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# A template, not a finished config: the official image's entrypoint renders
+# /etc/nginx/templates/*.template into conf.d/ at start, substituting env vars.
+# The filter limits that to API_* so nginx's own $host, $uri… are untouched.
+ENV API_UPSTREAM=http://kvuno-api:80 \
+    NGINX_ENVSUBST_FILTER=^API_
+COPY nginx.conf /etc/nginx/templates/default.conf.template
 # Not under conf.d/: everything there is included at http level, where these
 # add_header lines would apply to (and be dropped by) every location.
 COPY security-headers.conf /etc/nginx/snippets/security-headers.conf
+COPY api-proxy.conf /etc/nginx/snippets/api-proxy.conf
 COPY --from=build /fe/dist /usr/share/nginx/html
 
 EXPOSE 80

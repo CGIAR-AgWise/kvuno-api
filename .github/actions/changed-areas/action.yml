@@ -103,7 +103,7 @@ runs:
               docker/Dockerfile.prod.dockerfile) add_check api ;;
               docker/Dockerfile) add_check api-dev ;;
               docker/Dockerfile.worker|docker/entrypoint.worker.sh) add_check worker ;;
-              frontend/Dockerfile|frontend/nginx.conf|frontend/security-headers.conf|frontend/package.json|frontend/pnpm-lock.yaml|frontend/pnpm-workspace.yaml) add_check web ;;
+              frontend/Dockerfile|frontend/*.conf|frontend/package.json|frontend/pnpm-lock.yaml|frontend/pnpm-workspace.yaml) add_check web ;;
             esac
           done <<< "$files"
         fi

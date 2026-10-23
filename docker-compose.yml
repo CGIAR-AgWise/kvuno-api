@@ -117,6 +117,13 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     restart: unless-stopped
+    environment:
+      # Where nginx proxies /api, /ui, /api-docs and /health: the api container
+      # by its unique container_name. NOT the bare service name `api`: on
+      # dokploy-network, shared with other projects, `api` resolved to another
+      # project's container. (The production stack in proxy-tool names its API
+      # service `kvuno` and sets API_UPSTREAM=http://kvuno:80.)
+      API_UPSTREAM: ${API_UPSTREAM:-http://kvuno-api:80}
     ports:
       - "127.0.0.1:5001:80"
     # Wait for the API to actually serve, not merely to start: /health only
