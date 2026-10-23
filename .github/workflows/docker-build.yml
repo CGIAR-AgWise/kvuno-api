@@ -1,98 +1,117 @@
-name: Docker Build (branches)
+name: Docker Build
 
-# Branch builds, triggered by UnitTests completing — never on a raw push.
-#
-#   develop -> api (dev server) + worker, tagged :develop
-#   main    -> api (gunicorn production image) ONLY
+# Triggered by UnitTests completing — never on a raw push.
+#   develop -> dev images (api, worker, web), tagged :develop
+#   main    -> prod images (api, worker, web), tagged :latest, :production
+#   tags    -> prod images (api, worker, web), tagged :latest, :<tag>, :production
 #
 # Because the trigger is workflow_run, images are only ever built from a commit
-# whose UnitTests run succeeded. There is no gate job to wait on: the workflow
-# fires after UnitTests has already finished, and each job below re-checks
-# `conclusion == 'success'` before running.
-#
-# ⚠️ In a workflow_run context, `github.ref` / `github.ref_name` / `github.sha`
-# describe the DEFAULT branch, not the branch that ran the checks. Every
-# expression below therefore uses `github.event.workflow_run.*`. Using `github.ref`
-# here silently means the develop jobs never match, and would pass
-# `refs/heads/main` to the tagger and label a develop build `production`.
-# That includes APP_VERSION: `github.ref_name` would report the default branch
-# in /health, so it is only the fallback after `workflow_run.head_branch`.
-#
-# ⚠️ A workflow_run fired from a pull request in a FORK gets a read-only
-# GITHUB_TOKEN, and the push then fails with
-# "denied: permission_denied: read_package". Same-repo branches are unaffected.
-# If you push to develop/main from a fork, that is why nothing publishes.
+# whose UnitTests run succeeded.
 
 on:
   workflow_run:
     workflows: ["UnitTests"]
     types: [completed]
+  workflow_dispatch:
 
 permissions:
-  # Declared once for the whole workflow. Every scope not listed here is set
-  # to `none`.
   contents: read
   packages: write
 
 concurrency:
-  group: kvuno-${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
+  group: docker-${{ github.event.workflow_run.head_branch || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
-  build-api-dev:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'develop'
-    uses: ./.github/workflows/docker-build-reusable.yml
-    with:
-      dockerfile: docker/Dockerfile
-      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
-      image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+  build:
+    if: github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: docker/Dockerfile
+            image: ghcr.io/cgiar-agwise/kvuno-api
+            context: '.'
+            profiles: [dev]
+          - dockerfile: docker/Dockerfile.worker
+            image: ghcr.io/cgiar-agwise/kvuno-worker
+            context: '.'
+            profiles: [dev]
+          - dockerfile: Dockerfile
+            image: ghcr.io/cgiar-agwise/kvuno-web
+            context: './frontend'
+            profiles: [dev]
+          - dockerfile: docker/Dockerfile.prod.dockerfile
+            image: ghcr.io/cgiar-agwise/kvuno-api
+            context: '.'
+            profiles: [prod]
+          - dockerfile: docker/Dockerfile.worker
+            image: ghcr.io/cgiar-agwise/kvuno-worker
+            context: '.'
+            profiles: [prod]
+          - dockerfile: Dockerfile
+            image: ghcr.io/cgiar-agwise/kvuno-web
+            context: './frontend'
+            profiles: [prod]
 
-  build-web-dev:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'develop'
-    uses: ./.github/workflows/docker-build-reusable.yml
-    permissions:
-      contents: read
-      packages: write
-    with:
-      # The SPA is a separate build context: its Dockerfile needs only
-      # frontend/, not the whole repo.
-      context: ./frontend
-      dockerfile: Dockerfile
-      image_name: ghcr.io/cgiar-agwise/kvuno-web
-      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Determine build profile
+        id: profile
+        run: |
+          # In workflow_run context, use event.workflow_run.*; in dispatch, use github.*
+          if [[ -n "${{ github.event.workflow_run.head_branch }}" ]]; then
+            REF_TYPE="branch"
+            REF_NAME="${{ github.event.workflow_run.head_branch }}"
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            REF_TYPE="${{ github.ref_type }}"
+            REF_NAME="${{ github.ref_name }}"
+            SHA="${{ github.sha }}"
+          fi
 
-  build-worker-dev:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'develop'
-    uses: ./.github/workflows/docker-build-reusable.yml
-    with:
-      dockerfile: docker/Dockerfile.worker
-      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}-dev
-      image_name: ghcr.io/cgiar-agwise/kvuno-worker
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            echo "profile=prod" >> $GITHUB_OUTPUT
+            echo "version=$REF_NAME" >> $GITHUB_OUTPUT
+            echo "tags=${{ matrix.image }}:latest,${{ matrix.image }}:$REF_NAME,${{ matrix.image }}:production" >> $GITHUB_OUTPUT
+          elif [[ "$REF_NAME" == "main" ]]; then
+            echo "profile=prod" >> $GITHUB_OUTPUT
+            echo "version=main" >> $GITHUB_OUTPUT
+            echo "tags=${{ matrix.image }}:latest,${{ matrix.image }}:production" >> $GITHUB_OUTPUT
+          else
+            echo "profile=dev" >> $GITHUB_OUTPUT
+            echo "version=${REF_NAME}-dev" >> $GITHUB_OUTPUT
+            echo "tags=${{ matrix.image }}:develop" >> $GITHUB_OUTPUT
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
 
-  build-api-prod:
-    if: >
-      github.event.workflow_run.conclusion == 'success'
-      && github.event.workflow_run.head_branch == 'main'
-    uses: ./.github/workflows/docker-build-reusable.yml
-    with:
-      dockerfile: docker/Dockerfile.prod.dockerfile
-      app_version: ${{ github.event.workflow_run.head_branch || github.ref_name }}
-      image_name: ghcr.io/cgiar-agwise/kvuno-api
-      branch_ref: refs/heads/${{ github.event.workflow_run.head_branch }}
-      branch_name: ${{ github.event.workflow_run.head_branch }}
-      commit_sha: ${{ github.event.workflow_run.head_sha }}
+      - name: Skip if profile mismatch
+        if: ${{ !contains(matrix.profiles, steps.profile.outputs.profile) }}
+        run: echo "Skipping ${{ matrix.image }} for ${{ steps.profile.outputs.profile }} profile" && exit 0
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.profile.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: APP_VERSION=${{ steps.profile.outputs.version }}
+          push: true
+          provenance: true
+          tags: ${{ steps.profile.outputs.tags }}
+          cache-from: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }}
+          cache-to: type=registry,ref=${{ matrix.image }}:cache-${{ steps.profile.outputs.sha }},mode=max
