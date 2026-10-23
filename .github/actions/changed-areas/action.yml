@@ -72,6 +72,14 @@ runs:
                 python=true; frontend=true
                 add_check api; add_check api-dev; add_check worker; add_check web ;;
             esac
+            # A changed build recipe (or this classifier) must rebuild the
+            # images even though no file inside them changed. Without this a
+            # CI-only push skipped every image — including after a pipeline
+            # fix, leaving :develop on the last image the broken pipeline made.
+            case "$f" in
+              .github/workflows/docker-build.yml|.github/workflows/docker-build-reusable.yml|.github/actions/changed-areas/*)
+                image_python=true; image_web=true ;;
+            esac
 
             case "$f" in
               app/*|tests/*|alembic/*|scripts/*|pyproject.toml|poetry.lock|alembic.ini|*.py) python=true ;;

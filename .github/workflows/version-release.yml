@@ -10,6 +10,9 @@ on:
   workflow_run:
     workflows: ["UnitTests"]
     types: [completed]
+    # Only main can release; this stops a skipped run appearing for every
+    # develop and feature-branch test run. The job `if` checks the rest.
+    branches: [ main ]
 
 jobs:
   bump-tag-version:

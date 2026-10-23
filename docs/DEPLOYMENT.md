@@ -511,7 +511,7 @@ Each build gets an immutable `:sha-<short>` tag to roll back to:
 - Only what a change can affect runs. A docs-only PR runs one tiny job; a frontend-only PR never installs Python. A job skipped by its `if` counts as passing for required status checks.
 - Lint, audit and tests share one job and one `poetry install` (they were three jobs with three installs). Tests run on 3.14 only — the runtime.
 - PR Docker builds run only for build-affecting files (Dockerfiles, entrypoints, `pyproject.toml`/`poetry.lock`, `.dockerignore`, nginx config, `package.json`/`pnpm-lock.yaml`), and only for the affected images. App code cannot break a Docker build.
-- `develop` rebuilds only changed images: the push's `before` commit comes from the repository activity API (`workflow_run` does not carry it); if it is not found, everything builds.
+- `develop` rebuilds only changed images: the push's `before` commit comes from the repository activity API (`workflow_run` does not carry it); if it is not found, everything builds. A change to `docker-build.yml`, `docker-build-reusable.yml` or `changed-areas` rebuilds every image — a new build recipe must produce new images even though nothing inside them changed. To force a build at any time, run **Docker Build** from the Actions tab (`workflow_dispatch`), which builds all three.
 - `main` is built **once**, by the release — it used to build on the push and again for the tag. And the release starts from the successful `UnitTests` run, so no runner sits polling for tests.
 - Draft PRs run nothing; a new push to a PR cancels the run it replaces (push runs always finish — builds and releases hang off them). Every job has a `timeout-minutes`.
 

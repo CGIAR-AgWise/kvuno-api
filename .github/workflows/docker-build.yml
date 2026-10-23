@@ -26,6 +26,10 @@ on:
   workflow_run:
     workflows: ["UnitTests"]
     types: [completed]
+    # Filters on the run's head branch, so feature-branch PR runs do not even
+    # create a (skipped) Docker Build run. The job `if` still rejects failed
+    # runs and pull_request runs (a develop -> main PR has head branch develop).
+    branches: [ develop ]
   push:
     tags: [ '*' ]
   workflow_call:
