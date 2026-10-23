@@ -97,7 +97,7 @@ DB_NAME=agwise_api
 ADMIN_EMAILS=you@cgiar.org
 
 # Optional email (activation / rejection / new-registration notices).
-# With SMTP_HOST or MAIL_FROM unset nothing is sent; the API logs "would send …".
+# With SMTP_HOST or MAIL_FROM unset nothing is sent; the API logs "email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses).
 # SMTP_HOST=smtp.example.org
 # SMTP_PORT=587
 # SMTP_SECURITY=starttls        # starttls | ssl | none
@@ -447,7 +447,7 @@ There is no Postgres volume to back up here — the database is external (see §
 | User can sign up but not sign in (`403`, "awaiting approval") | The account is `pending` — every new registration is | An administrator approves it in **Accounts** (`/admin/users`) or with `POST /api/v1/admin/users/<id>/approve`. `rejected`/`disabled` accounts get `403` too and are re-activated the same way |
 | Nobody can approve accounts / no **Accounts** link in the navbar | `ADMIN_EMAILS` unset (and no account holds the admin role), or the admin signed up with a different address | Set `ADMIN_EMAILS` on the `api`, restart, and sign in (or register) with that address. It is read per request and compared case-insensitively |
 | Login/register 500 right after upgrading (`column users.status does not exist`) | Migrations `a8c4e2f1d9b3`/`e16b8fad5988` not applied — compose does not migrate by default | `docker compose exec api python scripts/run_migrations.py`; it backfills existing accounts as `approved` |
-| No approval / activation emails arrive | `SMTP_HOST` or `MAIL_FROM` unset — sending is skipped | Check the API log: `would send '…'` means email is not configured; `Email … failed:` means SMTP rejected it (check `SMTP_SECURITY`/port/credentials). Emails have no links unless `SPA_ROOT_URL` is an absolute `http(s)` URL |
+| No approval / activation emails arrive | `SMTP_HOST` or `MAIL_FROM` unset — sending is skipped | Check the API log: `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses) '…'` means email is not configured; `Email … failed:` means SMTP rejected it (check `SMTP_SECURITY`/port/credentials). Emails have no links unless `SPA_ROOT_URL` is an absolute `http(s)` URL |
 | A user's tokens suddenly return `401` | Their account was disabled or rejected — tokens of an inactive account stop working at once, and disable/reject delete them | Re-activate the account in **Accounts**; the user signs in again for a new token |
 | Worker logs "already being ingested by another worker" | A second copy of the task (double submit, or Redis redelivery after `CELERY_VISIBILITY_TIMEOUT`) found the live `<file>.ingest.lock` | Harmless — the duplicate exits. If it happens on long files, raise `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) above the longest ingest. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (600) is taken over |
 | API restarted but the startup scan did not run | `process_pending()` claims the Redis key `kvuno:process_pending` (`SET NX EX 300`) so only one gunicorn worker enqueues it; a restart within 5 minutes skips it | Wait 5 minutes, or delete the key, or run `python housekeeping.py` |

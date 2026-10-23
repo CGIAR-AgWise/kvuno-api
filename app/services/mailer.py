@@ -33,7 +33,7 @@ def _app_url(path: str) -> str | None:
     return f"{root}{path}"
 
 
-def _deliver(message: EmailMessage) -> bool:
+def _deliver(message: EmailMessage, log_ref: dict) -> bool:
     try:
         if config.SMTP_SECURITY == 'ssl':
             server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT,
@@ -48,23 +48,30 @@ def _deliver(message: EmailMessage) -> bool:
             if config.SMTP_USERNAME:
                 server.login(config.SMTP_USERNAME, config.SMTP_PASSWORD)
             server.send_message(message)
-        logger.info(f"Email sent: {message['Subject']!r} to {message['To']}")
+        logger.info("email sent", **log_ref)
         return True
     except Exception as e:
-        logger.warning(f"Email {message['Subject']!r} to {message['To']} failed: "
-                       f"{e.__class__.__name__}: {e}")
+        # The class and SMTP status code only: an SMTP error's text often
+        # quotes the recipient address, which must not reach the logs.
+        logger.warning("email failed", error=e.__class__.__name__,
+                       smtp_code=getattr(e, 'smtp_code', None), **log_ref)
         return False
 
 
-def send_mail(to: list[str], subject: str, body: str, *, background: bool = True) -> bool:
+def send_mail(to: list[str], subject: str, body: str, *, background: bool = True,
+              log_ref: dict | None = None) -> bool:
     """Send a plain-text email. Returns False when not configured (or, in the
-    foreground, when sending failed)."""
+    foreground, when sending failed).
+
+    Logs identify a message by `log_ref` — ids such as user_id, never email
+    addresses or usernames — plus the subject and the number of recipients.
+    """
     recipients = [addr for addr in to if addr]
     if not recipients:
         return False
+    ref = {'subject': subject, 'recipients': len(recipients), **(log_ref or {})}
     if not config.SMTP_HOST or not config.MAIL_FROM:
-        logger.info(f"Email not configured (SMTP_HOST/MAIL_FROM unset); would send "
-                    f"{subject!r} to {', '.join(recipients)}")
+        logger.info("email not sent: SMTP_HOST/MAIL_FROM unset", **ref)
         return False
 
     message = EmailMessage()
@@ -75,9 +82,9 @@ def send_mail(to: list[str], subject: str, body: str, *, background: bool = True
     message.set_content(body)
 
     if background:
-        threading.Thread(target=_deliver, args=(message,), name='mailer', daemon=True).start()
+        threading.Thread(target=_deliver, args=(message, ref), name='mailer', daemon=True).start()
         return True
-    return _deliver(message)
+    return _deliver(message, ref)
 
 
 # ── Messages ───────────────────────────────────────────────────
@@ -86,7 +93,7 @@ def _sign_off() -> str:
     return f"\n\n— {config.MAIL_APP_NAME}\n(Automated message; replies are not monitored.)"
 
 
-def send_account_activated(email: str, username: str) -> bool:
+def send_account_activated(email: str, username: str, user_id: int | None = None) -> bool:
     """The activation email: the account is approved and can now sign in."""
     login = _app_url('/login')
     body = (
@@ -96,10 +103,12 @@ def send_account_activated(email: str, username: str) -> bool:
         + f"\nUsername: {username}"
         + _sign_off()
     )
-    return send_mail([email], f"Your {config.MAIL_APP_NAME} account is active", body)
+    return send_mail([email], f"Your {config.MAIL_APP_NAME} account is active", body,
+                     log_ref={'kind': 'account_activated', 'user_id': user_id})
 
 
-def send_account_rejected(email: str, username: str, reason: str | None = None) -> bool:
+def send_account_rejected(email: str, username: str, reason: str | None = None,
+                          user_id: int | None = None) -> bool:
     body = (
         f"Hello {username},\n\n"
         f"Your request for a {config.MAIL_APP_NAME} account was not approved."
@@ -107,10 +116,11 @@ def send_account_rejected(email: str, username: str, reason: str | None = None) 
         + "\n\nIf you think this is a mistake, contact the administrator who manages access."
         + _sign_off()
     )
-    return send_mail([email], f"Your {config.MAIL_APP_NAME} account request", body)
+    return send_mail([email], f"Your {config.MAIL_APP_NAME} account request", body,
+                     log_ref={'kind': 'account_rejected', 'user_id': user_id})
 
 
-def send_new_registration(username: str, email: str) -> bool:
+def send_new_registration(username: str, email: str, user_id: int | None = None) -> bool:
     """Tell the administrators someone is waiting for approval."""
     admins = sorted(config.admin_emails())
     review = _app_url('/admin/users')
@@ -120,4 +130,6 @@ def send_new_registration(username: str, email: str) -> bool:
         + (f"\n\nReview it here: {review}" if review else "")
         + _sign_off()
     )
-    return send_mail(admins, f"{config.MAIL_APP_NAME}: new account awaiting approval", body)
+    # Logged as the account it concerns; the recipients are the owners.
+    return send_mail(admins, f"{config.MAIL_APP_NAME}: new account awaiting approval", body,
+                     log_ref={'kind': 'new_registration', 'about_user_id': user_id})

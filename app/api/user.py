@@ -168,7 +168,7 @@ def register(body: RegisterRequest):
         return {"msg": "registration success", "status": user.status}, 201
 
     from app.services.mailer import send_new_registration
-    send_new_registration(user.username, user.email)
+    send_new_registration(user.username, user.email, user_id=user.id)
     return {"msg": "registration received: an administrator must approve your account "
                    "before you can sign in", "status": user.status}, 201
 

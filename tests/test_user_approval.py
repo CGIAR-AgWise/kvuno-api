@@ -5,6 +5,9 @@ so the status checks are exercised end to end rather than through mocks.
 """
 import pytest
 
+# Captured before the fixture replaces it, for the no-PII-in-logs test.
+from app.services.mailer import send_mail as _real_send_mail
+
 ADMIN = 'boss@cgiar.org'
 PASSWORD = 'correct-horse-9'
 
@@ -224,6 +227,51 @@ class TestRoles:
         assert resp.status_code == 422
 
 
+class TestNoPersonalDataInLogs:
+    """Account and email logs identify people by id only (IITA data rules)."""
+
+    def test_register_review_and_email_logs_carry_ids_not_addresses(self, env, monkeypatch, caplog):
+        from app.services import mailer
+        monkeypatch.setattr(mailer, 'send_mail', _real_send_mail)
+        monkeypatch.setattr(mailer.config, 'SMTP_HOST', '')  # logged as "not sent"
+
+        token = _admin_token(env)
+        caplog.clear()
+        with caplog.at_level('INFO'):
+            _register(env.client, 'alice', 'alice@cgiar.org')
+            _register(env.client, 'bob', 'bob@cgiar.org')
+            alice, bob = _user_id(env, 'alice'), _user_id(env, 'bob')
+            env.client.post(f'/api/v1/admin/users/{alice}/approve', headers=_auth(token))
+            env.client.post(f'/api/v1/admin/users/{bob}/reject', json={'reason': 'no'}, headers=_auth(token))
+            env.client.post(f'/api/v1/admin/users/{alice}/role', json={'role': 'admin'}, headers=_auth(token))
+
+        logged = '\n'.join(str(r.msg) for r in caplog.records)
+        for secret in ('alice@cgiar.org', 'bob@cgiar.org', ADMIN, "'alice'", "'bob'", 'boss'):
+            assert secret not in logged, f'{secret} leaked into the logs'
+        # …but each event is still traceable by id.
+        assert f"'user_id': {alice}" in logged
+        assert f"'user_id': {bob}" in logged
+        assert f"'about_user_id': {alice}" in logged
+        assert "'kind': 'account_activated'" in logged
+
+    def test_smtp_failure_logs_the_code_not_the_message(self, monkeypatch, caplog):
+        import smtplib
+        from app.services import mailer
+        monkeypatch.setattr(mailer.config, 'SMTP_HOST', 'smtp.example.org')
+        monkeypatch.setattr(mailer.config, 'MAIL_FROM', 'noreply@example.org')
+
+        def refuse(*args, **kwargs):
+            raise smtplib.SMTPRecipientsRefused({'secret@cgiar.org': (550, b'no such user secret@cgiar.org')})
+        monkeypatch.setattr(mailer.smtplib, 'SMTP', refuse)
+
+        with caplog.at_level('INFO'):
+            assert mailer.send_mail(['secret@cgiar.org'], 'Hi', 'body', background=False,
+                                    log_ref={'user_id': 7}) is False
+        logged = '\n'.join(str(r.msg) for r in caplog.records)
+        assert 'secret@cgiar.org' not in logged
+        assert 'SMTPRecipientsRefused' in logged and "'user_id': 7" in logged
+
+
 class TestMailer:
     # Patch mailer.config, the module object the mailer actually reads: other
     # tests re-import app.config, so `from app import config` here can be a
@@ -238,7 +286,7 @@ class TestMailer:
         monkeypatch.setattr(mailer.config, 'SMTP_HOST', 'smtp.example.org')
         monkeypatch.setattr(mailer.config, 'MAIL_FROM', 'noreply@example.org')
         captured = []
-        monkeypatch.setattr(mailer, '_deliver', lambda msg: captured.append(msg) or True)
+        monkeypatch.setattr(mailer, '_deliver', lambda msg, ref: captured.append(msg) or True)
         assert mailer.send_mail(['a@b.org'], 'Hi', 'body', background=False) is True
         msg = captured[0]
         assert msg['To'] == 'a@b.org'

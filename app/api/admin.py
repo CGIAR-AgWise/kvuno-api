@@ -116,15 +116,16 @@ def _review(user_id: int, action: str):
         # later re-approval from reviving sessions the user forgot about.
         revoked = session.query(UserToken).filter(UserToken.user_id == user.id).delete()
     session.commit()
-    logger.info(f"Account {user.id} ({user.username}) {current} -> {new_status} "
-                f"by {actor.username if actor else '?'}; {revoked} token(s) revoked")
+    # IDs only — no usernames or email addresses in the logs.
+    logger.info("account status changed", user_id=user.id, from_status=current,
+                to_status=new_status, actor_id=actor.id if actor else None, tokens_revoked=revoked)
 
     emailed = False
     if review.notify:
         if new_status == STATUS_APPROVED:
-            emailed = mailer.send_account_activated(user.email, user.username)
+            emailed = mailer.send_account_activated(user.email, user.username, user_id=user.id)
         elif new_status == STATUS_REJECTED:
-            emailed = mailer.send_account_rejected(user.email, user.username, review.reason)
+            emailed = mailer.send_account_rejected(user.email, user.username, review.reason, user_id=user.id)
     return {"user": _to_admin_user(user).model_dump(), "emailed": emailed}, 200
 
 
@@ -185,6 +186,6 @@ def set_role(path: AdminUserPath, body: AdminRoleRequest):
     user.reviewed_at = _utcnow()
     user.reviewed_by = actor.id if actor else None
     session.commit()
-    logger.info(f"Account {user.id} ({user.username}) role {previous} -> {body.role} "
-                f"by {actor.username if actor else '?'}")
+    logger.info("account role changed", user_id=user.id, from_role=previous, to_role=body.role,
+                actor_id=actor.id if actor else None)
     return {"user": _to_admin_user(user).model_dump()}, 200

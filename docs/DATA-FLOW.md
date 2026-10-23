@@ -429,7 +429,7 @@ Indexes: `ix_processing_jobs_run_id`, `ix_processing_jobs_status`, `ix_processin
 | API | `app/api/quality.py` | `GET /api/v1/quality/stats`, `/conflicts` — both `@require_auth` |
 | API | `app/api/user.py` | Register (open to any address, new accounts `pending`; passwords ≤ 72 UTF-8 bytes), login (`403` + `status` when not active), `/me`, logout (bearer or `token` cookie), token management; `is_owner` / `is_admin` / `is_active` |
 | API | `app/api/admin.py` | `/api/v1/admin/users` — list with per-status counts, approve / reject / disable (revokes tokens), role; all `@require_admin` |
-| Mail | `app/services/mailer.py` | Optional SMTP (stdlib `smtplib`, daemon thread, never raises): activation, rejection, new-registration notice to `ADMIN_EMAILS`; logs `would send …` when `SMTP_HOST`/`MAIL_FROM` are unset |
+| Mail | `app/services/mailer.py` | Optional SMTP (stdlib `smtplib`, daemon thread, never raises): activation, rejection, new-registration notice to `ADMIN_EMAILS`; logs `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses)` when `SMTP_HOST`/`MAIL_FROM` are unset |
 | Auth | `app/auth.py` | `require_auth` — Bearer header or `token` cookie; `require_admin` — `401` unauthenticated, `403` not an administrator |
 | Cache | `app/cache.py` | `@api_cache` (2xx `dict`/`list` bodies only) / `invalidate_planting_data_cache()` (Redis, no-op if unavailable) |
 | Locking | `app/utils/file_lock.py` | `FileLock` — O_EXCL lock file with stale takeover; the per-file `.ingest.lock` |

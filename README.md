@@ -465,7 +465,7 @@ To bootstrap the first administrator:
 
 Accounts that existed before migration `a8c4e2f1d9b3` are backfilled `approved`, so the upgrade locks nobody out.
 
-Email is optional. With `SMTP_HOST` and `MAIL_FROM` set, the API sends an activation email on approval (linking `SPA_ROOT_URL` + `/login`), a rejection email with the optional reason, and a new-registration notice to every `ADMIN_EMAILS` address (linking `SPA_ROOT_URL` + `/admin/users`); the reviewer can untick "Email the user about my decision" to skip the user's email. Links are only included when `SPA_ROOT_URL` is an absolute `http(s)` URL. Without SMTP configured nothing is sent and the API log shows `would send …` for each message instead. Sending runs on a background thread and a failure is logged, never raised.
+Email is optional. With `SMTP_HOST` and `MAIL_FROM` set, the API sends an activation email on approval (linking `SPA_ROOT_URL` + `/login`), a rejection email with the optional reason, and a new-registration notice to every `ADMIN_EMAILS` address (linking `SPA_ROOT_URL` + `/admin/users`); the reviewer can untick "Email the user about my decision" to skip the user's email. Links are only included when `SPA_ROOT_URL` is an absolute `http(s)` URL. Without SMTP configured nothing is sent and the API log shows `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses)` for each message instead. Sending runs on a background thread and a failure is logged, never raised.
 
 Error responses never carry exception text: a failing endpoint returns a generic `500` body and logs the exception server-side. Request validation errors (bad query/body parameters, including an unknown `sort_col`/`sort_dir`) are `422`, flask-openapi3's validation status.
 
@@ -592,7 +592,7 @@ Key environment variables (see `.env.example`):
 | `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
 | `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
 | `ADMIN_EMAILS` | Comma-separated owner addresses (case-insensitive, read per request): administrators who cannot be demoted, approved at once on registration, and sent new-registration notices. **Unset means nobody can approve new accounts** (unless an account already holds the admin role) | — | To approve accounts |
-| `SMTP_HOST` | SMTP server; unset → no email is sent (the log shows `would send …`) | — | For email |
+| `SMTP_HOST` | SMTP server; unset → no email is sent (the log shows `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses)`) | — | For email |
 | `SMTP_PORT` | SMTP port | `587` | |
 | `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP login; skipped when the username is empty | — | |
 | `SMTP_SECURITY` | `starttls`, `ssl` (implicit TLS, usually port 465), or `none` (local relay) | `starttls` | |
