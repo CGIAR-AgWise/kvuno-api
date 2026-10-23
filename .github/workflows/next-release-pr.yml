@@ -21,8 +21,6 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           title: 'Next release'
-          reviewer: ${{ github.actor }}
-          assignee: ${{ github.actor }}
           target_branch: main
           label: release
           old_string: "**Write your description here**"
