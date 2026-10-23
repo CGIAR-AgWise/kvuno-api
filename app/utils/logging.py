@@ -100,6 +100,12 @@ def setup_logging(force: bool = False) -> None:
     # werkzeug's dev-server request lines duplicate gunicorn's access log in
     # production and are noise at DEBUG elsewhere; keep them at INFO+ only.
     logging.getLogger('werkzeug').setLevel(max(numeric_level, logging.INFO))
+    # DEBUG_DB=true logs every SQL statement — through this handler, in this
+    # format. It used to set SQLALCHEMY_ECHO, which makes SQLAlchemy attach its
+    # own stdout handler: SQL lines then bypassed LOG_LEVEL and the JSON format.
+    # It is an explicit opt-in, so it shows SQL whatever LOG_LEVEL says.
+    if _env('DEBUG_DB', 'false').lower() == 'true':
+        logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
 
     structlog.configure(
         processors=shared_processors + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],

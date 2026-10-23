@@ -22,10 +22,13 @@ load_dotenv()
 
 from app.__init__ import run_migrations  # noqa: E402
 from app.models.database_conn import MyDb  # noqa: E402
+from app.utils.logging import get_logger  # noqa: E402
+
+logger = get_logger('run_migrations')
 
 
 def main():
-    print("Running database migrations...")
+    logger.info("Running database migrations")
     try:
         # Create a minimal Flask app for DB context
         from flask import Flask
@@ -36,9 +39,9 @@ def main():
 
         with app.app_context():
             run_migrations()
-        print("Migrations complete.")
-    except Exception as e:
-        print(f"Migration failed: {e}", file=sys.stderr)
+        logger.info("Migrations complete")
+    except Exception:
+        logger.exception("Migration failed")
         return 1
     return 0
 

@@ -63,6 +63,12 @@ package-mode = false
 [tool.poetry.group.dev.dependencies]
 sqlacodegen = { allow-prereleases = true }
 
+[tool.ruff.lint]
+# Ruff's defaults plus T20 (flake8-print): no print() anywhere — everything,
+# scripts included, logs through app/utils/logging.py so it shares one format
+# and one LOG_LEVEL. CI runs `ruff check .`, so a stray print fails the build.
+extend-select = ["T20"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

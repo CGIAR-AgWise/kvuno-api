@@ -394,7 +394,7 @@ Gunicorn boots a fresh worker on every `MAX_REQUESTS` recycle and every timeout,
 
 **Worker (`docker/Dockerfile.worker`)**
 - Entrypoint `docker/entrypoint.worker.sh` runs the preflight (`scripts/preflight.py worker`: database + Redis) and never migrates
-- `celery -A app.celery_app worker --loglevel=info --concurrency=1`
+- `celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --concurrency=1`
 - `restart: unless-stopped`; compose healthcheck `celery inspect ping` against its own node
 - `task_acks_late` + `task_reject_on_worker_lost=True`: a worker killed mid-ingest (OOM, container stop) puts the task back on the queue, and the retry resumes from the stored offset. Redis redelivers any unacked task after `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) **even if it is still running**, so set it above the longest single-file ingest; the per-file `.ingest.lock` stops a redelivered copy from ingesting concurrently, but the copy is wasted work
 - Celery's own SIGTERM handling (warm shutdown) is untouched — the housekeeper's graceful-shutdown handlers are installed only by `python housekeeping.py`

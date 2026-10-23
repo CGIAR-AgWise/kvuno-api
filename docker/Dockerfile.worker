@@ -33,4 +33,7 @@ USER app
 # A worker without a broker would otherwise idle forever instead of failing.
 ENTRYPOINT ["/app/docker/entrypoint.worker.sh"]
 
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+# Shell form only to read LOG_LEVEL — the one level for every process, no
+# Celery-specific setting. `exec` keeps celery as PID 1's direct child so
+# signals (SIGTERM on stop) still reach it.
+CMD ["sh", "-c", "exec celery -A app.celery_app worker --loglevel=\"${LOG_LEVEL:-INFO}\" --concurrency=1"]

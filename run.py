@@ -52,23 +52,23 @@ def main():
     # hard-fails there, so a deployed container still refuses to start.
     debug = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
 
+    from app.utils.logging import get_logger
     from app.utils.preflight import run_preflight
 
+    logger = get_logger('run')
     if run_preflight("api") != 0:
         if debug:
-            print(
+            logger.warning(
                 "[preflight] Required dependencies are unreachable, but "
                 "FLASK_DEBUG is on so the dev server is starting anyway. "
                 "Requests that touch the database will fail until it is "
-                "available.",
-                file=sys.stderr,
+                "available."
             )
         else:
-            print(
+            logger.error(
                 "Refusing to start: required dependencies are unreachable. "
                 "See the [preflight] lines above. Set PREFLIGHT_ENABLED=false "
-                "to bypass.",
-                file=sys.stderr,
+                "to bypass."
             )
             sys.exit(1)
 

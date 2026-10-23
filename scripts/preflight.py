@@ -25,18 +25,18 @@ if _project_root not in sys.path:
 
 load_dotenv()
 
+from app.utils.logging import get_logger  # noqa: E402
 from app.utils.preflight import run_preflight  # noqa: E402
+
+logger = get_logger('preflight')
 
 
 def main() -> int:
     role = sys.argv[1] if len(sys.argv) > 1 else "api"
     code = run_preflight(role)
     if code != 0:
-        print(
-            f"Startup check failed for {role} — required dependencies are "
-            "unreachable. See the [preflight] log lines above.",
-            file=sys.stderr,
-        )
+        logger.error(f"Startup check failed for {role} — required dependencies are "
+                     "unreachable. See the [preflight] log lines above.", role=role)
     return code
 
 

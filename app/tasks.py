@@ -11,11 +11,13 @@ _worker_app = None
 def _get_worker_app():
     global _worker_app
     if _worker_app is None:
-        import os
         from flask import Flask
         app = Flask(__name__)
         app.config['SQLALCHEMY_DATABASE_URI'] = build_db_url()
-        app.config['SQLALCHEMY_ECHO'] = os.getenv('DEBUG_DB', 'false').lower() == 'true'
+        # DEBUG_DB is handled by app/utils/logging.py (through the shared
+        # handler); echo would add SQLAlchemy's own stdout handler and bypass
+        # LOG_LEVEL.
+        app.config['SQLALCHEMY_ECHO'] = False
         from app.models.database_conn import MyDb
         MyDb.init_app(app)
         _worker_app = app

@@ -356,10 +356,10 @@ Redis is **not** a compose service; run it externally and point `CELERY_BROKER_U
 docker run -d --name kvuno-redis -p 6379:6379 redis:7
 
 # Start the Celery worker (Native — Linux)
-celery -A app.celery_app worker --loglevel=info
+celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}"
 
 # Start the Celery worker (Native — Windows, use solo pool)
-celery -A app.celery_app worker --loglevel=info --pool solo
+celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --pool solo
 
 # Start the Celery worker (Docker)
 docker compose up --build -d worker
