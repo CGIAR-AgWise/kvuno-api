@@ -174,10 +174,24 @@ export default function Layout() {
       </a>
 
       <aside ref={sidebarRef} id="kv-sidebar" className={'kv-sidebar' + (drawerOpen ? ' is-open' : '')} aria-label="Main">
-        <NavLink to="/jobs" className="kv-brand" title="KVuno">
-          <span className="kv-mark" aria-hidden="true" />
-          <span className="kv-label">KVuno</span>
-        </NavLink>
+        {/* The collapse toggle sits with the wordmark: it acts on the
+            sidebar itself, and alone at the bottom it looked stranded. */}
+        <div className="kv-brand-row">
+          <NavLink to="/jobs" className="kv-brand" title="KVuno">
+            <span className="kv-mark" aria-hidden="true" />
+            <span className="kv-label">KVuno</span>
+          </NavLink>
+          <button
+            type="button"
+            className="kv-collapse"
+            onClick={toggleCollapsed}
+            aria-pressed={collapsed}
+            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            <i className={'bi ' + (collapsed ? 'bi-chevron-bar-right' : 'bi-chevron-bar-left')} aria-hidden="true" />
+          </button>
+        </div>
 
         <nav className="kv-nav">
           {groups.map((group) => (
@@ -222,30 +236,22 @@ export default function Layout() {
 
           {me && (
             <div className="kv-user kv-label" title={me.email}>
-              Signed in as <strong>{me.username}</strong>
-              {isAdmin && <span className="text-muted"> (admin)</span>}
+              <span className="kv-user-name">{me.username}</span>
+              <span className="kv-user-role">{isAdmin ? 'Administrator' : 'Signed in'}</span>
             </div>
           )}
 
+          {/* A real button, not another faint nav row: signing out should be
+              easy to find. Icon-only (with its label for screen readers) when
+              the sidebar is collapsed. */}
           <button
             type="button"
-            className="kv-nav-link"
+            className="kv-signout"
             onClick={() => void signOut()}
             title={collapsed ? 'Sign out' : undefined}
           >
-            <i className="bi bi-box-arrow-left" aria-hidden="true" />
+            <i className="bi bi-box-arrow-right" aria-hidden="true" />
             <span className="kv-label">Sign out</span>
-          </button>
-
-          <button
-            type="button"
-            className="kv-collapse"
-            onClick={toggleCollapsed}
-            aria-pressed={collapsed}
-            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            <i className={'bi ' + (collapsed ? 'bi-chevron-double-right' : 'bi-chevron-double-left')} />
           </button>
         </div>
       </aside>

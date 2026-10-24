@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { ApiError, fetchAdminUsers, reviewUser, setUserRole } from '../api'
 import type { AccountStatus, AdminUser, AdminUserList, ReviewAction, Role } from '../api'
 import Pagination from '../components/Pagination'
+import StatusBadge from '../components/StatusBadge'
+import type { Tone } from '../components/StatusBadge'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 
@@ -29,11 +31,11 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'all', label: 'All' },
 ]
 
-const STATUS_BADGE: Record<AccountStatus, string> = {
-  pending: 'text-bg-warning',
-  approved: 'text-bg-success',
-  rejected: 'text-bg-danger',
-  disabled: 'text-bg-secondary',
+const STATUS_TONE: Record<AccountStatus, { tone: Tone; label: string; icon?: string }> = {
+  pending: { tone: 'warning', label: 'Pending', icon: 'bi-hourglass-split' },
+  approved: { tone: 'success', label: 'Approved' },
+  rejected: { tone: 'danger', label: 'Rejected' },
+  disabled: { tone: 'neutral', label: 'Disabled', icon: 'bi-slash-circle' },
 }
 
 const EMPTY: Record<Tab, string> = {
@@ -261,7 +263,7 @@ export default function AdminUsers() {
                             </span>
                           ) : (
                             user.role === 'admin' && (
-                              <span className="badge text-bg-primary ms-2 align-text-top">Admin</span>
+                              <span className="badge text-bg-secondary ms-2 align-text-top">Admin</span>
                             )
                           )}
                           {user.id === me?.id && <span className="small text-muted ms-1">(you)</span>}
@@ -272,9 +274,7 @@ export default function AdminUsers() {
                         {fmtDate(user.created_at)}
                       </td>
                       <td>
-                        <span className={'badge text-capitalize ' + STATUS_BADGE[user.status]}>
-                          {user.status}
-                        </span>
+                        <StatusBadge {...STATUS_TONE[user.status]} />
                       </td>
                       <td className="d-none d-lg-table-cell small text-muted">
                         {fmtDate(user.reviewed_at)}

@@ -296,37 +296,87 @@ body {
 }
 
 .kv-user {
-  padding: 0.4rem 0.6rem;
-  font-size: 0.8125rem;
-  color: rgba(255, 255, 255, 0.55);
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0.6rem 0.4rem;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.kv-user-name {
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.kv-user strong {
+.kv-user-role {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.75rem;
+}
+
+/* Sign out: an outlined button, plainly visible on the slate. */
+.kv-signout {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 0.375rem;
+  background: transparent;
   color: #fff;
+  font-size: 0.875rem;
   font-weight: 600;
 }
 
-.kv-user .text-muted {
-  color: rgba(255, 255, 255, 0.55) !important;
+.kv-signout:hover {
+  background: #fff;
+  border-color: #fff;
+  color: var(--kv-slate);
+}
+
+.kv-signout:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* Wordmark row: the collapse toggle sits at its right. */
+.kv-brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.kv-brand-row .kv-brand {
+  padding-bottom: 0.2rem;
+  min-width: 0;
 }
 
 .kv-collapse {
   display: none;
-  width: 100%;
-  margin-top: 0.25rem;
-  padding: 0.3rem;
-  border: 0;
+  flex: none;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.25);
   border-radius: 0.375rem;
   background: transparent;
-  color: rgba(255, 255, 255, 0.5);
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 1rem;
 }
 
 .kv-collapse:hover {
-  color: #fff;
-  background: rgba(255, 255, 255, 0.07);
+  color: var(--kv-slate);
+  background: #fff;
+  border-color: #fff;
 }
 
 .kv-main {
@@ -393,7 +443,18 @@ body {
 /* Desktop: the sidebar can be narrowed to icons. */
 @media (min-width: 992px) {
   .kv-collapse {
-    display: block;
+    display: grid;
+  }
+
+  /* Collapsed: the mark, and the toggle under it. */
+  .kv-shell.is-collapsed .kv-brand-row {
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .kv-shell.is-collapsed .kv-signout {
+    padding-left: 0;
+    padding-right: 0;
   }
 
   .kv-shell.is-collapsed .kv-sidebar {
@@ -609,6 +670,62 @@ body {
   font-variant-numeric: tabular-nums;
   opacity: 0.7;
 }
+
+/* Status badges (StatusBadge.tsx): a distinct hue and icon per tone, tinted
+   background, strong text. None uses the brand red — Processing used to
+   render red like Failed because Bootstrap's "primary" became AKILIMO red. */
+.kv-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.12rem 0.55rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.kv-status .bi {
+  font-size: 0.8em;
+}
+
+.kv-status-info {
+  color: #1d4ed8;
+  background: #eaf1ff;
+  border-color: #bcd0fb;
+}
+
+.kv-status-success {
+  color: #146c2e;
+  background: #e7f6ec;
+  border-color: #b5dfc3;
+}
+
+.kv-status-danger {
+  color: #b42318;
+  background: #fdecea;
+  border-color: #f4c0ba;
+}
+
+.kv-status-warning {
+  color: #8a4b00;
+  background: #fff4dc;
+  border-color: #f2d08a;
+}
+
+.kv-status-neutral {
+  color: #4b5563;
+  background: #f1f3f5;
+  border-color: #d6dae0;
+}
+
+/* Per-status counts in run summaries, in the badge colours. */
+.kv-count-info { color: #1d4ed8; }
+.kv-count-success { color: #146c2e; }
+.kv-count-danger { color: #b42318; }
+.kv-count-warning { color: #8a4b00; }
 
 /* Connection state of a live list: a dot and a word. */
 .kv-live {

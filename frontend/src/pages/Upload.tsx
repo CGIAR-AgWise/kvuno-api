@@ -13,6 +13,8 @@ import {
 } from '../api'
 import type { UploadRecord } from '../api'
 import { useToast } from '../context/ToastContext'
+import StatusBadge from '../components/StatusBadge'
+import type { Tone } from '../components/StatusBadge'
 
 /**
  * Upload page — tus resumable uploads, server-side inspection, column mapping.
@@ -79,22 +81,22 @@ function formatBytes(bytes: number): string {
   return (bytes / 1024 / 1024).toFixed(1) + ' MB'
 }
 
-function statusBadge(item: Item): { label: string; tone: string } {
+function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
   switch (item.status) {
     case 'sending':
-      return { label: 'Uploading', tone: 'primary' }
+      return { label: 'Uploading', tone: 'info' }
     case 'paused':
       return { label: 'Incomplete', tone: 'warning' }
     case 'receiving':
     case 'received':
     case 'inspecting':
-      return { label: 'Reading file…', tone: 'info' }
+      return { label: 'Reading file…', tone: 'info', icon: 'bi-hourglass-split' }
     case 'ready':
       return { label: 'Ready to map', tone: 'success' }
     case 'failed':
       return { label: 'Failed', tone: 'danger' }
     case 'submitted':
-      return { label: 'Submitted', tone: 'secondary' }
+      return { label: 'Submitted', tone: 'neutral', icon: 'bi-send-check' }
   }
 }
 
@@ -378,7 +380,7 @@ export default function Upload() {
                 {item.name}
               </h2>
               <div className="d-flex align-items-center gap-2 flex-shrink-0">
-                <span className={'badge text-bg-' + badge.tone}>{badge.label}</span>
+                <StatusBadge tone={badge.tone} label={badge.label} icon={badge.icon} />
                 {item.status !== 'submitted' && (
                   <button
                     className="btn btn-sm btn-outline-secondary"

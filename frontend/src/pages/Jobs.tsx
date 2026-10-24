@@ -7,20 +7,22 @@ import { STATUSES, useJobStream } from '../hooks/useJobStream'
 import type { StatusFilter } from '../hooks/useJobStream'
 import { useToast } from '../context/ToastContext'
 import RunPanel from '../components/RunPanel'
+import StatusBadge, { TONE_BAR } from '../components/StatusBadge'
+import type { Tone } from '../components/StatusBadge'
 
 interface StatusMeta {
-  color: string
+  tone: Tone
   bar: string
   label: string
 }
 
 const STATUS: Record<string, StatusMeta> = {
-  processing: { color: 'primary', bar: '#0d6efd', label: 'Processing' },
-  completed: { color: 'success', bar: '#198754', label: 'Completed' },
-  error: { color: 'danger', bar: '#dc3545', label: 'Failed' },
+  processing: { tone: 'info', bar: TONE_BAR.info, label: 'Processing' },
+  completed: { tone: 'success', bar: TONE_BAR.success, label: 'Completed' },
+  error: { tone: 'danger', bar: TONE_BAR.danger, label: 'Failed' },
   // Worker stopped reporting (crash, OOM kill, restart). Not running.
-  stale: { color: 'warning', bar: '#fd7e14', label: 'Stalled' },
-  unknown: { color: 'secondary', bar: '#6c757d', label: 'Pending' },
+  stale: { tone: 'warning', bar: TONE_BAR.warning, label: 'Stalled' },
+  unknown: { tone: 'neutral', bar: TONE_BAR.neutral, label: 'Pending' },
 }
 
 const statusMeta = (status?: string): StatusMeta => (status && STATUS[status]) || STATUS.unknown
@@ -192,7 +194,7 @@ export default function Jobs() {
                         </span>
                       </td>
                       <td>
-                        <span className={'badge rounded-pill text-bg-' + meta.color}>{meta.label}</span>
+                        <StatusBadge tone={meta.tone} label={meta.label} />
                       </td>
                       <td className="d-none d-md-table-cell text-nowrap small text-muted kvuno-status">
                         {(job.current ?? 0).toLocaleString()} / {total.toLocaleString()}
@@ -244,7 +246,7 @@ export default function Jobs() {
                           <button
                             className={
                               'btn btn-outline-' +
-                              (job.status === 'stale' ? 'warning' : 'danger') +
+                              (job.status === 'stale' ? 'secondary' : 'danger') +
                               ' btn-sm'
                             }
                             disabled={retrying === job.file}
@@ -349,7 +351,7 @@ function JobDetail({
               <dl className="row mb-0">
                 <dt className="col-sm-4">Status</dt>
                 <dd className="col-sm-8">
-                  <span className={'badge rounded-pill text-bg-' + meta.color}>{meta.label}</span>
+                  <StatusBadge tone={meta.tone} label={meta.label} />
                 </dd>
                 <dt className="col-sm-4">Rows processed</dt>
                 <dd className="col-sm-8">
@@ -388,7 +390,7 @@ function JobDetail({
                 <button
                   type="button"
                   className={
-                    'btn btn-sm btn-outline-' + (shown.status === 'stale' ? 'warning' : 'danger')
+                    'btn btn-sm btn-outline-' + (shown.status === 'stale' ? 'secondary' : 'danger')
                   }
                   disabled={busy}
                   onClick={async () => {

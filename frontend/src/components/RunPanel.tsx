@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { fetchRuns } from '../api'
 import type { Run } from '../api'
+import StatusBadge, { TONE_BAR } from './StatusBadge'
+import type { Tone } from './StatusBadge'
 
 /**
  * Recent ingestion runs, newest first.
@@ -13,13 +15,13 @@ import type { Run } from '../api'
  * Polls rather than streaming: runs settle on a timescale of seconds to
  * minutes, and the jobs table beside it is already the live view.
  */
-const RUN_STATUS: Record<Run['status'], { label: string; variant: string }> = {
-  pending: { label: 'Queued', variant: 'text-bg-secondary' },
-  running: { label: 'Running', variant: 'text-bg-primary' },
-  completed: { label: 'Completed', variant: 'text-bg-success' },
-  error: { label: 'Failed', variant: 'text-bg-danger' },
-  partial: { label: 'Partial', variant: 'text-bg-warning' },
-  stale: { label: 'Stalled', variant: 'text-bg-warning' },
+const RUN_STATUS: Record<Run['status'], { label: string; tone: Tone; icon?: string }> = {
+  pending: { label: 'Queued', tone: 'neutral' },
+  running: { label: 'Running', tone: 'info' },
+  completed: { label: 'Completed', tone: 'success' },
+  error: { label: 'Failed', tone: 'danger' },
+  partial: { label: 'Partial', tone: 'warning', icon: 'bi-exclamation-circle-fill' },
+  stale: { label: 'Stalled', tone: 'warning' },
 }
 
 function when(seconds: number): string {
@@ -78,7 +80,7 @@ export default function RunPanel({ pollMs = 5000 }: { pollMs?: number }) {
                   {run.initiated_by ? ` · ${run.initiated_by}` : ''}
                 </div>
               </div>
-              <span className={`badge ${meta.variant} text-nowrap`}>{meta.label}</span>
+              <StatusBadge tone={meta.tone} label={meta.label} icon={meta.icon} />
             </div>
 
             <div className="d-flex gap-2 align-items-center mt-2">
@@ -92,7 +94,7 @@ export default function RunPanel({ pollMs = 5000 }: { pollMs?: number }) {
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={pct}
-                  style={{ width: `${pct}%` }}
+                  style={{ width: `${pct}%`, backgroundColor: TONE_BAR[meta.tone] }}
                 />
               </div>
               <span className="text-muted small text-nowrap kvuno-status">
@@ -103,16 +105,16 @@ export default function RunPanel({ pollMs = 5000 }: { pollMs?: number }) {
             <div className="d-flex gap-2 flex-wrap mt-1" style={{ fontSize: '.75rem' }}>
               <span className="text-muted">{run.counts.total} file(s)</span>
               {run.counts.completed > 0 && (
-                <span className="text-success">{run.counts.completed} done</span>
+                <span className="kv-count-success">{run.counts.completed} done</span>
               )}
               {run.counts.processing > 0 && (
-                <span className="text-primary">{run.counts.processing} running</span>
+                <span className="kv-count-info">{run.counts.processing} running</span>
               )}
               {run.counts.error > 0 && (
-                <span className="text-danger">{run.counts.error} failed</span>
+                <span className="kv-count-danger">{run.counts.error} failed</span>
               )}
               {run.counts.stale > 0 && (
-                <span className="text-warning">{run.counts.stale} stalled</span>
+                <span className="kv-count-warning">{run.counts.stale} stalled</span>
               )}
             </div>
           </div>
