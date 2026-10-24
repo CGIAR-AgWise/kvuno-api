@@ -5,6 +5,7 @@ import time
 from watchdog.events import FileSystemEventHandler
 
 from app.services.housekeeper import logger, process_file
+from app.utils.rds_to_parquet import convert_for_ingestion
 
 
 class RDSFileHandler(FileSystemEventHandler):
@@ -12,6 +13,9 @@ class RDSFileHandler(FileSystemEventHandler):
 
     Fires on both *created* and *modified* events with a per-file
     cooldown to avoid duplicate processing.
+
+    RDS files are converted to Parquet before processing for efficient
+    streaming ingestion.
     """
 
     def __init__(self, batch_size=1000, chunk_size=10000,
@@ -34,8 +38,10 @@ class RDSFileHandler(FileSystemEventHandler):
 
         time.sleep(1)
         try:
+            # Convert RDS to Parquet if needed (returns original path for Parquet)
+            parquet_path = convert_for_ingestion(path)
             process_file(
-                path,
+                parquet_path,
                 batch_size=self.batch_size,
                 chunk_size=self.chunk_size,
                 checkpoint_interval=self.checkpoint_interval,
