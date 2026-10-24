@@ -9,7 +9,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **RDS File Ingestion** — Reads `.RDS` files using `pyreadr`, processes data in chunks with batch inserts
 - **Resumable Uploads** — The SPA uploads over the [tus](https://tus.io) protocol; an interrupted upload resumes from the last byte, and the file is inspected (RDS → Parquet, preview, checksum, suggested column mapping) in the background
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
-- **Background Processing** — Celery + Redis worker for async file ingestion; separately deployable
+- **Background Processing** — SPA uploads and a data-folder scan are processed on background threads in the API (no Redis needed); a Celery + Redis worker is optional and separately deployable
 - **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering in metres (geography cast)
@@ -18,7 +18,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
-- **React Frontend** — Standalone Vite + React 18 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx
+- **React Frontend** — Standalone Vite + React 19 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx, in AKILIMO's colours
 - **Login & Registration UI** — SPA routes `/login` and `/register`; anyone can register, but a new account is **pending** until an administrator approves it
 - **Account Approval** — Administrators (`ADMIN_EMAILS`, or accounts given the admin role) approve, reject, disable, and promote accounts at the SPA route `/admin/users`; optional SMTP email tells users and admins what happened
 - **Token Management** — List and revoke tokens at the SPA route `/tokens`
@@ -39,7 +39,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | Background Tasks | Celery + Redis (Kombu transport) |
 | Logging | structlog (JSON in production, console in development) |
 | Serving | Waitress (dev) / Gunicorn (prod) |
-| Frontend | React 18 + TypeScript, Vite 6, pnpm, react-router 6; served by nginx |
+| Frontend | React 19 + TypeScript, Vite 8, pnpm, react-router 6, Bootstrap 5 (CSS only); served by nginx |
 | Containerization | Docker + docker-compose |
 | CI/CD | GitHub Actions |
 
@@ -95,7 +95,7 @@ kvuno/
 │   │   ├── App.tsx           # Client-side routes (lazy-loaded, code-split)
 │   │   ├── api.ts            # Typed fetch client for /api and /ui
 │   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens, AdminUsers
-│   │   ├── components/       # Layout, Pagination
+│   │   ├── components/       # Layout (sidebar), AuthShell, StatusBadge, Pagination, RunPanel
 │   │   ├── context/          # AuthContext, ToastContext
 │   │   └── hooks/            # useJobStream (SSE)
 │   ├── Dockerfile            # node build stage → nginx runtime
@@ -105,7 +105,9 @@ kvuno/
 ├── alembic/                  # Database migration scripts
 │   └── versions/             # Migration versions
 ├── scripts/
-│   └── run_migrations.py     # Standalone migration runner (deploy step)
+│   ├── run_migrations.py     # Standalone migration runner (deploy step)
+│   ├── preflight.py          # Startup dependency check (container entrypoints)
+│   └── gen_config_docs.py    # Generates .env.example + the Configuration tables
 │
 ├── logs/                     # Log output directory
 ├── static/data/              # RDS data files for ingestion (HOUSEKEEPING_DATA_DIR)
@@ -116,10 +118,11 @@ kvuno/
 │   ├── Dockerfile.base           # Shared builder base: Python 3.14 + pinned Poetry
 │   ├── Dockerfile                # Dev API image (python3 run.py)
 │   ├── Dockerfile.prod.dockerfile# Production API image (Gunicorn)
-│   ├── Dockerfile.worker         # Celery worker Docker image
-│   └── entrypoint.sh             # Migrations, then exec the image CMD
+│   ├── Dockerfile.worker         # Worker image: Celery, or housekeeping via HOUSEKEEPING_MODE
+│   ├── entrypoint.sh             # Preflight + migrations, then exec the image CMD
+│   └── entrypoint.worker.sh      # Preflight, then Celery or housekeeping.py
 ├── dev_worker.py             # Dev Celery worker launcher (auto solo pool on Windows)
-├── housekeeping.py           # Thin CLI wrapper over app/services/housekeeper.py
+├── housekeeping.py           # Typer CLI over housekeeper.run() (scan, watch, dry run)
 ├── model-generator.py        # ORM model code generator
 ├── pyproject.toml            # Project metadata and dependencies
 ├── run.py                    # Dev server entry point
@@ -178,7 +181,7 @@ alembic revision --autogenerate -m "description"
 ### Running the Application (Development)
 
 ```bash
-# API server only (no background processing)
+# API server — also processes SPA uploads and scans the data folder in-process
 python run.py            # or: poetry run dev
 ```
 
@@ -191,9 +194,7 @@ The API will be available at `http://localhost:5000` (host) and the Swagger UI a
 
 The API container serves **no HTML** — the pages live in the `frontend/` SPA. Start the Vite dev server alongside it (see [Frontend Architecture](#frontend-architecture)); the Flask container still owns the JSON endpoints the SPA calls.
 
-Set `HOUSEKEEPING_ENABLED=false` (default) to skip the 2-second probe for a Celery worker.
-
-Set `HOUSEKEEPING_ENABLED=true` to enqueue file-uploads to the Celery worker automatically.
+The API processes files itself, on background threads: files submitted from the Upload page, and a scan of the data folder (`HOUSEKEEPING_DATA_DIR`) at startup. Neither needs Redis or Celery. `HOUSEKEEPING_ENABLED=true` additionally hands `POST /api/v1/data/upload` files and Jobs-page retries of plain data-folder files to the Celery worker. See [How files get processed](#how-files-get-processed).
 
 ### Startup checks (preflight)
 
@@ -202,9 +203,10 @@ Before doing any work, both the API and the worker verify their dependencies and
 | Dependency | API | Worker |
 |---|---|---|
 | Database | always required | always required |
-| Redis | required only when `HOUSEKEEPING_ENABLED=true` | always required |
+| Redis | required only when `HOUSEKEEPING_ENABLED=true` | required, unless `HOUSEKEEPING_MODE` is set |
+| Data directory writable | reported, never blocks | reported, never blocks |
 
-Redis is optional for the API because with housekeeping off, progress is stored in PostgreSQL and nothing is enqueued — that is a supported configuration. A Celery worker with no broker is useless under any configuration, so it always requires Redis.
+Redis is optional for the API because with housekeeping off, progress is stored in PostgreSQL and nothing is enqueued — that is a supported configuration. A Celery worker with no broker is useless, so the worker requires Redis — except in `HOUSEKEEPING_MODE` (`oneshot`/`watch`/`dryrun`), where the image runs `housekeeping.py`, which imports straight into the database. An invalid setting (an unknown `HOUSEKEEPING_MODE` included) fails the preflight at once, without retrying.
 
 The `PREFLIGHT_*` settings (retries, delay, timeout, opt-out) are listed under [Configuration](#configuration).
 
@@ -220,14 +222,14 @@ The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with 
 |---|---|
 | Framework | React 18 + react-router 6 + TypeScript 5.7 |
 | Build tool | Vite 6 (`tsc -b && vite build`), package manager pnpm |
-| Page routes | `/login`, `/register`, `/jobs`, `/explore`, `/upload`, `/quality`, `/tokens` |
+| Page routes | `/login`, `/register`, `/upload`, `/jobs`, `/explore`, `/quality`, `/tokens`, `/admin/users` (administrators) |
 | Runtime | nginx (SPA + reverse proxy) |
 | Dev server | `pnpm dev` in `frontend/` — Vite on `:5173`, proxying to the API at `VITE_DEV_PROXY_TARGET` (default `http://127.0.0.1:5000`) |
 | Image | `ghcr.io/cgiar-agwise/kvuno-web` (`frontend/Dockerfile`, node build → nginx runtime) |
 
 ### Docker Deployment
 
-`docker-compose.yml` defines `base` (build-only, never started), `api` (production image, Gunicorn), `api-dev` (Flask dev server, only with `--profile dev`, host `127.0.0.1:5002`), `web` (nginx serving the React SPA on host `127.0.0.1:5001`), and `worker` (Celery). The app listens on port 80 inside the container and compose maps host `127.0.0.1:5000` to it. Open the UI at `http://localhost:5001`, not at the API port. All published ports bind to loopback only; there is no `WEB_PORT` variable — change the mapping in the compose file or an override.
+`docker-compose.yml` defines `base` (build-only, never started), `data-init` (one-shot: gives the data volume to the containers' `app` user), `api` (production image, Gunicorn), `api-dev` (Flask dev server, only with `--profile dev`, host `127.0.0.1:5002`), `web` (nginx serving the React SPA on host `127.0.0.1:5001`), and `worker` (Celery, or housekeeping via `HOUSEKEEPING_MODE`). The app listens on port 80 inside the container and compose maps host `127.0.0.1:5000` to it. Open the UI at `http://localhost:5001`, not at the API port. All published ports bind to loopback only; there is no `WEB_PORT` variable — change the mapping in the compose file or an override.
 
 Database migrations are applied by the `api` container's entrypoint when `RUN_MIGRATIONS=true` — the entrypoint's own default — but `docker-compose.yml` overrides it to `${RUN_MIGRATIONS:-false}`, so under compose either set it or run `docker compose exec api python scripts/run_migrations.py` after every upgrade. Keep it `false` if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
@@ -254,13 +256,13 @@ curl http://localhost:5000/health
 ### Docker — Individual Services
 
 ```bash
-# API only (no background processing)
+# API only (processes SPA uploads and the startup scan itself)
 docker compose up -d api
 
-# API + worker
+# API + worker (adds the Celery path; needs Redis)
 docker compose up -d api worker
 
-# SPA only (API + web), no background processing
+# API + web UI
 docker compose up -d api web
 ```
 
@@ -314,16 +316,30 @@ Ingestion and the spatial endpoints still need PostgreSQL/PostGIS: the batch ins
 When `HOUSEKEEPING_ENABLED=false` (default), the app runs entirely without Redis:
 
 - The API serves data normally
-- File uploads are still received and inspected (that runs in the API process); submitting saves the mapping and leaves the upload `ready` with a message saying no worker is configured
-- Set `HOUSEKEEPING_ENABLED=true` to enable background enqueuing (requires Redis accessible)
+- Files submitted from the Upload page are received, inspected **and processed** in the API process, with progress on the Jobs page
+- The startup scan imports what is in the data folder, also in-process
+- Only `POST /api/v1/data/upload` and Jobs-page retries of plain data-folder files need the worker: without it they are saved and reported as such
+- Set `HOUSEKEEPING_ENABLED=true` (and run the worker, with Redis) to hand those to Celery
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full details on Compose configuration, environment variables, running commands inside containers, and troubleshooting.
 
 ## Usage
 
-### File Processing (Background Worker)
+### How files get processed
 
-File ingestion is handled by a Celery worker. When `HOUSEKEEPING_ENABLED=true`, the `/api/v1/data/upload` endpoint enqueues a task; the Celery worker processes it asynchronously.
+| Source | Where it is processed | Needs Redis/Celery |
+|---|---|---|
+| Upload page (tus) → **Process** | Background thread in the API process; the upload goes to `processing` | No |
+| Files already in `HOUSEKEEPING_DATA_DIR` | Startup scan: a background thread in each API process at boot | No |
+| `POST /api/v1/data/upload` | Celery worker when `HOUSEKEEPING_ENABLED=true`; otherwise saved for the next scan | Yes, to process at once |
+| Jobs page **Retry** | An upload: API thread, re-using its saved mapping. A plain data-folder file: Celery when `HOUSEKEEPING_ENABLED=true` | Only for plain files |
+| `python housekeeping.py` / `HOUSEKEEPING_MODE` | The CLI process, or the worker container in housekeeping mode | No |
+
+Every path ends in the same `process_file()`: resumable from a stored offset, deduplicated by checksum, with progress on the Jobs page. Several processes can scan the same folder safely: RDS → Parquet conversion takes a per-file lock and writes atomically, and ingestion takes a per-file lock, so a file is never converted or imported twice at once.
+
+### File Processing (Celery Worker)
+
+The worker is optional. With `HOUSEKEEPING_ENABLED=true`, `POST /api/v1/data/upload` and retries of plain data-folder files are queued for it.
 
 Redis is **not** a compose service; run it externally and point `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` at it.
 
@@ -341,40 +357,44 @@ celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --pool solo
 docker compose up --build -d worker
 ```
 
-Tasks are acked late and re-queued if the worker dies (`task_reject_on_worker_lost`), so `CELERY_VISIBILITY_TIMEOUT` (default 6 h) must exceed your longest single-file ingest or Redis hands a still-running task to a second worker. A per-file `<file>.ingest.lock` makes any such duplicate exit quietly. A database outage mid-file re-raises so Celery retries from the stored offset; a bad file is recorded as `error` at its last position and is not retried. Each submission (and each startup scan) is its own processing run, so the Jobs page keeps one history row per attempt.
+Tasks are acked late and re-queued if the worker dies (`task_reject_on_worker_lost`), so `CELERY_VISIBILITY_TIMEOUT` (default 6 h) must exceed your longest single-file ingest or Redis hands a still-running task to a second worker. A per-file `<file>.ingest.lock` makes any such duplicate exit quietly. A database outage mid-file re-raises so Celery retries from the stored offset; a bad file is recorded as `error` at its last position and is not retried.
+
+**Restarting the worker does not lose work.** On shutdown the running file stops at the next chunk boundary, commits its rows and position together, and shows "Paused for a worker restart"; when the worker starts again it clears its own stale locks and resumes every job it left unfinished, from where it stopped. Compose gives it `stop_grace_period: 2m` for this.
 
 ### Uploading Files (SPA)
 
 The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.ts`) to a tus 1.0 server (core + creation) in `app/routes/uploads.py`. The server issues the upload id and appends bytes at an offset, so a dropped connection, closed tab, or API restart resumes from the last byte. Each upload is a row in the `uploads` table and moves through:
 
 ```
-receiving → received → inspecting → ready | failed → submitted
+receiving → received → inspecting → ready | failed → submitted → processing
 ```
 
 1. **Receive** — bytes land in `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked at creation, before any bytes arrive
 2. **Inspect** — on a background thread in the API process (no Celery needed): RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping
 3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once
-4. **Submit** — `POST /ui/uploads/<id>/process` saves the mapping and enqueues ingestion. The worker uses that mapping as-is (not merged over `RDS_COLUMN_MAP`). If the broker is unreachable the API returns `503` and the upload goes back to `ready`
+4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it on a background thread in the API, using that mapping as-is (not merged over `RDS_COLUMN_MAP`). No worker or Redis is needed; progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
 
-Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unsubmitted uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted at worker boot. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
+Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unfinished uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted when an API process starts. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
 
-### Legacy Housekeeping Script
+### Housekeeping (on-demand import)
 
-The `housekeeping.py` script processes files directly (without Celery) — useful for one-off bulk imports:
+`housekeeping.py` imports the files in a folder directly, without Celery — for bulk loads or a manual re-scan. It is a Typer CLI over `housekeeper.run()`; `python housekeeping.py --help` lists the options.
 
 ```bash
-# Process all files in static/data/
-python housekeeping.py
-
-# Custom directory
-python housekeeping.py /path/to/data
-
-# Dry-run
-python housekeeping.py --dry-run
-
-# Watch mode
-python housekeeping.py --watch
+python housekeeping.py                    # scan HOUSEKEEPING_DATA_DIR once
+python housekeeping.py /path/to/data      # another folder
+python housekeeping.py --dry-run          # report what would be imported, skipped or resumed
+python housekeeping.py --watch            # keep running; import new files as they appear (-w)
+python housekeeping.py --batch-size 5000 --chunk-size 20000 --checkpoint-interval 25
 ```
+
+In Docker, run it in the worker container (same data volume, more memory than the API):
+
+```bash
+docker compose exec worker python housekeeping.py --dry-run
+```
+
+Or start the worker image **as** a housekeeping job instead of Celery by setting `HOUSEKEEPING_MODE` on it: `oneshot` (scan once and exit), `watch` (keep importing new files) or `dryrun`. Leave it unset for the normal Celery worker.
 
 What happens during a run:
 1. **Health check** — `SELECT 1` confirms the database is reachable
@@ -382,18 +402,14 @@ What happens during a run:
 3. **Deduplication** — SHA-256 checksum lookup in `file_imports` table; fully imported files are skipped
 4. **Resumable processing** — Files with a stored `offset` resume from that row; incremental checkpoints commit every `checkpoint_interval` batches
 5. **Batch insert** — Records are inserted in savepoint-protected batches; individual batch failures are logged and skipped
-6. **Graceful shutdown** — `Ctrl+C` (or `SIGTERM`) commits completed batches and persists the offset for later resumption; a second `Ctrl+C` force-quits immediately. These handlers are installed by the CLI only — gunicorn and Celery keep their own signal handling
-7. **Telemetry** — Structured JSON events (`housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`) are written to stderr for monitoring ingestion
+6. **Graceful shutdown** — `Ctrl+C` (or `SIGTERM`) stops at the next chunk boundary, committing its rows and the offset together for later resumption; a second `Ctrl+C` force-quits immediately. These handlers are installed by `housekeeper.run()` (the CLI) only — gunicorn and Celery keep their own signal handling
+7. **Telemetry** — Structured log events (`housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`) go through the app's logger, as JSON lines in production
 
 Remote files are configured with the `REMOTE_RDS_*` settings (see [Configuration](#configuration)).
 
 Downloads are SSRF-guarded (`app/utils/downloader.py`): HTTPS only unless `REMOTE_RDS_ALLOW_HTTP=true`; private, loopback, link-local and metadata addresses refused; redirects followed by hand (max 5), each hop re-checked, with the bearer token and `REMOTE_RDS_COOKIES` dropped when a redirect changes host; optional `REMOTE_RDS_ALLOWED_DOMAINS` (exact host or subdomain); `REMOTE_RDS_MAX_BYTES` (default 1 GiB) per file; and a post-connect peer-IP check against DNS rebinding (best effort, skipped behind an HTTP proxy).
 
-Convert large `.RDS` files to `.parquet` for faster processing:
-
-```bash
-python -c "from app.utils.rds_to_parquet import batch_convert; batch_convert('static/data/')"
-```
+`.RDS` files in the data folder are converted to `.parquet` automatically before every scan (and by the watcher as they arrive): Parquet streams in chunks, whereas an RDS must be read into memory whole.
 
 ### Authentication
 
@@ -444,7 +460,7 @@ Error responses never carry exception text: a failing endpoint returns a generic
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/` | — | Redirects to `SPA_ROOT_URL` (default `/`) |
+| `GET` | `/` | — | Browsers: a landing page linking the web app and API docs. Other clients: redirect to `SPA_ROOT_URL`, or a JSON pointer when it is unset |
 | `GET` | `/health` | — | Health check with database status |
 | `GET` | `/login`, `/register` | — | SPA routes — login and registration pages (nginx) |
 | `GET` | `/jobs` | Required | SPA route — job list (nginx) |
@@ -454,14 +470,15 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `GET` | `/tokens` | Required | SPA route — token management (nginx) |
 | `GET` | `/admin/users` | Admin | SPA route — account approval (nginx; non-admins are sent to `/jobs`) |
 | `GET` | `/ui/jobs/data` | Required | JSON: job list |
+| `GET` | `/ui/jobs/runs` | Required | Recent processing runs (files submitted together), newest first |
 | `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
 | `POST` | `/ui/uploads/tus` | Required | tus create — `Upload-Length` + `Upload-Metadata filename`; size and extension checked before any bytes (`413`/`415`) |
 | `HEAD` | `/ui/uploads/tus/<id>` | Required | tus offset probe — `Upload-Offset` to resume from |
 | `PATCH` | `/ui/uploads/tus/<id>` | Required | tus append at `Upload-Offset` (`409` offset mismatch, `423` another request holds the upload) |
 | `GET` | `/ui/uploads` | Required | The caller's unfinished uploads (survives a page reload) |
 | `GET` | `/ui/uploads/<id>` | Required | Upload status, preview, duplicate info, suggested mapping |
-| `POST` | `/ui/uploads/<id>/process` | Required | Validate + save the column mapping, enqueue ingestion |
-| `DELETE` | `/ui/uploads/<id>` | Required | Discard an upload that has not been submitted |
+| `POST` | `/ui/uploads/<id>/process` | Required | Validate + save the column mapping, then process it in the API (`processing`) |
+| `DELETE` | `/ui/uploads/<id>` | Required | Discard an upload that is not yet submitted or processing (`409` otherwise) |
 | `POST` | `/ui/process` | Required | (Re)process a stored file — Jobs page Retry; omit `column_map` to re-use the saved one |
 | `GET` | `/ui/progress/<file_name>` | Required | One job's progress record (same shape as a `/ui/jobs/data` item), or `status: unknown` |
 | `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, and `max_file_size` |
@@ -477,14 +494,15 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
-| `POST` | `/api/v1/data/upload` | Required | Upload an RDS/parquet file |
-| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data |
+| `POST` | `/api/v1/data/upload` | Required | Upload RDS/Parquet files (queued for the worker when `HOUSEKEEPING_ENABLED=true`) |
+| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data. Each record has `coordinates` as a GeoJSON Point, `opt_date` as in the source (`30-Nov`, no year) plus `opt_month_day` (`--11-30`), and ISO 8601 UTC `created_at`/`updated_at` |
 | `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values (paginated per column) |
 | `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates (paginated) |
 | `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated by cluster: `pages` from `total_clusters`; bad `zoom`/bounds → `400`) |
 | `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated; `0` values are kept) |
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
 | `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated) |
+| `GET` | `/api/v1/quality/duplicates` | Required | Conflicts grouped by country/province/variety/season/date, most repeated first, with counts per source (paginated by group) |
 
 ### Pagination
 
@@ -657,7 +675,8 @@ Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — t
 
 | Variable | Default | Description |
 |---|---|---|
-| `HOUSEKEEPING_ENABLED` | `false` | Process files with the Celery worker (needs Redis). Off: uploads are received and mapped, but nothing is ingested. |
+| `HOUSEKEEPING_ENABLED` | `false` | Hand /api/v1/data/upload and Jobs retries of plain data-folder files to the Celery worker (needs Redis). SPA uploads and the startup scan run in the API process either way. |
+| `HOUSEKEEPING_MODE` | — | Worker image only: run housekeeping.py instead of Celery — oneshot (scan once and exit), watch (keep importing new files) or dryrun (report only). Unset: the normal Celery worker. |
 | `HOUSEKEEPING_DATA_DIR` | `static/data` | Directory holding data files; uploads go to its `uploads/` subdirectory. |
 | `HOUSEKEEPING_BATCH_SIZE` | `2000` | Rows per insert batch. |
 | `HOUSEKEEPING_CHUNK_SIZE` | `5000` | Rows read per chunk (sizes insert batches, not memory). |

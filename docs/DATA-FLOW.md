@@ -2,13 +2,23 @@
 
 This document describes the two main data flows in KVuno API: **ingestion** (RDS/Parquet files into the database) and **serving** (database records through the REST API).
 
-> All ingestion logic lives in `app/services/housekeeper.py`. The root `housekeeping.py` is a thin `argparse` wrapper around `cli_run()`.
+> All ingestion logic lives in `app/services/housekeeper.py`. The root `housekeeping.py` is a thin Typer CLI over `housekeeper.run()`.
+
+**Where files are processed** — every path ends in `process_file()`:
+
+| Source | Runs in | Needs Redis/Celery |
+|---|---|---|
+| Upload page → `POST /ui/uploads/<id>/process` | A daemon thread in the API process (`routes/uploads.py::enqueue_upload`); upload → `processing` | No |
+| Files already in `HOUSEKEEPING_DATA_DIR` | `create_app()`'s startup-scan thread (`load_rds_to_db`), in each API process at boot | No |
+| `POST /api/v1/data/upload` | `process_file_task` on the Celery worker when `HOUSEKEEPING_ENABLED=true`; otherwise saved for the next scan | Yes, to run at once |
+| Jobs Retry (`POST /ui/process`) | An upload: the API thread, re-using its saved mapping. A plain data-folder file: Celery when `HOUSEKEEPING_ENABLED=true` | Only for plain files |
+| `python housekeeping.py`, or the worker image with `HOUSEKEEPING_MODE` | That process (`housekeeper.run()`) | No |
 
 ---
 
 ## 0. Request Path — Browser to API
 
-The frontend is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with
+The frontend is a standalone **React 19 + TypeScript SPA** in `frontend/`, built with
 Vite and pnpm and served by **nginx**; Flask renders no HTML. nginx reverse-proxies
 `/api`, `/ui`, and `/health` to the `api` service, so the browser talks to one origin
 and the bearer token never crosses one. Everything below is what happens *after* that
@@ -85,9 +95,9 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 ### Step-by-step
 
 1. **(Optional) Remote download** — `download_remote_files()` (`app/services/housekeeper.py`) reads `REMOTE_RDS_URLS` (semicolon-delimited) and fetches each URL into the data dir. Supports bearer tokens (`REMOTE_RDS_TOKEN`), cookies (`REMOTE_RDS_COOKIES`), and custom headers (`REMOTE_RDS_HEADERS`). SSRF guards (`app/utils/downloader.py`): HTTPS-only unless `REMOTE_RDS_ALLOW_HTTP=true`; private/loopback/link-local/metadata IPs rejected; redirects followed **by hand** (max 5), each hop re-validated, with the bearer token (`Authorization`) dropped when a hop changes host — `REMOTE_RDS_COOKIES` are not host-scoped and are still sent; optional `REMOTE_RDS_ALLOWED_DOMAINS` allow-list (exact host or true subdomain — `example.org.evil.com` does not match); `REMOTE_RDS_MAX_BYTES` (default 1 GiB) enforced while streaming; and, after connecting, the socket's peer IP is re-checked against DNS rebinding (best effort; skipped behind an HTTP(S) proxy, whose own address is the peer). Failures are logged and skipped.
-2. **File discovery** — `load_rds_to_db()` (`app/services/housekeeper.py`) scans the data dir **root** (not subdirectories) for `.RDS` and `.parquet` files, both pre-existing and freshly downloaded. SPA uploads live in `uploads/<id>/` precisely so this scan does not ingest them with the default mapping before the user has mapped their columns
+2. **Conversion + file discovery** — `load_rds_to_db()` (`app/services/housekeeper.py`) first converts every `.RDS` in the data dir root to Parquet (`batch_convert()`; the watcher does the same as files arrive), then scans the **root** (not subdirectories) for `.RDS` and `.parquet` files. Conversion is safe with several scanners at once: a per-file `<file>.convert.lock` lets one process convert it (the others skip it), the Parquet is written to `<name>.parquet.tmp` and renamed into place so no one reads a partial file, an RDS already removed by another process counts as done, and one bad file is logged and skipped. SPA uploads live in `uploads/<id>/` precisely so this scan does not ingest them with the default mapping before the user has mapped their columns
 3. **Pre-flight DB health check** — `db_health_check()` runs `SELECT 1` before any processing
-4. **Concurrent dispatch** — Files are processed in a `ThreadPoolExecutor` (size `HOUSEKEEPING_MAX_WORKERS`) using `submit()` + `as_completed()` so one failure does not abort the batch. The whole scan is **one** `processing_runs` row (`source='scan'`); each upload submission or Jobs Retry gets its own run (`source='upload'`) from `process_file_async()`. On the API, `process_pending()` only enqueues the scan if it wins the Redis key `kvuno:process_pending` (`SET NX EX 300`), so N gunicorn workers enqueue one scan — and an API restart within 5 minutes skips it
+4. **Concurrent dispatch** — Files are processed in a `ThreadPoolExecutor` (size `HOUSEKEEPING_MAX_WORKERS`) using `submit()` + `as_completed()` so one failure does not abort the batch. The whole scan is **one** `processing_runs` row (`source='scan'`); each Celery submission gets its own run (`source='upload'`) from `process_file_async()`. Files processed on an API thread (SPA uploads) are not grouped into a run. ⚠️ The startup scan starts in **every** API process (each gunicorn worker, and again whenever one is recycled after `MAX_REQUESTS`): the conversion and ingest locks keep concurrent scans from colliding, but each still lists the folder and checksums its files. `process_pending()` (a Redis-deduplicated Celery enqueue of the same scan) still exists but is no longer called from `create_app()`
    - **Per-file lock** — `process_file` takes `<file>.ingest.lock` next to the data file (O_EXCL, `app/utils/file_lock.py`) and touches it every chunk. A second worker on the same file (double submit, or a Redis redelivery of a still-running task) returns **silently** — writing an error would mark the live job failed. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (default 600) is taken over as dead
 5. **Checksum calculation** — Each file is hashed with SHA-256 (`app/utils/__init__.py::calculate_file_checksum`)
 6. **Deduplication / resume** — `FileImportRepo.get_by_checksum()` checks `file_imports`. A row with `offset IS NULL` is fully imported: the file is skipped and a `completed` progress entry ("Already ingested") is written so a submitted duplicate still shows up on the Jobs page. A non-null `offset` resumes mid-file; an `offset` at or past the row count (left by files completed before the offset was cleared on success) is treated as processed and normalised to `NULL`
@@ -97,9 +107,9 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 10. **Checkpointing** — Every `HOUSEKEEPING_CHECKPOINT_INTERVAL` batches (default 50) the inserted rows **and** the new `offset` (`upsert_offset(commit=False)`) are committed in **one** transaction. Committing rows first left a window where a crash kept rows past the stored offset, which a resume re-inserted. Don't split them
 11. **Conflict capture** — Duplicates against the `uq_planting_recommendation` unique constraint are recorded in `import_conflicts` (country/province/lon/lat/variety/season_type/opt_date). The constraint is `NULLS NOT DISTINCT` on PostgreSQL ≥ 15 (migration `f3a9c2d4e5b6`), so a row with a NULL key column now conflicts instead of being re-inserted on every replay, and the conflict lookup matches with `IS NOT DISTINCT FROM`
 12. **File tracking** — A `FileImport` record (file name, checksum, `original_filename`, `offset`) is saved. On completion `offset` is stored as `NULL`, which is what every "already processed" check tests for (it used to store the row count, so no finished file was ever recognised and re-uploads were reported as partial). A partially processed file keeps its numeric offset. Completion with skipped batches is reported as `completed` with an error note ("Done with errors")
-13. **Graceful shutdown / failure** — In the CLI (`python housekeeping.py`), SIGTERM/SIGINT set a flag checked at each batch boundary: the current batch finishes and the offset is committed; a second signal force-quits. The handlers are installed by `install_signal_handlers()` from `cli_run()` only — they used to be installed at import, which replaced gunicorn's and Celery's own SIGTERM handling. On an exception the session is rolled back and the error is reported at the last checkpoint row (where a retry will resume). A transient DB error is **re-raised**, so the Celery task's `autoretry_for` retries it from the stored offset; any other error (a bad file) is recorded as `error` and the task returns, so it is **not** retried
+13. **Graceful shutdown / failure** — Ingestion stops only at a **chunk boundary**: the chunk's rows and the offset after it are committed together, so a resume never re-inserts rows. In the CLI (`python housekeeping.py`), SIGTERM/SIGINT request it and a second signal force-quits; the handlers are installed by `install_signal_handlers()` from `housekeeper.run()` only — they used to be installed at import, which replaced gunicorn's and Celery's own SIGTERM handling. On the Celery worker, `worker_shutting_down` drops a stop file the pool child checks; the job is left `processing` ("Paused for a worker restart") and on the next start `worker_ready` re-enqueues every job that host left unfinished, in its own run, after `worker_init` has cleared that host's dead ingest locks. On an exception the session is rolled back and the error is reported at the last checkpoint row (where a retry will resume). A transient DB error is **re-raised**, so the Celery task's `autoretry_for` retries it from the stored offset; any other error (a bad file) is recorded as `error` and the task returns, so it is **not** retried
 14. **Progress** — `save_progress()` in `app/services/progress_store.py` writes the `job:{stem}` hash to Redis and publishes on the `jobs:updates` channel, which `/ui/jobs/events` streams to browsers (the hot path, throttled by `JOB_PROGRESS_MIN_INTERVAL`). It also checkpoints the job to the `processing_jobs` table (grouped under a `processing_runs` row) every `JOB_DB_CHECKPOINT_SECONDS` (default 5s) whether or not Redis is up; terminal states always write through to both. Database progress writes use their **own short-lived `Session`** (`_db_session()`), never the scoped session holding the uncommitted ingest batch, so a progress write can no longer commit ingest rows ahead of their offset. `attempts` counts on from the file's history for each new run and increments when a run's job comes back to `processing` (a retry). Timestamps are stored naive UTC and converted with `_epoch()`, which treats them as UTC — `datetime.timestamp()` assumed local time and made jobs look stale (or fresh) on non-UTC hosts. On completion the worker also calls `invalidate_planting_data_cache()`, so new rows appear in the cached map/filter endpoints immediately
-15. **Telemetry** — `emit_event()` writes structured JSON lines to stderr at `housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`
+15. **Telemetry** — `emit_event()` logs structured events through the app logger (JSON lines in production) at `housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`
 
 ### Tuning knobs
 
@@ -142,29 +152,29 @@ The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.
                                            start inspection thread
  GET   /ui/uploads/<id>  (poll) ───────▶ `inspecting` → `ready` | `failed`
                                            restarts a dead inspection
- POST  /ui/uploads/<id>/process ───────▶ validate + save column_map, `submitted` ──▶ process_file(
-                                                                                     column_map=…)
+ POST  /ui/uploads/<id>/process ───────▶ validate + save column_map, `processing`
+                                           ──▶ API thread: process_file(column_map=…)
 ```
 
 ### Lifecycle
 
-`receiving → received → inspecting → ready | failed → submitted`
+`receiving → received → inspecting → ready | failed → submitted → processing`
 
 1. **Create** — `POST /ui/uploads/tus` with `Upload-Length` and `Upload-Metadata: filename <base64>`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked here, before any bytes are accepted (`413` / `415`). The server issues the id (`uuid4().hex`, validated against `^[0-9a-f]{32}$` before it ever becomes a path) and returns `201` + `Location`. `Upload-Defer-Length` is not supported
 2. **Receive** — `PATCH` appends at `Upload-Offset` into `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The part file's size *is* the offset, so an API restart loses nothing and `HEAD` tells the client where to resume. An offset mismatch is `409`; a second request while another holds the per-upload `.lock` file (O_EXCL, taken over after 30s without a write) is `423`, which the client retries
 3. **Received** — after the last byte the part file is renamed to `<id>.rds` / `<id>.parquet` and inspection starts
 4. **Inspect** — on a daemon thread in the API process, so it works with `HOUSEKEEPING_ENABLED=false`: `convert_for_ingestion()` (RDS → Parquet; the original path is kept if conversion fails), preview rows, row count, SHA-256, duplicate lookup against `file_imports` (`processed` or `partial`), and a suggested `column_map` (exact DB column name, case-insensitive, then `COLUMN_ALIASES`). The claim is a conditional `UPDATE`, so two pollers never run it twice. A heartbeat refreshes `updated_at` every 30s; a row still `inspecting` without one after `UPLOAD_INSPECT_STALE_SECONDS` (default 180) — its gunicorn worker was recycled — is re-claimed by the next `GET /ui/uploads/<id>`
 5. **Map** — the SPA shows the server's suggestion, so what is in the selects is exactly what will be sent; choosing *skip* removes the key. Validation on submit: `lat` and `lon` must be mapped, no DB column used twice, every source must exist in the file, every target must be a `planting_recommendations` column
-6. **Submit** — `POST /ui/uploads/<id>/process` saves the mapping (`submitted`) and calls `process_file_async(column_map=…)`, which returns whether the broker accepted the task. Broker unreachable → `503` and the upload returns to `ready`. `HOUSEKEEPING_ENABLED=false` → the mapping is saved and the upload stays `ready` with a message
+6. **Process** — `POST /ui/uploads/<id>/process` validates and saves the mapping, sets the upload to `processing` and starts `process_file(column_map=…)` on a daemon thread in the API process — no Celery or Redis, whatever `HOUSEKEEPING_ENABLED` says. Progress goes to `progress_store` like any other ingest. A thread dies with its gunicorn worker; the file's stored offset is kept, and Retry resumes from it
 7. **Retry** — the Jobs page calls `POST /ui/process` with only the file name; for an upload the server re-uses the saved `column_map` (it used to send `{}` and wipe it). Files with no `uploads` row fall back to the sidecar path, resolved with `Path.is_relative_to` against the data dir
 
-Uploads are per user (`owner_id`); anyone else's id is reported as `404`. `GET /ui/uploads` lists the caller's unfinished uploads so a page reload does not lose files waiting to be mapped, and `DELETE /ui/uploads/<id>` discards one that has not been submitted. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit.
+Uploads are per user (`owner_id`); anyone else's id is reported as `404`. `GET /ui/uploads` lists the caller's unfinished uploads so a page reload does not lose files waiting to be mapped, and `DELETE /ui/uploads/<id>` discards one that is not yet `submitted` or `processing` (`409` otherwise). The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit.
 
 ### Cleanup
 
 `_cleanup_temp_files()` runs on every API worker boot and must never touch anything in flight — it used to `rmtree` the whole chunk directory, and gunicorn boots a worker on every `max_requests` recycle and timeout, which is what made uploads fail at random. It now:
 
-- deletes unsubmitted uploads idle longer than `UPLOAD_ABANDON_AGE` (default `7d`; `30m` / `12h` / `1d` / `2w`)
+- deletes unfinished uploads (including `processing` ones) idle longer than `UPLOAD_ABANDON_AGE` (default `7d`; `30m` / `12h` / `1d` / `2w`)
 - deletes the upload directory, data file and any sidecars of jobs `completed` longer than `CLEANUP_AGE` ago
 - removes the retired `.chunks/` directory if one is left over
 
@@ -306,7 +316,7 @@ One row per SPA upload, from the first byte to submission (migration `2026102212
 | `owner_id` | BIGINT FK → `users.id` (SET NULL) | Uploader; other users get `404` |
 | `original_name` | VARCHAR(255) NOT NULL | User-facing file name |
 | `size` | BIGINT NOT NULL | tus `Upload-Length`, checked against `MAX_FILE_SIZE` |
-| `status` | VARCHAR(20) NOT NULL | `receiving` / `received` / `inspecting` / `ready` / `failed` / `submitted` |
+| `status` | VARCHAR(20) NOT NULL | `receiving` / `received` / `inspecting` / `ready` / `failed` / `submitted` / `processing` |
 | `stored_path` | VARCHAR(512) | File the worker reads (`.parquet` after conversion) |
 | `sha256` | VARCHAR(64) | Checksum of the stored file |
 | `preview` | JSON | Columns, sample rows, `total_rows` |
@@ -407,14 +417,14 @@ Indexes: `ix_processing_jobs_run_id`, `ix_processing_jobs_status`, `ix_processin
 
 | Layer | Module | Responsibility |
 |---|---|---|
-| ETL | `app/services/housekeeper.py` | Remote download, file discovery, parallel dispatch, chunked processing, checkpointing, CLI |
-| CLI wrapper | `housekeeping.py` | argparse front-end → `housekeeper.cli_run()` |
-| Watcher | `app/services/watch_handler.py` | watchdog-based directory monitoring for `--watch` |
+| ETL | `app/services/housekeeper.py` | Remote download, file discovery, parallel dispatch, chunked processing, checkpointing, `run()` (CLI entry), worker stop/resume |
+| CLI wrapper | `housekeeping.py` | Typer front-end → `housekeeper.run()` (`[DATA_FOLDER] --watch/-w --dry-run --batch-size --chunk-size --checkpoint-interval`) |
+| Watcher | `app/services/watch_handler.py` | watchdog-based directory monitoring for `--watch`; converts new RDS files to Parquet first |
 | Progress | `app/services/progress_store.py` | Job progress: Redis hot path + `jobs:updates` pub/sub, `processing_runs` / `processing_jobs` durable record |
 | Uploads | `app/services/uploads.py` | Upload storage, tus append + lock, background inspection, suggested mapping (`COLUMN_ALIASES`), mapping validation, abandoned-upload cleanup |
 | Celery | `app/tasks.py` | `process_file_task` (accepts `column_map`) / `process_pending_task`; builds its own Flask app + `MyDb` |
 | Download | `app/utils/downloader.py` | `RDSDownloader` — remote download with auth + SSRF guards |
-| Conversion | `app/utils/rds_to_parquet.py` | `batch_convert()` — RDS → Parquet; `convert_for_ingestion()` used by upload inspection and `/api/v1/data/upload` |
+| Conversion | `app/utils/rds_to_parquet.py` | `batch_convert()` — RDS → Parquet before every scan (per-file lock, atomic write); `convert_for_ingestion()` used by upload inspection and `/api/v1/data/upload` |
 | Checksum | `app/utils/__init__.py` | `calculate_file_checksum()` — file hashing |
 | Parsing | `pyreadr` / `pandas` (external) | RDS or Parquet → DataFrame |
 | Models | `app/models/kvuno.py` | `PlantingRecommendation`, `FileImport`, `ImportConflict`, `Upload`, `User`, `UserToken`, `ProcessingRun`, `ProcessingJob` |

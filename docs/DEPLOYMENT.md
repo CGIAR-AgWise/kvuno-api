@@ -14,7 +14,8 @@ Covers Docker Compose setup, image builds, service configuration, and running ma
 | `api` | `ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}` (built from `docker/Dockerfile.prod.dockerfile`) | Production API: Gunicorn, `FLASK_DEBUG` defaults to `false`, `restart: unless-stopped`. Listens on **80** in the container; compose maps host `127.0.0.1:5000`. Entrypoint runs preflight, migrates if `RUN_MIGRATIONS=true`, then serves. |
 | `api-dev` | `ghcr.io/cgiar-agwise/kvuno-api:${DEV_TAG:-develop}` (built from `docker/Dockerfile`) | Profile `dev` only (`docker compose --profile dev up api-dev`): Flask dev server (`run.py`), `FLASK_DEBUG`/`DEBUG_DB` default `true`. Host port `5002`, so it can run beside `api`. |
 | `web` | `ghcr.io/cgiar-agwise/kvuno-web` (built from `frontend/Dockerfile`) | nginx: serves the React SPA and reverse-proxies `/api`, `/ui`, `/health` to `api`. Listens on **80** in the container; compose maps host `127.0.0.1:5001` (hardcoded — there is no `WEB_PORT` variable). |
-| `worker` | `ghcr.io/cgiar-agwise/kvuno-worker` (built from `docker/Dockerfile.worker`) | Celery ingestion worker. `restart: unless-stopped`; healthcheck is `celery -A app.celery_app inspect ping -d celery@$HOSTNAME` every 60s |
+| `data-init` | same image as `api` | One-shot, as root, before `api`/`api-dev`/`worker`: gives the data volume to the image's `app` user (only wrong-owner entries are touched; never blocks startup) |
+| `worker` | `ghcr.io/cgiar-agwise/kvuno-worker` (built from `docker/Dockerfile.worker`) | Celery ingestion worker — or, with `HOUSEKEEPING_MODE=oneshot\|watch\|dryrun`, a housekeeping run instead. `restart: unless-stopped`; `stop_grace_period: 2m` so a running ingest can pause cleanly; healthcheck is `celery -A app.celery_app inspect ping -d celery@$HOSTNAME` every 60s (not meaningful in housekeeping mode) |
 
 ```
                        ┌──────────────────────┐
@@ -273,18 +274,25 @@ docker compose exec api alembic upgrade head
 
 **Set it to `false` when you run more than one API replica**, otherwise each replica races to migrate the same schema — concurrent `alembic upgrade head` calls can deadlock or fail. This is the reason startup migrations were originally removed in favour of a separate step.
 
-The `worker` never migrates. It only receives tasks from the already-running API, and `process_pending()` is enqueued from `create_app()`. A task already sitting in the broker when the worker restarts could execute before the API migrates. Celery's `autoretry_for=(Exception,)` (10 retries at 60s) only covers that window for **transient** database errors (connection refused, dropped connection): `process_file` now records any other failure — including "relation does not exist" — as an `error` job and returns, so it is not retried. Migrate before starting the worker, and use the Jobs page Retry for anything that failed in between. `depends_on: api` would **not** help — the API container counts as started the moment its entrypoint begins, which is before migrations finish.
+The `worker` never migrates. It only receives tasks from the already-running API (`/api/v1/data/upload` and Jobs retries of plain data-folder files, when `HOUSEKEEPING_ENABLED=true`). A task already sitting in the broker when the worker restarts could execute before the API migrates. Celery's `autoretry_for=(Exception,)` (10 retries at 60s) only covers that window for **transient** database errors (connection refused, dropped connection): `process_file` now records any other failure — including "relation does not exist" — as an `error` job and returns, so it is not retried. Migrate before starting the worker, and use the Jobs page Retry for anything that failed in between. `depends_on: api` would **not** help — the API container counts as started the moment its entrypoint begins, which is before migrations finish.
 
 ### Housekeeping (RDS ingestion)
 
-Prefer the `worker` service when `HOUSEKEEPING_ENABLED=true` — ingestion is a Celery task and `api` just enqueues it.
+How files are processed:
+
+- **Upload page** — imported on a background thread in the API process (the upload shows `processing`). No worker or Redis needed.
+- **Files in the data volume** — the API scans the folder in a background thread when it starts (each gunicorn worker does; per-file locks keep the scans from colliding). `.RDS` files are converted to Parquet first.
+- **On demand** — run the Typer CLI in the **worker** container (same volume, 2 GB memory limit; the API is capped at 512 MB and a large RDS is read whole):
 
 ```bash
-# One-off run inside the API container
-docker cp data/file.RDS kvuno-api:/app/static/data/
-docker compose exec api python housekeeping.py --dry-run
-docker compose exec api python housekeeping.py
+docker cp data/file.RDS kvuno-worker:/app/static/data/
+docker compose exec worker python housekeeping.py --dry-run   # what would be imported, skipped, resumed
+docker compose exec worker python housekeeping.py             # import everything in HOUSEKEEPING_DATA_DIR
+docker compose exec worker python housekeeping.py --help      # --watch/-w, --batch-size, --chunk-size, --checkpoint-interval
 ```
+
+- **As a job** — start the worker image with `HOUSEKEEPING_MODE` set and it runs `housekeeping.py` instead of Celery: `oneshot` (scan once, then exit — set `restart: "no"` for this), `watch` (keep importing new files) or `dryrun`. In this mode the preflight requires the database but **not** Redis, and an unknown value fails it at once.
+- **Through Celery** — with `HOUSEKEEPING_ENABLED=true`, `POST /api/v1/data/upload` and Jobs retries of plain data-folder files are queued for the worker, which needs Redis.
 
 ### Interactive shell
 
@@ -395,11 +403,11 @@ All application images use `python:3.14-slim` for the runtime stage and run as a
 Gunicorn boots a fresh worker on every `MAX_REQUESTS` recycle and every timeout, and each boot runs `create_app()`'s cleanup. That cleanup only removes uploads idle longer than `UPLOAD_ABANDON_AGE` and files of jobs completed longer than `CLEANUP_AGE` ago, and it logs a warning and skips (rather than failing the boot) when it cannot read uploads or jobs — Redis down with the tables not yet migrated — it used to wipe the whole chunk directory, which is what made in-flight uploads fail at random. Upload inspection runs on a thread in the API worker, so a recycle can interrupt it; it is re-claimed by the next status poll after `UPLOAD_INSPECT_STALE_SECONDS`.
 
 **Worker (`docker/Dockerfile.worker`)**
-- Entrypoint `docker/entrypoint.worker.sh` runs the preflight (`scripts/preflight.py worker`: database + Redis) and never migrates
+- Entrypoint `docker/entrypoint.worker.sh` runs the preflight (`scripts/preflight.py worker`: database + Redis, or the database only when `HOUSEKEEPING_MODE` is set) and never migrates; with `HOUSEKEEPING_MODE` it then runs `housekeeping.py` instead of Celery
 - `celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --concurrency=1`
 - `restart: unless-stopped`; compose healthcheck `celery inspect ping` against its own node
 - `task_acks_late` + `task_reject_on_worker_lost=True`: a worker killed mid-ingest (OOM, container stop) puts the task back on the queue, and the retry resumes from the stored offset. Redis redelivers any unacked task after `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) **even if it is still running**, so set it above the longest single-file ingest; the per-file `.ingest.lock` stops a redelivered copy from ingesting concurrently, but the copy is wasted work
-- Celery's own SIGTERM handling (warm shutdown) is untouched — the housekeeper's graceful-shutdown handlers are installed only by `python housekeeping.py`
+- Celery's own SIGTERM handling (warm shutdown) is untouched — the housekeeper's signal handlers are installed only by `housekeeper.run()` (the CLI). Instead, `worker_shutting_down` drops a stop file the running ingest checks between chunks: it commits its rows and offset together and shows "Paused for a worker restart". On start, `worker_init` clears this host's dead ingest locks and `worker_ready` re-enqueues every job the host left unfinished, in its own run, from its offset
 
 **Web (`frontend/Dockerfile`)**
 - Build stage: `node:24-alpine` with pnpm enabled via corepack; `pnpm run build` runs `tsc -b` first, so a type error fails the image build instead of shipping a broken bundle
@@ -441,7 +449,8 @@ There is no Postgres volume to back up here — the database is external (see §
 | API returns 500 on `/health` | DB connection refused | Check `DB_HOST` resolves from inside the container — `db` is no longer a compose service |
 | `psycopg2.OperationalError` | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
-| Uploads accepted but never processed | `HOUSEKEEPING_ENABLED` unset/false and no worker | Set `HOUSEKEEPING_ENABLED=true` and start the `worker` service |
+| Upload page files never finish processing | They run on a thread in the API process; a gunicorn worker recycled or killed mid-file (e.g. out of memory on a large file) ends it | The job goes *Stalled* after `JOB_STALE_AFTER_SECONDS`; Retry resumes from the stored offset. For very large files use the worker (`housekeeping.py`) or raise the API memory limit |
+| Files sent to `/api/v1/data/upload` never processed | `HOUSEKEEPING_ENABLED` unset/false: they are saved for the next startup scan | Restart the API (it scans at boot), run `housekeeping.py` in the worker, or set `HOUSEKEEPING_ENABLED=true` with the `worker` running |
 | 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
 | `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
 | Port 5000 already in use on the host | Another service on host port 5000 | Stop it, or remap the host side in an override: `ports: - "127.0.0.1:5003:80"` (5001 and 5002 are taken by `web` and `api-dev`) |
@@ -452,7 +461,8 @@ There is no Postgres volume to back up here — the database is external (see §
 | No approval / activation emails arrive | `SMTP_HOST` or `MAIL_FROM` unset — sending is skipped | Check the API log: `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses) '…'` means email is not configured; `Email … failed:` means SMTP rejected it (check `SMTP_SECURITY`/port/credentials). Emails have no links unless `SPA_ROOT_URL` is an absolute `http(s)` URL |
 | A user's tokens suddenly return `401` | Their account was disabled or rejected — tokens of an inactive account stop working at once, and disable/reject delete them | Re-activate the account in **Accounts**; the user signs in again for a new token |
 | Worker logs "already being ingested by another worker" | A second copy of the task (double submit, or Redis redelivery after `CELERY_VISIBILITY_TIMEOUT`) found the live `<file>.ingest.lock` | Harmless — the duplicate exits. If it happens on long files, raise `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) above the longest ingest. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (600) is taken over |
-| API restarted but the startup scan did not run | `process_pending()` claims the Redis key `kvuno:process_pending` (`SET NX EX 300`) so only one gunicorn worker enqueues it; a restart within 5 minutes skips it | Wait 5 minutes, or delete the key, or run `python housekeeping.py` |
+| Startup scan log: "RDS conversion already running in another process; skipping" | Each gunicorn worker scans at boot; another one holds that file's `.convert.lock` | Harmless — that process converts and imports it |
+| `FileNotFoundError` on an `.RDS` during a startup scan | Two processes converted the same file before conversion was locked (fixed in `c1388cc`) | Upgrade; the scan now skips a file another process is converting |
 | `Permission denied` binding, app exits at startup | Container runs as non-root and port 80 is privileged | Add `cap_add: [NET_BIND_SERVICE]` (compose already does for `api`) |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |
 | `manifest unknown` on pull | Tag not built yet, or wrong `TAG` | Tags come from the Docker Build workflow; check what exists under the `CGIAR-AgWise` org |
@@ -462,8 +472,9 @@ There is no Postgres volume to back up here — the database is external (see §
 | Upload refused with `413` before it starts | The declared `Upload-Length` exceeds `MAX_FILE_SIZE_MB` (default 20) | Raise `MAX_FILE_SIZE_MB` on the API; the SPA picks the new limit up from `/ui/columns`. nginx sets `client_max_body_size 0` on `/ui/` and does not cap it |
 | Upload `PATCH` returns `423` | Another request still holds that upload's `.lock` (a retry arrived while the previous one was draining) | Nothing — the client retries; a lock with no write for 30s is taken over |
 | Upload stuck on *Reading the file…* | The API worker running inspection was recycled mid-inspection | The next status poll re-claims it once the heartbeat is older than `UPLOAD_INSPECT_STALE_SECONDS` (default 180) |
-| Upload submit returns `503` | `HOUSEKEEPING_ENABLED=true` but the broker is unreachable | Start Redis / check `CELERY_BROKER_URL`; the upload stays `ready` with its mapping, so submit again |
-| Uploads disappear after a week | Unsubmitted uploads idle longer than `UPLOAD_ABANDON_AGE` (default `7d`) are deleted at API worker boot | Raise `UPLOAD_ABANDON_AGE`, or submit them |
+| Upload submit returns `503` "storage is not writable" | The data volume is not owned by the containers' `app` user | Run the `data-init` service (compose does on `up`), or `chown -R app:app /app/static/data` as root |
+| Uploads disappear after a week | Unfinished uploads idle longer than `UPLOAD_ABANDON_AGE` (default `7d`) are deleted at API worker boot | Raise `UPLOAD_ABANDON_AGE`, or process them |
+| Worker in `HOUSEKEEPING_MODE=oneshot` restarts in a loop | `restart: unless-stopped` restarts it after every clean exit | Set `restart: "no"` on that service, or use `watch` |
 | Upload's `file` is `<id>.parquet` when `.rds` went in | Inspection converts RDS to Parquet so ingestion reads the cheap format | Expected; it is the name the worker reads and the one the Jobs page shows. `/api/v1/data/upload` converts the same way |
 | A job shows as *Processing* indefinitely | The worker died (OOM, restart, crash) and never wrote a terminal status | It becomes *Stalled* after `JOB_STALE_AFTER_SECONDS` (default 1800) and offers Retry. A job that stays Processing past that is still being written to |
 | Worker container restarts during an ingest | Exceeded `WORKER_MEM_LIMIT` | Raise it, or check whether the file is unusually large for its format |
