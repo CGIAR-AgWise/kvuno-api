@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import socket
+import tempfile
 import threading
 import time
 
@@ -105,6 +106,37 @@ planting_recommendation_repo = PlantingRecommendationRepo()
 
 shutdown_requested = False
 
+# Set by the Celery worker's main process when it is told to stop (see
+# app/celery_app.py). The ingest runs in a pool CHILD, which never sees the
+# SIGTERM Docker sends to PID 1 — and Celery's warm shutdown would otherwise
+# wait for the whole file while Docker kills the container after its grace
+# period, leaving the job "processing" with an unacked message Redis only
+# redelivers after CELERY_VISIBILITY_TIMEOUT (6 h). A file in the container's
+# temp directory is visible to parent and children alike.
+WORKER_STOP_FILE = os.path.join(tempfile.gettempdir(), 'kvuno-worker-stopping')
+
+
+def request_worker_stop():
+    try:
+        with open(WORKER_STOP_FILE, 'w'):
+            pass
+    except OSError:
+        logger.warning("Could not signal running ingests to stop", exc_info=True)
+
+
+def clear_worker_stop():
+    try:
+        os.remove(WORKER_STOP_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("Could not clear the worker stop flag", exc_info=True)
+
+
+def stop_requested() -> bool:
+    """The CLI got SIGINT/SIGTERM, or the Celery worker is shutting down."""
+    return shutdown_requested or os.path.exists(WORKER_STOP_FILE)
+
 
 def _handle_sigterm(signum, frame):
     global shutdown_requested
@@ -187,6 +219,21 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
     return default_map
 
 
+def _already_reported_complete(file_name: str, run_id: int | None) -> bool:
+    try:
+        from app.services.progress_store import get_job
+        job = get_job(file_name)
+    except Exception:
+        return False
+    return bool(job and job.get('status') == 'completed' and job.get('run_id') == run_id
+                and (job.get('total') or 0) > 0)
+
+
+def worker_name() -> str:
+    """This worker's name on its jobs (HOSTNAME is the container's, set by the runtime: not a setting)."""
+    return os.getenv('HOSTNAME') or socket.gethostname()
+
+
 def _write_progress(file_path: str, status: str, current: int, total: int, message: str = "",
                     run_id: int | None = None, error: str | None = None,
                     original_filename: str | None = None):
@@ -200,8 +247,7 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
     save_progress(
         file_path, status, current, total, message,
         run_id=run_id, error=error,
-        # HOSTNAME is the container's, set by the runtime: not a setting.
-        worker=os.getenv('HOSTNAME') or socket.gethostname(),
+        worker=worker_name(),
         original_filename=original_filename or os.path.basename(file_path),
     )
 
@@ -523,8 +569,12 @@ def process_file(
             resume_offset = 0
             if existing and existing.offset is None:
                 logger.warning(f"File {file_name} is already fully processed. Checksum: {checksum}")
-                # Report it, or a submitted duplicate shows nothing at all.
-                progress('completed', 0, 0, 'Already ingested — nothing to do')
+                # Report it, or a submitted duplicate shows nothing at all —
+                # unless this file's job already says completed: then this is
+                # a late redelivery of a task a resumed job already finished,
+                # and writing 0/0 over it would erase the real result.
+                if not _already_reported_complete(file_name, run_id):
+                    progress('completed', 0, 0, 'Already ingested — nothing to do')
                 return
             if existing and existing.offset is not None:
                 resume_offset = existing.offset
@@ -587,10 +637,13 @@ def process_file(
                 file=__import__('sys').stderr,
             )
 
+            # Stops only between chunks: a chunk's rows and the offset after
+            # it are committed together, so a resume never re-inserts rows.
+            stopped = False
             try:
                 for chunk_start, chunk in chunk_source:
-                    if shutdown_requested:
-                        logger.warning("Shutdown requested — breaking after current chunk")
+                    if stop_requested():
+                        stopped = True
                         break
 
                     lock.touch()
@@ -621,10 +674,6 @@ def process_file(
                         batch.append(PlantingRecommendationCreate(**kwargs))
 
                     for i in range(0, len(batch), batch_size):
-                        if shutdown_requested:
-                            logger.warning("Shutdown requested — breaking after current batch")
-                            break
-
                         sub = batch[i:i + batch_size]
                         try:
                             def _flush_batch(rows):
@@ -665,11 +714,10 @@ def process_file(
                             failed_batches += 1
                             logger.exception(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
 
-                    if not shutdown_requested:
-                        last_committed_row = chunk_end
-                        progress('processing', last_committed_row, num_rows)
+                    last_committed_row = chunk_end
+                    progress('processing', last_committed_row, num_rows)
 
-                    if batches_since_checkpoint >= checkpoint_interval and not shutdown_requested:
+                    if batches_since_checkpoint >= checkpoint_interval:
                         # Rows and offset in ONE transaction. Committing the
                         # rows first left a window where a crash kept rows
                         # past the stored offset, which a resume re-inserted.
@@ -679,7 +727,8 @@ def process_file(
                         checkpoint_row = chunk_end
                         batches_since_checkpoint = 0
                         logger.debug(f"Checkpoint committed at row {chunk_end}")
-                    if shutdown_requested:
+                    if stop_requested():
+                        stopped = True
                         break
 
             except BaseException as exc:
@@ -706,12 +755,17 @@ def process_file(
             chunk_source = None
             gc.collect()
 
-            if shutdown_requested:
+            if stopped:
                 file_import_repo.upsert_offset(checksum, file_name, last_committed_row,
                                                original_filename, commit=False)
                 session.commit()
+                # Still 'processing' — it is not done and not failed. The
+                # worker re-enqueues it on start (resume_interrupted_jobs); if
+                # none starts, it goes stale and gets a Retry button.
+                progress('processing', last_committed_row, num_rows,
+                         f"Paused for a worker restart; resumes from row {last_committed_row:,}")
                 logger.warning(
-                    f"Graceful shutdown — committed {completed_batches} batches from {file_name}, "
+                    f"Stopping — committed {completed_batches} batches from {file_name}, "
                     f"offset {last_committed_row} persisted"
                 )
             else:
@@ -740,7 +794,7 @@ def process_file(
             elapsed = time.time() - start_time
             emit_event("file.processing_end", file=file_name, checksum=checksum,
                        elapsed=round(elapsed, 2), completed_batches=completed_batches,
-                       failed_batches=failed_batches, shutdown=shutdown_requested)
+                       failed_batches=failed_batches, shutdown=stopped)
 
             if failed_batches:
                 logger.warning(f"File {file_name} processed with {failed_batches} failed batch(es)")
@@ -937,7 +991,7 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
 # ── Async wrappers (Flask integration) ─────────────────────────
 
 def process_file_async(file_path: str, app=None, column_map: dict | None = None,
-                       original_filename: str | None = None) -> bool:
+                       original_filename: str | None = None, run_id: int | None = None) -> bool:
     """Enqueue a single file for processing via Celery (non-blocking).
 
     Used by the upload API endpoint.
@@ -960,19 +1014,21 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
 
     # A run per submission. Without a run_id every attempt at a file matched
     # the same progress row, so each one overwrote the previous attempt's
-    # history. Best effort: no run is better than no ingest.
-    run_id = None
-    try:
-        from app.services.progress_store import start_run
-        run_id = start_run(label=original_filename or os.path.basename(str(file_path)),
-                           source='upload', total_files=1)
-    except Exception as e:
-        logger.warning(f"Could not open a processing run for {file_path}: {e}")
+    # history. Best effort: no run is better than no ingest. A given run_id
+    # continues that run (resuming an interrupted job), so it is not discarded.
+    resuming = run_id is not None
+    if not resuming:
+        try:
+            from app.services.progress_store import start_run
+            run_id = start_run(label=original_filename or os.path.basename(str(file_path)),
+                               source='upload', total_files=1)
+        except Exception as e:
+            logger.warning(f"Could not open a processing run for {file_path}: {e}")
     if run_id is not None:
         kwargs['run_id'] = int(run_id)
 
     queued = bool(_enqueue_or_warn(process_file_task, **kwargs))
-    if not queued and run_id is not None:
+    if not queued and run_id is not None and not resuming:
         # Nothing will ever report into it, and an empty run reads as
         # 'pending' forever.
         try:
@@ -981,6 +1037,71 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
         except Exception as e:
             logger.warning(f"Could not discard unused run {run_id}: {e}")
     return queued
+
+
+def release_dead_locks(data_folder: str, hostname: str) -> int:
+    """Remove ingest locks this host left behind. Call before any task runs.
+
+    A worker killed mid-ingest (container restart past its grace period, OOM)
+    cannot release its lock, and a lock looks live for
+    INGEST_LOCK_STALE_SECONDS — so the resumed job found it "held by another
+    worker" and silently did nothing. When this host's worker is only just
+    starting, nothing on it can be holding one.
+    """
+    removed = 0
+    for root, _dirs, files in os.walk(data_folder):
+        for name in files:
+            if not name.endswith(INGEST_LOCK_SUFFIX):
+                continue
+            path = os.path.join(root, name)
+            if FileLock.holder_host(path) == hostname:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    logger.warning(f"Could not remove dead ingest lock {path}", exc_info=True)
+    if removed:
+        logger.info("released dead ingest locks", count=removed, host=hostname)
+    return removed
+
+
+def resume_interrupted_jobs(hostname: str) -> int:
+    """Re-enqueue the jobs this host was running when its worker stopped.
+
+    Called once the worker is up. A job still 'processing' (or gone 'stale')
+    with worker == this host cannot be running: this worker has just started.
+    It continues in its own run, from its stored offset, with the mapping
+    saved with its upload — what the Jobs page's Retry does, done for you.
+    Covers both a cooperative stop ("Paused for a worker restart") and a hard
+    kill, whose unacked message Redis would only redeliver hours later.
+    """
+    from app.services import uploads as upload_service
+    from app.services.progress_store import load_all_jobs
+
+    resumed = 0
+    for job in load_all_jobs():
+        if job.get('worker') != hostname or job.get('status') not in ('processing', 'stale'):
+            continue
+        name = job.get('file') or ''
+        try:
+            upload = upload_service.find_by_stored_name(name)
+            if upload is not None and upload.stored_path and os.path.isfile(upload.stored_path):
+                queued = process_file_async(upload.stored_path, column_map=upload.column_map,
+                                            original_filename=upload.original_name, run_id=job.get('run_id'))
+            else:
+                path = os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, name)
+                if not os.path.isfile(path):
+                    logger.warning("interrupted job's file is gone; not resuming", file=name)
+                    continue
+                queued = process_file_async(path, original_filename=job.get('original_name'),
+                                            run_id=job.get('run_id'))
+        except Exception:
+            logger.exception("could not resume interrupted job", file=name)
+            continue
+        if queued:
+            resumed += 1
+            logger.info("resumed interrupted job", file=name, run_id=job.get('run_id'), row=job.get('current'))
+    return resumed
 
 
 def _claim_process_pending() -> bool:
