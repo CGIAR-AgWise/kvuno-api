@@ -1,35 +1,56 @@
-import { Suspense, lazy } from 'react'
+import { Suspense, lazy, useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import { ToastProvider } from './context/ToastContext'
 import Layout from './components/Layout'
+import Loading from './components/Loading'
 import Login from './pages/Login'
 import Register from './pages/Register'
 
 /**
  * Route-level code splitting. Explore alone pulls in Leaflet, markercluster
  * and leaflet.heat — roughly 200 KB of the bundle — and none of the other
- * pages need any of it, so those routes load on demand.
+ * pages need any of it, so the first load stays small.
+ *
+ * Each page's code is then prefetched once the browser is idle (see
+ * usePrefetchPages), so moving between pages does not wait on a download.
  */
-const Jobs = lazy(() => import('./pages/Jobs'))
-const Explore = lazy(() => import('./pages/Explore'))
-const Upload = lazy(() => import('./pages/Upload'))
-const Quality = lazy(() => import('./pages/Quality'))
-const Tokens = lazy(() => import('./pages/Tokens'))
-const AdminUsers = lazy(() => import('./pages/AdminUsers'))
+const PAGES = {
+  jobs: () => import('./pages/Jobs'),
+  upload: () => import('./pages/Upload'),
+  quality: () => import('./pages/Quality'),
+  tokens: () => import('./pages/Tokens'),
+  admin: () => import('./pages/AdminUsers'),
+  explore: () => import('./pages/Explore'),
+}
 
-function Loading() {
-  return (
-    <div className="kv-loading" role="status">
-      <span className="kv-seeds" aria-hidden="true">
-        <i />
-        <i />
-        <i />
-      </span>
-      <span className="visually-hidden">Loading…</span>
-    </div>
-  )
+const Jobs = lazy(PAGES.jobs)
+const Explore = lazy(PAGES.explore)
+const Upload = lazy(PAGES.upload)
+const Quality = lazy(PAGES.quality)
+const Tokens = lazy(PAGES.tokens)
+const AdminUsers = lazy(PAGES.admin)
+
+/**
+ * Download every page's chunk after the first render, when the browser is
+ * idle. The imports are the same promises lazy() uses, so a later navigation
+ * renders at once. Signed-in only: the login page has no use for them.
+ */
+function usePrefetchPages(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return
+    const load = () => {
+      for (const page of Object.values(PAGES)) void page().catch(() => undefined)
+    }
+    // Safari has no requestIdleCallback; fall back to a short delay.
+    if (typeof window.requestIdleCallback === 'function') {
+      const id = window.requestIdleCallback(load, { timeout: 3000 })
+      return () => window.cancelIdleCallback(id)
+    }
+    const id = window.setTimeout(load, 1500)
+    return () => window.clearTimeout(id)
+  }, [enabled])
 }
 
 /**
@@ -40,6 +61,7 @@ function Loading() {
 function RequireAuth({ children }: { children: ReactNode }) {
   const { token, ready } = useAuth()
   const location = useLocation()
+  usePrefetchPages(ready && Boolean(token))
 
   if (!ready) {
     return <Loading />

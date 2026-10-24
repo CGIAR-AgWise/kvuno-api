@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { fetchAdminUsers } from '../api'
 import { useAuth } from '../context/AuthContext'
+import Loading from './Loading'
 
 /**
  * How many accounts await approval, for the admin's sidebar badge. Refreshed on
@@ -304,7 +305,11 @@ export default function Layout() {
                 <p className="kv-lede">{current.description}</p>
               </header>
             )}
-            <Outlet />
+            {/* Inside the shell: while a page's code loads, the sidebar and
+                header stay and only this area waits. */}
+            <Suspense fallback={<Loading />}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
 
