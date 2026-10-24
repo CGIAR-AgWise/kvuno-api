@@ -208,8 +208,8 @@ class PlantingRecommendation(Base):
     season_type: Mapped[Optional[str]] = mapped_column(String(20))
     opt_date: Mapped[Optional[str]] = mapped_column(String(8))
     planting_option: Mapped[Optional[int]] = mapped_column(Integer)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
-    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
 
 
 class User(Base):
