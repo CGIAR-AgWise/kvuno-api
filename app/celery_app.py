@@ -73,3 +73,55 @@ def _bind_task_context(task_id=None, task=None, **_kwargs):
 def _clear_task_context(**_kwargs):
     import structlog
     structlog.contextvars.clear_contextvars()
+
+
+# ── Restarts ───────────────────────────────────────────────────
+# Restarting the worker container mid-ingest used to leave the job
+# "processing" for hours: Docker's SIGTERM reaches only the main process, the
+# warm shutdown waited for the whole file, Docker killed it after its grace
+# period, the message stayed unacked until CELERY_VISIBILITY_TIMEOUT (6 h),
+# and the dead ingest lock made a manual Retry skip the file. Now:
+#   - shutting down tells running ingests to stop at the next chunk boundary
+#     (rows + offset committed together, job marked "Paused");
+#   - starting clears this host's dead locks, then re-enqueues the jobs this
+#     host left processing, in their own runs, from their stored offsets.
+
+from celery.signals import worker_init, worker_ready, worker_shutting_down  # noqa: E402
+
+
+@worker_init.connect
+def _on_worker_init(**_kwargs):
+    # Before the pool starts: nothing on this host can hold a lock yet.
+    import socket
+
+    from app.services.housekeeper import clear_worker_stop, release_dead_locks
+    clear_worker_stop()  # a restarted container keeps its /tmp
+    try:
+        release_dead_locks(_settings.HOUSEKEEPING_DATA_DIR, socket.gethostname())
+    except Exception:
+        from app.utils.logging import get_logger
+        get_logger(__name__).exception("could not release dead ingest locks")
+
+
+@worker_ready.connect
+def _on_worker_ready(**_kwargs):
+    from app.services.housekeeper import resume_interrupted_jobs, set_app, worker_name
+    from app.tasks import _get_worker_app
+    from app.utils.logging import get_logger
+
+    app = _get_worker_app()
+    set_app(app)
+    try:
+        with app.app_context():
+            resumed = resume_interrupted_jobs(worker_name())
+        if resumed:
+            get_logger(__name__).info("re-enqueued interrupted jobs", count=resumed)
+    except Exception:
+        # Never stop the worker over this: the jobs go stale and can be retried.
+        get_logger(__name__).exception("could not resume interrupted jobs")
+
+
+@worker_shutting_down.connect
+def _on_worker_shutting_down(**_kwargs):
+    from app.services.housekeeper import request_worker_stop
+    request_worker_stop()
