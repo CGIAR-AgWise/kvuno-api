@@ -350,6 +350,7 @@ class TestRunsAndAttempts:
             (tmp_path / name).write_bytes(b'x')
         monkeypatch.setattr(hk, 'db_health_check', lambda: None)
         monkeypatch.setattr(hk, 'download_remote_files', lambda folder: [])
+        monkeypatch.setattr('app.utils.rds_to_parquet.batch_convert', lambda *a, **kw: [])
         runs = []
         monkeypatch.setattr(ps, 'start_run', lambda **kw: runs.append(kw) or 99)
         seen = []
