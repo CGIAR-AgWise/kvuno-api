@@ -60,10 +60,10 @@ _app = None
 # slowest chunk.
 INGEST_LOCK_SUFFIX = '.ingest.lock'
 
-# How long process_pending()'s de-dupe key lives. create_app() calls it once
-# per gunicorn worker, so without this N workers enqueued N identical scans.
+# process_pending()'s de-dupe key. create_app() runs once per gunicorn worker,
+# so without it N workers enqueued N identical scans. It lives for
+# STARTUP_SCAN_COOLDOWN_SECONDS.
 PROCESS_PENDING_DEDUPE_KEY = 'kvuno:process_pending'
-PROCESS_PENDING_DEDUPE_SECONDS = 300
 
 
 # ── App management ─────────────────────────────────────────────
@@ -1155,7 +1155,7 @@ def _claim_process_pending() -> bool:
         from redis import Redis
         client = Redis.from_url(get_settings().CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
         return bool(client.set(PROCESS_PENDING_DEDUPE_KEY, str(os.getpid()),
-                               nx=True, ex=PROCESS_PENDING_DEDUPE_SECONDS))
+                               nx=True, ex=get_settings().STARTUP_SCAN_COOLDOWN_SECONDS))
     except Exception as e:
         logger.debug(f"process_pending de-dupe unavailable, not de-duplicating: {e}")
         return True
@@ -1172,6 +1172,81 @@ def process_pending(app=None):
         logger.info("Startup scan already enqueued by another worker; skipping")
         return
     _enqueue_or_warn(process_pending_task)
+
+
+STARTUP_SCAN_MARKER = '.startup-scan'
+_STARTUP_SCAN_HEARTBEAT_SECONDS = 30
+
+
+def start_startup_scan(app) -> str:
+    """Scan the data folder once per deployment, from one place.
+
+    Called by create_app(), i.e. in every gunicorn worker and again whenever
+    one is recycled (MAX_REQUESTS). Each of them used to run its own scan on a
+    thread: concurrent RDS conversions collided, every recycle re-listed and
+    re-checksummed the folder, and large files were read whole inside the
+    memory-capped API container.
+
+    - HOUSEKEEPING_ENABLED: the scan is queued for the Celery worker instead
+      (process_pending, de-duplicated across processes through Redis), so the
+      API never imports files itself.
+    - Otherwise one API process runs it on a thread (run_startup_scan).
+
+    Returns what happened, for logs and tests: 'disabled', 'queued' or 'thread'.
+    """
+    settings = get_settings()
+    if not settings.STARTUP_SCAN:
+        return 'disabled'
+    if settings.HOUSEKEEPING_ENABLED:
+        process_pending()
+        return 'queued'
+    threading.Thread(target=run_startup_scan, args=(app,), name='startup-scan', daemon=True).start()
+    return 'thread'
+
+
+def run_startup_scan(app) -> bool:
+    """Run the startup scan here unless another process ran or runs it.
+
+    The claim is ``<data dir>/.startup-scan``, an O_EXCL FileLock whose staleness
+    is STARTUP_SCAN_COOLDOWN_SECONDS. A heartbeat keeps it fresh while the scan
+    runs, so no other process starts one meanwhile; afterwards the file is left
+    in place on purpose, so a process booting within the cooldown — a sibling
+    gunicorn worker, a recycled one — skips its scan. After the cooldown the
+    marker counts as stale and the next boot scans again.
+    """
+    settings = get_settings()
+    folder = settings.HOUSEKEEPING_DATA_DIR
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        logger.exception("startup scan skipped: data folder unavailable", folder=folder)
+        return False
+    claim = FileLock(os.path.join(folder, STARTUP_SCAN_MARKER), settings.STARTUP_SCAN_COOLDOWN_SECONDS)
+    if not claim.acquire():
+        logger.info("startup scan skipped: another process ran it recently or is running it")
+        return False
+
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(_STARTUP_SCAN_HEARTBEAT_SECONDS):
+            claim.touch()
+
+    threading.Thread(target=heartbeat, name='startup-scan-heartbeat', daemon=True).start()
+    try:
+        set_app(app)
+        with app.app_context():
+            load_rds_to_db(
+                data_folder=folder,
+                max_workers=settings.HOUSEKEEPING_MAX_WORKERS,
+                **housekeeping_settings(),
+            )
+    except Exception:
+        logger.exception("startup scan failed")
+    finally:
+        stop.set()
+        claim.touch()  # the cooldown starts when the scan ends; the file stays
+    return True
 
 
 # ── Housekeeping runner ──────────────────────────────────────────

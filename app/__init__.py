@@ -6,7 +6,6 @@ from alembic.config import Config as AlembicConfig
 
 from pathlib import Path
 import shutil
-import threading
 
 from app.models.database_conn import MyDb
 from app.routes.main import register_app_routes
@@ -345,30 +344,12 @@ def create_app():
     with app.app_context():
         _cleanup_temp_files()
 
-    # Start background scan for unprocessed files in the data directory.
-    # Runs in a thread so it works with or without HOUSEKEEPING_ENABLED/Redis.
-    from app.services.housekeeper import load_rds_to_db, housekeeping_settings, set_app
-    from app.utils.logging import get_logger
+    # Scan the data folder for files not yet imported — once per deployment,
+    # not once per gunicorn worker: on the Celery worker when there is one,
+    # otherwise in a single API process (see housekeeper.start_startup_scan).
+    from app.services.housekeeper import set_app, start_startup_scan
     set_app(app)
-
-    logger = get_logger(__name__)
-
-    def _startup_scan():
-        with app.app_context():
-            try:
-                settings = housekeeping_settings()
-                load_rds_to_db(
-                    data_folder=get_settings().HOUSEKEEPING_DATA_DIR,
-                    dry_run=False,
-                    max_workers=get_settings().HOUSEKEEPING_MAX_WORKERS,
-                    **settings,
-                )
-            except Exception:
-                # structlog takes key=value, not %-args: "%s" was logged literally.
-                logger.exception("startup scan failed")
-
-    thread = threading.Thread(target=_startup_scan, name='startup-scan', daemon=True)
-    thread.start()
+    start_startup_scan(app)
 
     # Behind a reverse proxy (Dokploy, nginx) request.remote_addr is the
     # proxy's address, so every client shares one rate-limit bucket and the

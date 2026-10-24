@@ -209,6 +209,12 @@ class Settings(BaseSettings):
                                     "Hand /api/v1/data/upload and Jobs retries of plain data-folder files to the "
                                     "Celery worker (needs Redis). SPA uploads and the startup scan run in the API "
                                     "process either way.")
+    STARTUP_SCAN: bool = _f(True, 'ingest',
+                            "Import new files in HOUSEKEEPING_DATA_DIR when the API starts: queued for the Celery "
+                            "worker when HOUSEKEEPING_ENABLED, otherwise run by one API process.")
+    STARTUP_SCAN_COOLDOWN_SECONDS: int = _f(300, 'ingest',
+                                            "After a startup scan, API processes booting within this many seconds "
+                                            "(sibling gunicorn workers, recycled ones) skip theirs. Minimum 60.")
     HOUSEKEEPING_MODE: Optional[Literal['oneshot', 'watch', 'dryrun']] = _f(
         None, 'ingest',
         "Worker image only: run housekeeping.py instead of Celery — oneshot (scan once and exit), watch "
@@ -305,6 +311,15 @@ class Settings(BaseSettings):
             raise ValueError(f'must be a JSON object: {e}') from None
         if not isinstance(parsed, dict):
             raise ValueError('must be a JSON object')
+        return value
+
+    @field_validator('STARTUP_SCAN_COOLDOWN_SECONDS')
+    @classmethod
+    def _cooldown(cls, value: int):
+        # The running scan refreshes its claim every 30 s; a shorter cooldown
+        # would let a second scan take over a live one.
+        if value < 60:
+            raise ValueError('must be at least 60 seconds')
         return value
 
     @field_validator('UPLOAD_ABANDON_AGE', 'CLEANUP_AGE')

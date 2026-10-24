@@ -256,7 +256,7 @@ curl http://localhost:5000/health
 ### Docker — Individual Services
 
 ```bash
-# API only (processes SPA uploads and the startup scan itself)
+# API only (processes SPA uploads, and runs the startup scan in one process)
 docker compose up -d api
 
 # API + worker (adds the Celery path; needs Redis)
@@ -317,7 +317,7 @@ When `HOUSEKEEPING_ENABLED=false` (default), the app runs entirely without Redis
 
 - The API serves data normally
 - Files submitted from the Upload page are received, inspected **and processed** in the API process, with progress on the Jobs page
-- The startup scan imports what is in the data folder, also in-process
+- The startup scan imports what is in the data folder, in one API process
 - Only `POST /api/v1/data/upload` and Jobs-page retries of plain data-folder files need the worker: without it they are saved and reported as such
 - Set `HOUSEKEEPING_ENABLED=true` (and run the worker, with Redis) to hand those to Celery
 
@@ -330,7 +330,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full details on Compose configu
 | Source | Where it is processed | Needs Redis/Celery |
 |---|---|---|
 | Upload page (tus) → **Process** | Background thread in the API process; the upload goes to `processing` | No |
-| Files already in `HOUSEKEEPING_DATA_DIR` | Startup scan: a background thread in each API process at boot | No |
+| Files already in `HOUSEKEEPING_DATA_DIR` | Startup scan (`STARTUP_SCAN`, on by default), once per deployment: queued for the Celery worker when `HOUSEKEEPING_ENABLED=true`, otherwise run by **one** API process — the others, and workers recycled within `STARTUP_SCAN_COOLDOWN_SECONDS`, skip | No |
 | `POST /api/v1/data/upload` | Celery worker when `HOUSEKEEPING_ENABLED=true`; otherwise saved for the next scan | Yes, to process at once |
 | Jobs page **Retry** | An upload: API thread, re-using its saved mapping. A plain data-folder file: Celery when `HOUSEKEEPING_ENABLED=true` | Only for plain files |
 | `python housekeeping.py` / `HOUSEKEEPING_MODE` | The CLI process, or the worker container in housekeeping mode | No |
@@ -676,6 +676,8 @@ Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — t
 | Variable | Default | Description |
 |---|---|---|
 | `HOUSEKEEPING_ENABLED` | `false` | Hand /api/v1/data/upload and Jobs retries of plain data-folder files to the Celery worker (needs Redis). SPA uploads and the startup scan run in the API process either way. |
+| `STARTUP_SCAN` | `true` | Import new files in HOUSEKEEPING_DATA_DIR when the API starts: queued for the Celery worker when HOUSEKEEPING_ENABLED, otherwise run by one API process. |
+| `STARTUP_SCAN_COOLDOWN_SECONDS` | `300` | After a startup scan, API processes booting within this many seconds (sibling gunicorn workers, recycled ones) skip theirs. Minimum 60. |
 | `HOUSEKEEPING_MODE` | — | Worker image only: run housekeeping.py instead of Celery — oneshot (scan once and exit), watch (keep importing new files) or dryrun (report only). Unset: the normal Celery worker. |
 | `HOUSEKEEPING_DATA_DIR` | `static/data` | Directory holding data files; uploads go to its `uploads/` subdirectory. |
 | `HOUSEKEEPING_BATCH_SIZE` | `2000` | Rows per insert batch. |

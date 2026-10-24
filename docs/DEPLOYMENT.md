@@ -281,7 +281,7 @@ The `worker` never migrates. It only receives tasks from the already-running API
 How files are processed:
 
 - **Upload page** — imported on a background thread in the API process (the upload shows `processing`). No worker or Redis needed.
-- **Files in the data volume** — the API scans the folder in a background thread when it starts (each gunicorn worker does; per-file locks keep the scans from colliding). `.RDS` files are converted to Parquet first.
+- **Files in the data volume** — scanned once when the API starts. With `HOUSEKEEPING_ENABLED=true` (the production stack) the scan is queued for the **worker**, so the 512 MB API never reads large files itself; without a worker, one API process runs it and the others skip (`<data dir>/.startup-scan`, cooldown `STARTUP_SCAN_COOLDOWN_SECONDS`, default 300 s). `.RDS` files are converted to Parquet first. Turn it off with `STARTUP_SCAN=false`.
 - **On demand** — run the Typer CLI in the **worker** container (same volume, 2 GB memory limit; the API is capped at 512 MB and a large RDS is read whole):
 
 ```bash
@@ -450,7 +450,8 @@ There is no Postgres volume to back up here — the database is external (see §
 | `psycopg2.OperationalError` | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Upload page files never finish processing | They run on a thread in the API process; a gunicorn worker recycled or killed mid-file (e.g. out of memory on a large file) ends it | The job goes *Stalled* after `JOB_STALE_AFTER_SECONDS`; Retry resumes from the stored offset. For very large files use the worker (`housekeeping.py`) or raise the API memory limit |
-| Files sent to `/api/v1/data/upload` never processed | `HOUSEKEEPING_ENABLED` unset/false: they are saved for the next startup scan | Restart the API (it scans at boot), run `housekeeping.py` in the worker, or set `HOUSEKEEPING_ENABLED=true` with the `worker` running |
+| Files sent to `/api/v1/data/upload` never processed | `HOUSEKEEPING_ENABLED` unset/false: they are saved for the next startup scan | Restart the API after the cooldown (`STARTUP_SCAN_COOLDOWN_SECONDS`), run `housekeeping.py` in the worker, or set `HOUSEKEEPING_ENABLED=true` with the `worker` running |
+| API restarted but the startup scan did not run | A scan ran within `STARTUP_SCAN_COOLDOWN_SECONDS` (the `.startup-scan` marker in the data folder, or the Redis key `kvuno:process_pending` with a worker), or `STARTUP_SCAN=false` | Wait for the cooldown, delete the marker/key, or run `housekeeping.py` in the worker |
 | 500s with "relation does not exist" | `RUN_MIGRATIONS=false`, or the DB was unreachable so the entrypoint skipped | `docker compose exec api python scripts/run_migrations.py` |
 | `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
 | Port 5000 already in use on the host | Another service on host port 5000 | Stop it, or remap the host side in an override: `ports: - "127.0.0.1:5003:80"` (5001 and 5002 are taken by `web` and `api-dev`) |
@@ -461,7 +462,7 @@ There is no Postgres volume to back up here — the database is external (see §
 | No approval / activation emails arrive | `SMTP_HOST` or `MAIL_FROM` unset — sending is skipped | Check the API log: `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses) '…'` means email is not configured; `Email … failed:` means SMTP rejected it (check `SMTP_SECURITY`/port/credentials). Emails have no links unless `SPA_ROOT_URL` is an absolute `http(s)` URL |
 | A user's tokens suddenly return `401` | Their account was disabled or rejected — tokens of an inactive account stop working at once, and disable/reject delete them | Re-activate the account in **Accounts**; the user signs in again for a new token |
 | Worker logs "already being ingested by another worker" | A second copy of the task (double submit, or Redis redelivery after `CELERY_VISIBILITY_TIMEOUT`) found the live `<file>.ingest.lock` | Harmless — the duplicate exits. If it happens on long files, raise `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) above the longest ingest. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (600) is taken over |
-| Startup scan log: "RDS conversion already running in another process; skipping" | Each gunicorn worker scans at boot; another one holds that file's `.convert.lock` | Harmless — that process converts and imports it |
+| Log: "RDS conversion already running in another process; skipping" | Another scan (the CLI, the watcher, the worker) holds that file's `.convert.lock` | Harmless — that process converts and imports it |
 | `FileNotFoundError` on an `.RDS` during a startup scan | Two processes converted the same file before conversion was locked (fixed in `c1388cc`) | Upgrade; the scan now skips a file another process is converting |
 | `Permission denied` binding, app exits at startup | Container runs as non-root and port 80 is privileged | Add `cap_add: [NET_BIND_SERVICE]` (compose already does for `api`) |
 | `denied: requested access to the resource is denied` on pull | Package is private or you are not logged in | `docker login ghcr.io` with a token that has `read:packages` |

@@ -81,6 +81,9 @@ env = [
     "DB_NAME=:memory:",
     # Off unless a test turns it on: a developer .env with it true made every
     # create_app() in the suite try Redis, ~6s each when Redis was down.
-    "HOUSEKEEPING_ENABLED=false"
+    "HOUSEKEEPING_ENABLED=false",
+    # Off too: every create_app() in the suite would otherwise start a scan
+    # thread over the real HOUSEKEEPING_DATA_DIR. Tests that need it turn it on.
+    "STARTUP_SCAN=false"
 ]
 
