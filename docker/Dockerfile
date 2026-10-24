@@ -44,7 +44,8 @@ WORKDIR /app
 # path as in the builder, since venv shebangs are absolute.
 COPY --from=builder /app/.venv /app/.venv
 COPY --chown=app:app . .
-RUN chmod +x /app/docker/entrypoint.sh
+RUN chmod +x /app/docker/entrypoint.sh \
+    && install -d -o app -g app /app/static/data /app/static/data/uploads
 
 USER app
 

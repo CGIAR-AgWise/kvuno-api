@@ -39,20 +39,23 @@ import uuid
 
 from sqlalchemy import or_, update
 
-from app.config import ALLOWED_EXTENSIONS, HOUSEKEEPING_DATA_DIR
+from app.config import ALLOWED_EXTENSIONS, get_settings
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, Upload
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 TUS_VERSION = '1.0.0'
 
-# Under the data directory but in a subdirectory on purpose: the startup scan
-# (`load_rds_to_db`) ingests every .rds/.parquet in the data directory's root
-# with the default mapping, which used to pick up uploads still waiting for the
-# user to map their columns.
-UPLOAD_ROOT = os.path.join(HOUSEKEEPING_DATA_DIR, 'uploads')
+
+def upload_root() -> str:
+    # Under the data directory but in a subdirectory on purpose: the startup
+    # scan (`load_rds_to_db`) ingests every .rds/.parquet in the data
+    # directory's root with the default mapping, which used to pick up uploads
+    # still waiting for the user to map their columns.
+    return os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, 'uploads')
+
 
 PART_NAME = 'data.part'
 LOCK_NAME = '.lock'
@@ -63,7 +66,6 @@ LOCK_STALE_SECONDS = 30
 WRITE_BLOCK = 64 * 1024
 
 INSPECT_HEARTBEAT_SECONDS = 30
-INSPECT_STALE_SECONDS = int(os.getenv('UPLOAD_INSPECT_STALE_SECONDS', '180'))
 
 ERROR_MAX = 2000
 
@@ -119,7 +121,7 @@ def upload_dir(upload_id: str) -> str:
     # a path, whatever the call site.
     if not valid_id(upload_id):
         raise UploadError('Invalid upload id', 404)
-    return os.path.join(UPLOAD_ROOT, upload_id)
+    return os.path.join(upload_root(), upload_id)
 
 
 def part_path(upload_id: str) -> str:
@@ -172,8 +174,18 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
         created_at=_now(),
         updated_at=_now(),
     )
-    os.makedirs(upload_dir(upload.id), exist_ok=True)
-    open(part_path(upload.id), 'wb').close()
+    try:
+        os.makedirs(upload_dir(upload.id), exist_ok=True)
+        open(part_path(upload.id), 'wb').close()
+    except OSError as e:
+        # Almost always the data volume's ownership: the container runs as the
+        # non-root `app` user (UID 1000) and a volume created before the image
+        # made the directory is owned by root. A server problem, not the
+        # client's — 503 with a stable message, and one clear log line.
+        logger.error('upload storage is not writable', path=upload_root(), error=e.__class__.__name__,
+                     errno=e.errno, hint='chown the HOUSEKEEPING_DATA_DIR volume to 1000:1000')
+        raise UploadError('Upload storage on the server is not writable. Ask an administrator to fix '
+                          'the data volume permissions.', 503) from None
 
     session = _session()
     session.add(upload)
@@ -382,7 +394,7 @@ def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | 
 
 def _claim_inspection(upload_id: str) -> bool:
     """Atomically take the inspection, so two pollers never run it twice."""
-    stale_before = _now() - datetime.timedelta(seconds=INSPECT_STALE_SECONDS)
+    stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
     session = _session()
     claimed = session.execute(
         update(Upload)
@@ -454,7 +466,7 @@ def inspect(upload_id: str, app=None):
         upload.status = 'ready'
         upload.error = None
     except Exception as e:
-        logger.error(f'Upload {upload_id}: inspection failed: {e}')
+        logger.exception(f'Upload {upload_id}: inspection failed: {e}')
         session.rollback()
         upload = session.get(Upload, upload_id)
         upload.status = 'failed'
@@ -474,7 +486,7 @@ def ensure_inspection(app, upload: Upload) -> None:
     """
     if upload.status not in ('received', 'inspecting'):
         return
-    stale_before = _now() - datetime.timedelta(seconds=INSPECT_STALE_SECONDS)
+    stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
     if upload.status == 'inspecting' and upload.updated_at and upload.updated_at >= stale_before:
         return  # alive: its heartbeat is recent
 

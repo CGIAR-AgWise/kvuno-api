@@ -44,9 +44,10 @@ def env(tmp_path, monkeypatch):
     from app.models.kvuno import Base, FileImport, Upload
     from app.routes.main import register_app_routes
 
-    monkeypatch.setattr(service, 'UPLOAD_ROOT', str(tmp_path / 'uploads'))
-    monkeypatch.setattr('app.routes.uploads.MAX_FILE_SIZE', 1024 * 1024)
-    monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', False)
+    # Settings are read per call, so the environment is all a test changes.
+    monkeypatch.setenv('HOUSEKEEPING_DATA_DIR', str(tmp_path))  # uploads in tmp/uploads
+    monkeypatch.setenv('MAX_FILE_SIZE_MB', '1')
+    monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'false')
     monkeypatch.setattr(service.threading, 'Thread', _InlineThread)
 
     current = {'user': OWNER}
@@ -148,6 +149,18 @@ class TestTusProtocol:
         assert _create(env.client, 10, name='notes.csv').status_code == 415
         assert _create(env.client, 0).status_code == 400
 
+    def test_unwritable_storage_is_a_clear_503_not_a_500(self, env, monkeypatch):
+        # Production: a root-owned data volume while the app runs as uid 1000
+        # raised PermissionError from makedirs and returned a bare 500.
+        def denied(*args, **kwargs):
+            raise PermissionError(13, 'Permission denied', 'static/data/uploads')
+
+        monkeypatch.setattr(service.os, 'makedirs', denied)
+        res = _create(env.client, 10)
+        assert res.status_code == 503
+        assert 'not writable' in res.get_json()['error']
+        assert env.session.query(service.Upload).count() == 0
+
     def test_ids_are_server_issued_and_strict(self, env):
         location = _create(env.client, 10).headers['Location']
         assert service.valid_id(location.rsplit('/', 1)[1])
@@ -172,6 +185,10 @@ class TestInspection:
 
     def test_unreadable_file_fails_with_a_reason(self, env):
         upload_id = _upload(env, b'not a parquet file')
+        # Inspection committed through its own session; requests here share the
+        # fixture's, which still holds the object as the PATCH left it. A real
+        # request starts with a fresh session.
+        env.session.expire_all()
         body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
         assert body['status'] == 'failed'
         assert body['error'].startswith('Could not read the file')
@@ -222,7 +239,7 @@ class TestSubmission:
 
     def test_enqueues_with_the_users_exact_mapping(self, env, monkeypatch):
         calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async',
                             lambda **kw: calls.append(kw) or True)
 
@@ -236,7 +253,7 @@ class TestSubmission:
 
     def test_retry_reuses_the_saved_mapping(self, env, monkeypatch):
         calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async',
                             lambda **kw: calls.append(kw) or True)
 
@@ -249,7 +266,7 @@ class TestSubmission:
         assert calls[1]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
     def test_unreachable_queue_is_reported_not_hidden(self, env, monkeypatch):
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async', lambda **kw: False)
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',

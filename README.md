@@ -19,7 +19,8 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
 - **React Frontend** — Standalone Vite + React 18 + TypeScript SPA in `frontend/`, built with pnpm and served by nginx
-- **Login & Registration UI** — SPA routes `/login` and `/register`; self-registration is limited to the email domains in `REGISTRATION_ALLOWED_DOMAINS` and is **disabled when that is unset**
+- **Login & Registration UI** — SPA routes `/login` and `/register`; anyone can register, but a new account is **pending** until an administrator approves it
+- **Account Approval** — Administrators (`ADMIN_EMAILS`, or accounts given the admin role) approve, reject, disable, and promote accounts at the SPA route `/admin/users`; optional SMTP email tells users and admins what happened
 - **Token Management** — List and revoke tokens at the SPA route `/tokens`
 - **CORS** — Cross-origin support enabled globally
 - **Request Rate Limiting** — Flask-Limiter available for route protection
@@ -36,7 +37,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 | RDS Parsing | pyreadr + pandas |
 | Authentication | Opaque bearer tokens (`{id}|{secret}`, SHA-256 at rest) + bcrypt |
 | Background Tasks | Celery + Redis (Kombu transport) |
-| Logging | loguru |
+| Logging | structlog (JSON in production, console in development) |
 | Serving | Waitress (dev) / Gunicorn (prod) |
 | Frontend | React 18 + TypeScript, Vite 6, pnpm, react-router 6; served by nginx |
 | Containerization | Docker + docker-compose |
@@ -54,6 +55,7 @@ kvuno/
 │   ├── tasks.py              # Celery task definitions
 │   ├── auth.py               # require_auth decorator
 │   ├── api/
+│   │   ├── admin.py          # Account approval + roles (/api/v1/admin, admins only)
 │   │   ├── planting_data.py  # Planting data API (public_api + protected_api)
 │   │   ├── quality.py        # Data quality endpoints
 │   │   ├── upload.py         # File upload API blueprint
@@ -77,12 +79,13 @@ kvuno/
 │   │   └── uploads.py        # tus upload server + upload lifecycle (/ui/uploads/*)
 │   ├── services/
 │   │   ├── housekeeper.py    # Ingestion pipeline (process_file, load_rds_to_db, CLI)
+│   │   ├── mailer.py         # Optional SMTP: activation, rejection, new-registration emails
 │   │   ├── uploads.py        # Upload storage, background inspection, column-mapping rules
 │   │   ├── progress_store.py # Job progress (Redis primary, DB fallback)
 │   │   └── watch_handler.py  # watchdog directory watcher
 │   ├── static/               # css/ favicon served by Flask
 │   └── utils/
-│       ├── logging.py        # SharedLogger (loguru wrapper)
+│       ├── logging.py        # setup_logging() / get_logger() (structlog)
 │       ├── downloader.py     # RDSDownloader (auth, SSRF guards)
 │       ├── rds_to_parquet.py # RDS → Parquet batch converter
 │       └── migration_utils.py# Dialect-aware column utilities
@@ -91,7 +94,7 @@ kvuno/
 │   ├── src/
 │   │   ├── App.tsx           # Client-side routes (lazy-loaded, code-split)
 │   │   ├── api.ts            # Typed fetch client for /api and /ui
-│   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens
+│   │   ├── pages/            # Login, Register, Jobs, Explore, Upload, Quality, Tokens, AdminUsers
 │   │   ├── components/       # Layout, Pagination
 │   │   ├── context/          # AuthContext, ToastContext
 │   │   └── hooks/            # useJobStream (SSE)
@@ -144,26 +147,7 @@ poetry install
 cp .env.example .env
 ```
 
-Edit `.env` with your database connection:
-
-```env
-# Required
-DB_USER=postgres
-DB_PASSWORD=postgres
-DB_NAME=agwise_api
-
-# Full URL takes priority over individual parts
-# DB_URL="postgresql://user:pass@host:5432/kvuno"
-
-# Individual parts
-DB_DRIVER=postgresql
-DB_HOST=127.0.0.1
-DB_PORT=5432
-
-# For SQLite:
-# DB_DRIVER=sqlite
-# DB_NAME=kvuno.db
-```
+Edit `.env`: the database settings (`DB_*`, or `DB_URL`) are the only ones a local setup must fill in; every other line shows its default. For SQLite set `DB_DRIVER=sqlite` and `DB_NAME=kvuno.db`.
 
 ### Make targets
 
@@ -222,12 +206,7 @@ Before doing any work, both the API and the worker verify their dependencies and
 
 Redis is optional for the API because with housekeeping off, progress is stored in PostgreSQL and nothing is enqueued — that is a supported configuration. A Celery worker with no broker is useless under any configuration, so it always requires Redis.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PREFLIGHT_ENABLED` | `true` | Set `false` to skip the check entirely |
-| `PREFLIGHT_RETRIES` | `30` | Attempts before giving up |
-| `PREFLIGHT_DELAY_SECONDS` | `2` | Wait between attempts (60s total tolerance) |
-| `PREFLIGHT_TIMEOUT_SECONDS` | `3` | Per-probe connect timeout |
+The `PREFLIGHT_*` settings (retries, delay, timeout, opt-out) are listed under [Configuration](#configuration).
 
 `run.py` is the one exception to fail-fast: with `FLASK_DEBUG=true` it logs a warning and starts anyway, so local development is not blocked by a database or broker that is not running. Containers still refuse to start, because the entrypoint check is independent of it.
 
@@ -252,7 +231,7 @@ The UI is a standalone **React 18 + TypeScript SPA** in `frontend/`, built with 
 
 Database migrations are applied by the `api` container's entrypoint when `RUN_MIGRATIONS=true` — the entrypoint's own default — but `docker-compose.yml` overrides it to `${RUN_MIGRATIONS:-false}`, so under compose either set it or run `docker compose exec api python scripts/run_migrations.py` after every upgrade. Keep it `false` if you run more than one API replica so they don't race to migrate the same schema. The `worker` deliberately does **not** migrate: it is only handed work by the already-running API.
 
-> **Set `REGISTRATION_ALLOWED_DOMAINS`** (e.g. `cgiar.org,iita.org`) on the `api`, or nobody can sign up: unset or empty disables `POST /api/v1/users/register` (`403`). Existing accounts and login are unaffected.
+> **Set `ADMIN_EMAILS`** (e.g. `you@cgiar.org`) on the `api`, or nobody can approve new accounts: anyone can register, but every new account stays `pending` until an administrator approves it. Accounts that existed before the approval migration are `approved` and unaffected. See [Accounts and approval](#accounts-and-approval).
 
 > PostgreSQL/PostGIS and Redis are **not** compose services — they are expected to run elsewhere. Point `DB_HOST` and `CELERY_BROKER_URL` at whatever is reachable, or add them back via a `docker-compose.override.yml`.
 
@@ -353,10 +332,10 @@ Redis is **not** a compose service; run it externally and point `CELERY_BROKER_U
 docker run -d --name kvuno-redis -p 6379:6379 redis:7
 
 # Start the Celery worker (Native — Linux)
-celery -A app.celery_app worker --loglevel=info
+celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}"
 
 # Start the Celery worker (Native — Windows, use solo pool)
-celery -A app.celery_app worker --loglevel=info --pool solo
+celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --pool solo
 
 # Start the Celery worker (Docker)
 docker compose up --build -d worker
@@ -406,14 +385,7 @@ What happens during a run:
 6. **Graceful shutdown** — `Ctrl+C` (or `SIGTERM`) commits completed batches and persists the offset for later resumption; a second `Ctrl+C` force-quits immediately. These handlers are installed by the CLI only — gunicorn and Celery keep their own signal handling
 7. **Telemetry** — Structured JSON events (`housekeeping.start/end`, `file.download_start/end`, `file.processing_start/end`) are written to stderr for monitoring ingestion
 
-Remote files are configured via environment variables:
-
-| Variable | Description |
-|---|---|
-| `REMOTE_RDS_URLS` | Semicolon-delimited URLs of remote `.RDS` files to download |
-| `REMOTE_RDS_TOKEN` | Bearer token for authenticated downloads |
-| `REMOTE_RDS_COOKIES` | Cookie header (e.g. `session=abc; token=xyz`) |
-| `REMOTE_RDS_HEADERS` | Custom headers as `key: value; key2: value2` |
+Remote files are configured with the `REMOTE_RDS_*` settings (see [Configuration](#configuration)).
 
 Downloads are SSRF-guarded (`app/utils/downloader.py`): HTTPS only unless `REMOTE_RDS_ALLOW_HTTP=true`; private, loopback, link-local and metadata addresses refused; redirects followed by hand (max 5), each hop re-checked, with the bearer token and `REMOTE_RDS_COOKIES` dropped when a redirect changes host; optional `REMOTE_RDS_ALLOWED_DOMAINS` (exact host or subdomain); `REMOTE_RDS_MAX_BYTES` (default 1 GiB) per file; and a post-connect peer-IP check against DNS rebinding (best effort, skipped behind an HTTP proxy).
 
@@ -443,7 +415,26 @@ curl http://localhost:5000/api/v1/planting-data/ \
 
 Or sign in through the SPA at `/login` — the token is stored as a cookie for browser navigation (`Secure` when the page is served over HTTPS). An unauthenticated browser hitting a protected endpoint is redirected to `SPA_LOGIN_PATH` (default `/login`); API clients still get a `401` JSON body. In the SPA, a `401` from any API call (an expired or revoked token) signs the user out and returns them to `/login?next=<page>`.
 
-Registration (`POST /api/v1/users/register`) is open only to email addresses whose domain is listed in `REGISTRATION_ALLOWED_DOMAINS` — exact, case-insensitive match, so `sub.cgiar.org` is not covered by `cgiar.org`. When the variable is unset or empty, registration is **disabled** (`403`). Passwords longer than 72 UTF-8 bytes (bcrypt's limit) are rejected at registration (`422`); a login with one is simply `401`.
+Registration (`POST /api/v1/users/register`) is open to any valid email address, but the new account is **pending** until an administrator approves it — see [Accounts and approval](#accounts-and-approval). Passwords longer than 72 UTF-8 bytes (bcrypt's limit) are rejected at registration (`422`); a login with one is simply `401`.
+
+### Accounts and approval
+
+Every new account starts `pending` (the register response is `201` with `"status": "pending"`) and can neither sign in nor use a token until an administrator approves it. A login with the right password for an account that is not active is `403` with `{"msg", "status"}` (`pending`, `rejected`, or `disabled`); a wrong password is always `401`, so an account's status is only revealed to someone who knows its password. Disabling or rejecting an account revokes all its tokens, and any token of an inactive account stops working at once (`401`).
+
+Administrators are:
+
+- **Owners** — the addresses in `ADMIN_EMAILS` (comma-separated, case-insensitive, read on every request). Registering with one of them skips the queue, and an owner cannot be disabled or demoted from the UI; access can always be recovered by editing that variable.
+- Approved accounts that an administrator gave the **admin** role.
+
+To bootstrap the first administrator:
+
+1. Set `ADMIN_EMAILS=you@example.org` on the `api` and restart it.
+2. Register at `/register` with that address — the account is approved immediately and you are signed in.
+3. The navbar shows **Accounts** (`/admin/users`), with a badge counting pending requests. Approve, reject (with an optional reason), disable, re-activate, or make other approved accounts admins from there. You cannot change your own account, and owners show no actions.
+
+Accounts that existed before migration `a8c4e2f1d9b3` are backfilled `approved`, so the upgrade locks nobody out.
+
+Email is optional. With `SMTP_HOST` and `MAIL_FROM` set, the API sends an activation email on approval (linking `SPA_ROOT_URL` + `/login`), a rejection email with the optional reason, and a new-registration notice to every `ADMIN_EMAILS` address (linking `SPA_ROOT_URL` + `/admin/users`); the reviewer can untick "Email the user about my decision" to skip the user's email. Links are only included when `SPA_ROOT_URL` is an absolute `http(s)` URL. Without SMTP configured nothing is sent and the API log shows `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses)` for each message instead. Sending runs on a background thread and a failure is logged, never raised.
 
 Error responses never carry exception text: a failing endpoint returns a generic `500` body and logs the exception server-side. Request validation errors (bad query/body parameters, including an unknown `sort_col`/`sort_dir`) are `422`, flask-openapi3's validation status.
 
@@ -461,6 +452,7 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `GET` | `/upload` | Required | SPA route — file upload (nginx) |
 | `GET` | `/quality` | Required | SPA route — data quality dashboard (nginx) |
 | `GET` | `/tokens` | Required | SPA route — token management (nginx) |
+| `GET` | `/admin/users` | Admin | SPA route — account approval (nginx; non-admins are sent to `/jobs`) |
 | `GET` | `/ui/jobs/data` | Required | JSON: job list |
 | `GET` | `/ui/jobs/events` | Required | SSE: live job updates (Redis pub/sub, 3s poll fallback) |
 | `POST` | `/ui/uploads/tus` | Required | tus create — `Upload-Length` + `Upload-Metadata filename`; size and extension checked before any bytes (`413`/`415`) |
@@ -473,8 +465,14 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `POST` | `/ui/process` | Required | (Re)process a stored file — Jobs page Retry; omit `column_map` to re-use the saved one |
 | `GET` | `/ui/progress/<file_name>` | Required | One job's progress record (same shape as a `/ui/jobs/data` item), or `status: unknown` |
 | `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, and `max_file_size` |
-| `POST` | `/api/v1/users/register` | — | Register a new account (email domain must be in `REGISTRATION_ALLOWED_DOMAINS`, else `403`) |
-| `POST` | `/api/v1/users/login` | — | Authenticate and get a token |
+| `POST` | `/api/v1/users/register` | — | Register a new account — `201` with `status: pending` (or `approved` for an `ADMIN_EMAILS` address); `400` invalid email, `409` taken |
+| `POST` | `/api/v1/users/login` | — | Authenticate and get a token (`401` wrong credentials, `403` + `status` when the account is pending/rejected/disabled) |
+| `GET` | `/api/v1/users/me` | Required | The signed-in account: `id`, `username`, `email`, `status`, `role`, `is_admin` |
+| `GET` | `/api/v1/admin/users` | Admin | Accounts, newest first (paginated; filter `status`, search `q` on username/email) plus `counts` per status |
+| `POST` | `/api/v1/admin/users/<id>/approve` | Admin | Approve a pending, rejected, or disabled account; optional body `{"notify": true}` |
+| `POST` | `/api/v1/admin/users/<id>/reject` | Admin | Reject a pending account and revoke its tokens; optional body `{"reason": "...", "notify": true}` (reason ≤ 500 chars) |
+| `POST` | `/api/v1/admin/users/<id>/disable` | Admin | Disable an approved account and revoke all its tokens |
+| `POST` | `/api/v1/admin/users/<id>/role` | Admin | `{"role": "admin"}` or `{"role": "user"}` — approved accounts only (`409` otherwise) |
 | `POST` | `/api/v1/users/logout` | Required | Revoke the current token (bearer header or `token` cookie) |
 | `POST` | `/api/v1/users/tokens` | Required | Create a new API token |
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
@@ -550,69 +548,190 @@ single objects.
 
 ## Configuration
 
-Key environment variables (see `.env.example`):
+Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — the single source of truth for its name, type, default and description. Code reads them with `get_settings().NAME`, never `os.getenv`. Values are validated when a process starts: an invalid one (`SMTP_PORT=abc`, `LOG_LEVEL=LOUD`, `CLEANUP_AGE=soon`) stops the API, worker or preflight with every problem listed, instead of being silently replaced by the default; the preflight also warns about a set variable that looks like a setting but is not one (`LOG_LEVLE`). An empty value (compose's `${X:-}`) means "use the default".
 
-| Variable | Description | Default | Required |
-|---|---|---|---|
-| `DB_URL` | Full database connection string (overrides DB_*) | — | |
-| `DB_DRIVER` | Database driver | `postgresql` | |
-| `DB_HOST` | Database host | `127.0.0.1` | |
-| `DB_PORT` | Database port | `5432` | |
-| `DB_USER` | Database user | — | **Yes** (unless `DB_URL`) |
-| `DB_PASSWORD` | Database password | — | **Yes** (unless `DB_URL`) |
-| `DB_NAME` | Database name | `kvuno.db` if sqlite | **Yes** (unless `DB_URL`) |
-| `TOKEN_TTL_DAYS` | Token expiration in days (`0` = never) | `0` | |
-| `REGISTRATION_ALLOWED_DOMAINS` | Comma-separated email domains allowed to self-register (exact, case-insensitive; no subdomain matching). **Unset/empty disables registration** (`403`) | — (disabled) | To allow sign-up |
-| `RATE_LIMIT_REGISTER` | flask-limiter limit string | `10 per hour` | |
-| `RATE_LIMIT_LOGIN` | flask-limiter limit string | `20 per hour` | |
-| `RATE_LIMIT_UPLOAD` | flask-limiter limit string | `10 per hour` | |
-| `RATE_LIMIT_DATA` | flask-limiter limit string | `120 per minute` | |
-| `RATE_LIMIT_COORDINATES_BULK` | flask-limiter limit string (bulk coordinates endpoint) | `20 per minute` | |
-| `RATE_LIMIT_DEFAULT_HOURLY` | Blanket limit for routes with no explicit limit — a bare **count**; the code appends `per hour` | `600` (= `600 per hour`) | |
-| `RATE_LIMIT_DEFAULT_DAILY` | Same, daily — a bare count; the code appends `per day` | `5000` (= `5000 per day`) | |
-| `PROXY_FIX_HOPS` | Number of trusted proxies in front of the app; enables real client IPs. Set `0` if nothing proxies the app, or `X-Forwarded-For` can be forged | `1` | |
-| `RATE_LIMIT_STORAGE` | Rate-limit backend URI | `memory://` | |
-| `CORS_ORIGINS` | Comma-separated allowed CORS origins | `http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173` | |
-| `SPA_ROOT_URL` | Target of the `GET /` redirect | `/` | |
-| `SPA_LOGIN_PATH` | Where `require_auth` sends an unauthenticated browser | `/login` | |
-| `FLASK_DEBUG` | Enable debug mode | `false` | |
-| `SERVER_HOST` | Bind address | `0.0.0.0` | |
-| `SERVER_PORT` | Bind port for the dev server | `80` | |
-| `BIND_PORT` | Gunicorn bind port (`app/gunicorn_config.py`) | `80` | |
-| `BIND_IP` | Gunicorn bind address | `0.0.0.0` | |
-| `WORKER_CLASS` | Gunicorn worker class — `gthread` so SSE doesn't exhaust workers | `gthread` | |
-| `WORKERS` | Gunicorn worker processes | `2` | |
-| `THREADS` | Threads per worker | `4` | |
-| `TIMEOUT` | Request timeout (s) — raised from the 30s default for large uploads | `120` | |
-| `ACCESSLOG` / `ERRORLOG` | Gunicorn log targets; `-` means stdout/stderr | `-` | |
-| `LOG_LEVEL` | Log level for both the app logger and Gunicorn | `INFO` | |
-| `DEBUG_DB` | Echo SQL statements | `false` | |
-| `SERVER_URL_PROD` | Production server URL | `https://kvuno.agwise.org` | |
-| `MAX_FILE_SIZE_MB` | Upload size cap, enforced at tus creation before any bytes are accepted | `20` | |
-| `CLEANUP_AGE` | Age after which completed jobs' files are purged at worker boot (`1d`, `12h`, …) | `1d` | |
-| `UPLOAD_ABANDON_AGE` | Idle age after which an unsubmitted upload is deleted at worker boot (same format) | `7d` | |
-| `UPLOAD_INSPECT_STALE_SECONDS` | An upload stuck in `inspecting` this long is re-claimed on the next status poll | `180` | |
-| `HOUSEKEEPING_ENABLED` | Enable Celery background processing | `false` | |
-| `HOUSEKEEPING_DATA_DIR` | Directory watched for uploads | `static/data` | |
-| `HOUSEKEEPING_BATCH_SIZE` | Rows per batch insert | `2000` | |
-| `HOUSEKEEPING_CHUNK_SIZE` | Rows per in-memory chunk | `5000` | |
-| `HOUSEKEEPING_CHECKPOINT_INTERVAL` | Batches between offset commits | `50` | |
-| `HOUSEKEEPING_MAX_WORKERS` | Max concurrent file-processing subtasks | `1` | |
-| `RDS_COLUMN_MAP` | JSON map of RDS column → ORM field | built-in defaults | |
-| `CELERY_BROKER_URL` | Redis URL for Celery broker | `redis://localhost:6379/0` | |
-| `CELERY_RESULT_BACKEND` | Redis URL for Celery results | `redis://localhost:6379/0` | |
-| `CELERY_TASK_DEFAULT_QUEUE` | Queue name for task isolation | `kvuno` | |
-| `CELERY_TASK_MAX_RETRIES` | Max retries per task | `10` | |
-| `CELERY_TASK_RETRY_DELAY` | Retry delay in seconds | `60` | |
-| `CELERY_VISIBILITY_TIMEOUT` | Redis visibility timeout (s) before an unacked task is redelivered; must exceed the longest single-file ingest | `21600` | |
-| `INGEST_LOCK_STALE_SECONDS` | Age (s) at which a per-file `<file>.ingest.lock` with no refresh is taken over as dead | `600` | |
-| `REMOTE_RDS_URLS` | Semicolon-delimited remote file URLs | — | |
-| `REMOTE_RDS_TOKEN` | Bearer token for remote downloads | — | |
-| `REMOTE_RDS_COOKIES` | Cookie header (comma-separated `k=v` pairs) | — | |
-| `REMOTE_RDS_HEADERS` | Custom headers (`key: value; key2: value2`) | — | |
-| `REMOTE_RDS_ALLOW_HTTP` | Permit non-HTTPS remote URLs | `false` | |
-| `REMOTE_RDS_ALLOWED_DOMAINS` | Comma-separated domain allow-list (exact host or a true subdomain) | — (any) | |
-| `REMOTE_RDS_MAX_BYTES` | Max bytes per remote download, enforced while streaming | `1073741824` (1 GiB) | |
+`.env.example` and the tables below are **generated** from that class — change a setting in `app/config.py`, then run `make config-docs` (CI runs `python scripts/gen_config_docs.py --check` and fails on drift).
+
+<!-- config:start (generated by scripts/gen_config_docs.py; do not edit) -->
+
+**Application**
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENVIRONMENT` | `development` | production/prod → JSON log lines (for Loki etc.); anything else → readable console logs. |
+| `APP_VERSION` | — | Version reported by /health and the API docs; set by the image build. |
+| `GITHUB_REF_NAME` | — | Fallback for APP_VERSION when built in GitHub Actions. |
+| `SPA_ROOT_URL` | — | The web app's URL: target of `GET /` for API clients, linked from the landing page, and the base of links in emails (only when an absolute http(s) URL). |
+| `SPA_LOGIN_PATH` | `/login` | Where `require_auth` sends an unauthenticated browser (a client-side SPA route). |
+
+**Logging**
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | The one log level for every process (API, worker, gunicorn, migrations). One of: DEBUG, INFO, WARNING, ERROR, CRITICAL. |
+| `LOG_DESTINATION` | `stdout` | Where logs go; keep stdout in containers (what docker logs / Dokploy collect). One of: stdout, stderr, file. |
+| `LOG_ROTATION` | `size` | Rotation for LOG_DESTINATION=file. One of: size, daily. |
+| `LOG_FILE_PATH` | — | Log file for LOG_DESTINATION=file. |
+| `LOG_MAX_BYTES` | `10485760` | Rotate the log file past this size (LOG_ROTATION=size). |
+| `LOG_BACKUP_COUNT` | `5` | Rotated log files to keep. |
+| `DEBUG_DB` | `false` | Log every SQL statement, whatever LOG_LEVEL says (very verbose). |
+
+**Database**
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_URL` | — | Full SQLAlchemy URL; wins over the DB_* parts below. |
+| `DB_DRIVER` | `postgresql` | postgresql, or sqlite for UI/auth work without Postgres (ingestion and spatial queries need Postgres). |
+| `DB_HOST` | `127.0.0.1` | Database host (from inside a container: not localhost). |
+| `DB_PORT` | `5432` | Database port. |
+| `DB_USER` | — | Database user. Required unless DB_URL is set or DB_DRIVER=sqlite. |
+| `DB_PASSWORD` | — | Database password. Required unless DB_URL is set or DB_DRIVER=sqlite. |
+| `DB_NAME` | — | Database name. Required unless DB_URL is set; with DB_DRIVER=sqlite the file name (default kvuno.db). |
+| `RUN_MIGRATIONS` | `true` | Container entrypoint applies migrations before start (compose sets false). |
+
+**Web server (development) and HTTP**
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLASK_DEBUG` | `false` | Debug mode for `python run.py`; it then starts even when the preflight fails. |
+| `SERVER_HOST` | `0.0.0.0` | Bind address for `python run.py`. |
+| `SERVER_PORT` | `80` | Port for `python run.py`. |
+| `SERVER_URL_PROD` | `https://kvuno.agwise.org` | Server listed in the OpenAPI document. |
+| `SERVER_URL_PROD_2` | `https://kvuno.akilimo.org` | Second server listed in the OpenAPI document. |
+| `CORS_ORIGINS` | `http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173` | Comma-separated origins allowed cross-origin (only `pnpm dev`; production is same-origin). |
+| `PROXY_FIX_HOPS` | `1` | Trusted proxies in front of the app, for real client IPs. 0 when nothing proxies it, or X-Forwarded-For can be forged to evade rate limits. |
+| `SORT_JSON` | `false` | Sort keys in JSON responses. |
+| `COORDINATES_BULK_MAX_ROWS` | `5000` | Map points returned by the bulk coordinates endpoint (a random sample beyond this). |
+
+**Gunicorn (production web server)**
+
+| Variable | Default | Description |
+|---|---|---|
+| `BIND_IP` | `0.0.0.0` | Gunicorn bind address. |
+| `BIND_PORT` | `80` | Gunicorn port. |
+| `BACKLOG` | `2048` | Gunicorn listen backlog. |
+| `WORKER_CLASS` | `gthread` | Gunicorn worker class (gthread: the SSE stream needs threads). |
+| `WORKERS` | `2` | Gunicorn worker processes. |
+| `THREADS` | `4` | Threads per gunicorn worker. |
+| `WORKER_CONNECTIONS` | `1000` | Max simultaneous clients per worker. |
+| `WORKER_TMP_DIR` | `/dev/shm` | Gunicorn heartbeat directory. |
+| `PRELOAD_APP` | `false` | Load the app before forking (unsafe with SQLAlchemy; leave off). |
+| `TIMEOUT` | `120` | Seconds before a silent worker is killed (raised from 30 for inline API upload conversion). |
+| `GRACEFUL_TIMEOUT` | `30` | Seconds to finish requests on restart. |
+| `KEEPALIVE` | `5` | Keep-alive seconds. |
+| `MAX_REQUESTS` | `1000` | Recycle a worker after this many requests. |
+| `MAX_REQUESTS_JITTER` | `100` | Random spread so workers do not recycle together. |
+| `ACCESSLOG` | `-` | Access log target ('-' = stdout). |
+| `ERRORLOG` | `-` | Error log target ('-' = stderr). |
+
+**Accounts and authentication**
+
+| Variable | Default | Description |
+|---|---|---|
+| `ADMIN_EMAILS` | — | Comma-separated owner addresses (case-insensitive): administrators who cannot be demoted, approved at once on registration, and sent new-registration notices. Unset: nobody can approve new accounts unless one already holds the admin role. |
+| `TOKEN_TTL_DAYS` | `0` | Days a sign-in token lasts; 0 = no expiry. |
+
+**Email (optional)**
+
+| Variable | Default | Description |
+|---|---|---|
+| `SMTP_HOST` | — | SMTP server; unset → no email is sent, and the log says so. |
+| `SMTP_PORT` | `587` | SMTP port. |
+| `SMTP_USERNAME` | — | SMTP login, skipped when empty (Mailgun: postmaster@<domain>). |
+| `SMTP_PASSWORD` | — | SMTP password. |
+| `SMTP_SECURITY` | `starttls` | starttls (587), ssl (465) or none (local relay). One of: starttls, ssl, none. |
+| `SMTP_TIMEOUT_SECONDS` | `15` | SMTP connect/send timeout. |
+| `MAIL_FROM` | — | Sender address; unset = no email is sent. |
+| `MAIL_APP_NAME` | `KVuno` | Name used in the From: header and message text. |
+
+**Uploads and data files**
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAX_FILE_SIZE_MB` | `20` | Largest upload accepted, in MB; enforced at tus creation, before any bytes arrive. |
+| `UPLOAD_ABANDON_AGE` | `7d` | Remove uploads idle this long (30m, 12h, 1d, 2w). |
+| `UPLOAD_INSPECT_STALE_SECONDS` | `180` | An upload `inspecting` this long is re-claimed on the next status poll. |
+| `CLEANUP_AGE` | `1d` | Remove files of jobs completed this long ago (30m, 12h, 1d, 2w). |
+
+**Ingestion (housekeeping)**
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOUSEKEEPING_ENABLED` | `false` | Process files with the Celery worker (needs Redis). Off: uploads are received and mapped, but nothing is ingested. |
+| `HOUSEKEEPING_DATA_DIR` | `static/data` | Directory holding data files; uploads go to its `uploads/` subdirectory. |
+| `HOUSEKEEPING_BATCH_SIZE` | `2000` | Rows per insert batch. |
+| `HOUSEKEEPING_CHUNK_SIZE` | `5000` | Rows read per chunk (sizes insert batches, not memory). |
+| `HOUSEKEEPING_CHECKPOINT_INTERVAL` | `50` | Batches between offset checkpoints. |
+| `HOUSEKEEPING_MAX_WORKERS` | `1` | Parallel files in a directory scan. |
+| `INGEST_LOCK_STALE_SECONDS` | `600` | Take over a per-file ingest lock silent this long. |
+| `RDS_COLUMN_MAP` | — | JSON object overriding the default source→DB column map. |
+
+**Celery / Redis**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CELERY_BROKER_URL` | `redis://localhost:6379/0` | Redis URL for the Celery broker (also SSE and the cache). |
+| `CELERY_RESULT_BACKEND` | `redis://localhost:6379/0` | Celery result backend URL. |
+| `CELERY_TASK_DEFAULT_QUEUE` | `kvuno` | Celery queue name. |
+| `CELERY_TASK_MAX_RETRIES` | `10` | Retries for a task failing on a transient error. |
+| `CELERY_TASK_RETRY_DELAY` | `60` | Seconds between task retries. |
+| `CELERY_VISIBILITY_TIMEOUT` | `21600` | Seconds before Redis redelivers an unacked task, even a running one: must exceed the longest single-file ingest. |
+| `CELERY_CONCURRENCY` | — | Worker processes for `python dev_worker.py`. |
+| `WORKER_MAX_MEMORY_PER_CHILD` | `2048` | MB; recycle a worker child past this (set above one file's peak). |
+| `WORKER_MAX_TASKS_PER_CHILD` | `50` | Recycle a worker child after this many tasks. |
+
+**Job progress**
+
+| Variable | Default | Description |
+|---|---|---|
+| `JOB_STALE_AFTER_SECONDS` | `1800` | A processing job silent this long is shown as stale. |
+| `JOB_PROGRESS_TTL_SECONDS` | `604800` | Redis expiry of a job's progress entry. |
+| `JOB_PROGRESS_MIN_INTERVAL` | `1.0` | Minimum seconds between published progress updates. |
+| `JOB_DB_CHECKPOINT_SECONDS` | `5.0` | Minimum seconds between durable progress writes. |
+
+**Remote RDS downloads**
+
+| Variable | Default | Description |
+|---|---|---|
+| `REMOTE_RDS_URLS` | — | Semicolon-separated HTTPS URLs fetched before a scan. |
+| `REMOTE_RDS_TOKEN` | — | Bearer token for the downloads. |
+| `REMOTE_RDS_COOKIES` | — | Cookies, comma-separated `name=value` pairs. |
+| `REMOTE_RDS_HEADERS` | — | Extra headers, comma-separated `Name: value` pairs. |
+| `REMOTE_RDS_ALLOWED_DOMAINS` | — | Comma-separated hosts downloads may come from (exact or subdomain). |
+| `REMOTE_RDS_ALLOW_HTTP` | `false` | Allow plain-HTTP download URLs. |
+| `REMOTE_RDS_MAX_BYTES` | `1073741824` | Largest download accepted, in bytes (checked while streaming). |
+
+**Rate limiting**
+
+| Variable | Default | Description |
+|---|---|---|
+| `RATE_LIMIT_REGISTER` | `10 per hour` | Registration limit (flask-limiter syntax). |
+| `RATE_LIMIT_LOGIN` | `20 per hour` | Sign-in limit. |
+| `RATE_LIMIT_UPLOAD` | `10 per hour` | API upload limit. |
+| `RATE_LIMIT_DATA` | `120 per minute` | Planting-data endpoints limit. |
+| `RATE_LIMIT_COORDINATES_BULK` | `20 per minute` | Bulk coordinates endpoint limit. |
+| `RATE_LIMIT_DEFAULT_HOURLY` | `600` | Requests per hour (a bare count) for any route without its own limit. If real users see 429s, raise this rather than the per-endpoint limits. |
+| `RATE_LIMIT_DEFAULT_DAILY` | `5000` | Requests per day (a bare count), as above. |
+| `RATE_LIMIT_STORAGE` | `memory://` | Counter storage; use Redis with several gunicorn workers. |
+
+**Startup preflight**
+
+| Variable | Default | Description |
+|---|---|---|
+| `PREFLIGHT_ENABLED` | `true` | Check the database (and Redis when required) before starting; false skips it. |
+| `PREFLIGHT_TIMEOUT_SECONDS` | `3` | Timeout per check. |
+| `PREFLIGHT_RETRIES` | `30` | Attempts before giving up. |
+| `PREFLIGHT_DELAY_SECONDS` | `2` | Seconds between attempts (30 x 2 s = 60 s tolerance). |
+| `PREFLIGHT_ROLE` | `api` | Role when the preflight is run without an argument. One of: api, worker. |
+
+**Developer tooling**
+
+| Variable | Default | Description |
+|---|---|---|
+| `OUTFILE_PATH` | `app/models/kvuno.py` | model-generator.py output file. |
+| `EXCLUDED_TABLES` | `spatial_ref_sys,alembic_version` | model-generator.py tables to skip. |
+
+<!-- config:end -->
 
 ## CI/CD
 

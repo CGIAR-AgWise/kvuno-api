@@ -46,7 +46,7 @@ class RDSFileHandler(FileSystemEventHandler):
             # There is no retrier here, and an exception escaping a watchdog
             # handler kills the observer thread, so log it and keep watching;
             # the file's offset is kept and the next event or run resumes it.
-            logger.error(f"Ingest of {path} failed, will resume on the next run: {e}")
+            logger.exception(f"Ingest of {path} failed, will resume on the next run: {e}")
 
     def on_created(self, event):
         if not event.is_directory:

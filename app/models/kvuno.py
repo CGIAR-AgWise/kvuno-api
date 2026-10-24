@@ -2,7 +2,7 @@ from typing import Any, Optional
 import datetime
 
 from geoalchemy2.types import Geometry
-from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
@@ -217,14 +217,29 @@ class User(Base):
     __table_args__ = (
         PrimaryKeyConstraint('id', name='users_pkey'),
         UniqueConstraint('email', name='users_email_key'),
-        UniqueConstraint('username', name='users_username_key')
+        UniqueConstraint('username', name='users_username_key'),
+        Index('ix_users_status', 'status'),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # with_variant: SQLite only auto-increments an INTEGER PRIMARY KEY.
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, 'sqlite'), primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
+    # pending -> approved | rejected; approved -> disabled -> approved.
+    # Only `approved` accounts (and administrators) can sign in or use a token.
+    # The column's server default is 'approved' so the migration keeps every
+    # existing account working; registration sets 'pending' explicitly.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default='pending',
+                                        server_default='approved')
+    # 'user' or 'admin'. Admins see the Accounts screens and approve, reject,
+    # disable and promote. Addresses in ADMIN_EMAILS are admins whatever this
+    # says (the "owners"), so access can always be recovered.
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default='user', server_default='user')
+    # Who changed the status last, and when — naive UTC like every timestamp here.
+    reviewed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger)
 
     user_tokens: Mapped[list['UserToken']] = relationship('UserToken', back_populates='user')
 
@@ -237,10 +252,11 @@ class UserToken(Base):
         Index('idx_user_tokens_token', 'token')
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # with_variant: SQLite only auto-increments an INTEGER PRIMARY KEY.
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, 'sqlite'), primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     token: Mapped[str] = mapped_column(String(128), nullable=False)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
     expires_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
     last_used_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 

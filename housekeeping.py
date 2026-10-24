@@ -5,7 +5,7 @@ Thin CLI wrapper; all processing logic lives in app/services/housekeeper.py.
 """
 import argparse
 
-from app.config import HOUSEKEEPING_DATA_DIR
+from app.config import get_settings
 from app.services.housekeeper import cli_run
 
 if __name__ == '__main__':
@@ -17,7 +17,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint-interval', type=int, default=None, help="Batches per checkpoint")
     # Same directory the API and worker use. The old default, static/data, was
     # a different folder, so the CLI scanned somewhere uploads never land.
-    parser.add_argument('data_folder', nargs='?', default=HOUSEKEEPING_DATA_DIR,
-                        help=f"Data directory (default: HOUSEKEEPING_DATA_DIR = {HOUSEKEEPING_DATA_DIR})")
+    data_dir = get_settings().HOUSEKEEPING_DATA_DIR
+    parser.add_argument('data_folder', nargs='?', default=data_dir,
+                        help=f"Data directory (default: HOUSEKEEPING_DATA_DIR = {data_dir})")
 
     cli_run(parser.parse_args())

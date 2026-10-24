@@ -17,7 +17,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     HOME=/app
 
-RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+# Same fixed uid/gid as the API image: both write the shared data volume.
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} app && useradd -u ${UID} -g app -d /app -s /sbin/nologin --no-log-init app
 
 WORKDIR /app
 
@@ -25,7 +28,9 @@ COPY --from=builder /app/.venv /app/.venv
 # `COPY . .` already brings in docker/entrypoint.worker.sh (.dockerignore only
 # excludes Dockerfile*), so it only needs to be made executable.
 COPY --chown=app:app . .
-RUN chown app:app /app && chmod +x /app/docker/entrypoint.worker.sh
+# See Dockerfile.prod.dockerfile: a new volume inherits this ownership.
+RUN chown app:app /app && chmod +x /app/docker/entrypoint.worker.sh \
+    && install -d -o app -g app /app/static/data /app/static/data/uploads
 
 USER app
 
@@ -33,4 +38,7 @@ USER app
 # A worker without a broker would otherwise idle forever instead of failing.
 ENTRYPOINT ["/app/docker/entrypoint.worker.sh"]
 
-CMD ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+# Shell form only to read LOG_LEVEL — the one level for every process, no
+# Celery-specific setting. `exec` keeps celery as PID 1's direct child so
+# signals (SIGTERM on stop) still reach it.
+CMD ["sh", "-c", "exec celery -A app.celery_app worker --loglevel=\"${LOG_LEVEL:-INFO}\" --concurrency=1"]

@@ -1,12 +1,7 @@
-import os
-
-from dotenv import load_dotenv
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
-
-load_dotenv(verbose=True)
 
 
 class MyDb:
@@ -23,8 +18,6 @@ class MyDb:
     # init_app()'d to several apps, each getting its own engine and session
     # scope keyed by app context.
     db = SQLAlchemy()
-    db_url: str = os.getenv("DB_URL")
-    debug_db = os.getenv('DEBUG_DB', 'false').lower() == 'true'
 
     @classmethod
     def init_app(cls, app: Flask):

@@ -20,13 +20,13 @@ from flask import current_app, jsonify, request
 
 from app.api.user import get_current_user
 from app.auth import require_auth
-from app.config import MAX_FILE_SIZE
+from app.config import get_settings
 from app.rate_limit import limiter
 from app.services import uploads as service
 from app.services.uploads import TUS_VERSION, UploadError
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 TUS_PATH = '/ui/uploads/tus'
 
@@ -82,9 +82,7 @@ def _parse_metadata(raw: str | None) -> dict[str, str]:
 
 def enqueue_upload(upload):
     """Hand a submitted upload to the worker. Shared with /ui/process (Retry)."""
-    from app.config import HOUSEKEEPING_ENABLED
-
-    if not HOUSEKEEPING_ENABLED:
+    if not get_settings().HOUSEKEEPING_ENABLED:
         service.mark_ready(upload, 'Mapping saved, but no worker is configured. '
                                    'Set HOUSEKEEPING_ENABLED=true and start a Celery worker.')
         return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
@@ -118,7 +116,8 @@ def register_upload_routes(app):
                 raise UploadError('Upload-Defer-Length is not supported; send Upload-Length')
             size = _int_header('Upload-Length')
             meta = _parse_metadata(request.headers.get('Upload-Metadata'))
-            upload = service.create(_owner_id(), meta.get('filename', ''), size, MAX_FILE_SIZE)
+            upload = service.create(_owner_id(), meta.get('filename', ''), size,
+                                    get_settings().max_file_size)
         except UploadError as e:
             return _tus_error(e)
         return '', 201, _tus_headers({'Location': f'{TUS_PATH}/{upload.id}', 'Upload-Offset': '0'})

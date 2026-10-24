@@ -1,24 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { fetchAllConflicts, fetchConflicts, fetchStats } from '../api'
-import type { Conflict, QualityStats } from '../api'
+import { fetchConflicts, fetchDuplicates, fetchStats } from '../api'
+import type { Conflict, DuplicateGroup, QualityStats } from '../api'
 import Pagination from '../components/Pagination'
-import { useToast } from '../context/ToastContext'
 
 type Tab = 'conflicts' | 'duplicates'
 
-interface DuplicateGroup {
-  key: string
-  country: string | null
-  province: string | null
-  variety: string | null
-  season_type: string | null
-  opt_date: string | null
-  count: number
-  sources: Record<string, number>
-}
+const NO_FILTERS = new URLSearchParams()
 
 export default function Quality() {
-  const toast = useToast()
   const [tab, setTab] = useState<Tab>('conflicts')
   const [stats, setStats] = useState<QualityStats | null>(null)
   const [rows, setRows] = useState<Conflict[]>([])
@@ -26,8 +15,10 @@ export default function Quality() {
   const [page, setPage] = useState(1)
   const [filters, setFilters] = useState({ country: '', source: '', search: '' })
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([])
-  const [dupsTruncated, setDupsTruncated] = useState(false)
+  const [dupMeta, setDupMeta] = useState({ total: 0, pages: 1, current_page: 1 })
+  const [dupPage, setDupPage] = useState(1)
   const [dupsLoading, setDupsLoading] = useState(false)
+  const [dupError, setDupError] = useState('')
   const [error, setError] = useState('')
 
   useEffect(() => {
@@ -59,57 +50,34 @@ export default function Quality() {
   }, [params, page])
 
   /**
-   * The duplicates view groups by country/province/variety/season/date, so it
-   * needs every conflict, not one page. The old UI asked for per_page=10000,
-   * which the server now clamps to 500 — that silently truncated the counts.
-   * This walks the pages instead.
+   * Duplicates: one page of groups, grouped by the server. Loaded only while
+   * the tab is open, and only the page shown — this used to fetch every page
+   * of conflicts to group them in the browser.
    */
-  async function loadDuplicates() {
+  useEffect(() => {
+    if (tab !== 'duplicates') return
+    const controller = new AbortController()
     setDupsLoading(true)
-    try {
-      const all = await fetchAllConflicts()
-      const grouped = new Map<string, DuplicateGroup>()
-      for (const row of all.rows) {
-        const key =
-          [row.country, row.province, row.variety, row.season_type, row.opt_date]
-            .map((v) => v ?? '')
-            .join('|')
-        let group = grouped.get(key)
-        if (!group) {
-          group = {
-            key,
-            country: row.country,
-            province: row.province,
-            variety: row.variety,
-            season_type: row.season_type,
-            opt_date: row.opt_date,
-            count: 0,
-            sources: {},
-          }
-          grouped.set(key, group)
-        }
-        group.count += 1
-        const source = row.source || 'unknown'
-        group.sources[source] = (group.sources[source] ?? 0) + 1
-      }
-      setDuplicates([...grouped.values()])
-      setDupsTruncated(all.truncated)
-    } catch (err) {
-      toast.push('Failed to load duplicates: ' + (err as Error).message, 'danger')
-    } finally {
-      setDupsLoading(false)
-    }
-  }
+    setDupError('')
+    void fetchDuplicates(NO_FILTERS, dupPage, controller.signal)
+      .then(({ rows: data, meta: m }) => {
+        setDuplicates(data)
+        setDupMeta({ total: m.total, pages: m.pages, current_page: m.current_page })
+      })
+      .catch((err: Error) => {
+        if (err.name !== 'AbortError') setDupError(err.message)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDupsLoading(false)
+      })
+    return () => controller.abort()
+  }, [tab, dupPage])
 
-  function switchTab(next: Tab) {
-    setTab(next)
-    if (next === 'duplicates' && duplicates.length === 0) void loadDuplicates()
-  }
 
   const maxSource = stats?.conflicts_by_source?.reduce((m, s) => Math.max(m, s.count), 1) ?? 1
 
   return (
-    <div className="py-3">
+    <div className="pb-3">
       <div className="row g-3 mb-3">
         {(
           [
@@ -145,7 +113,7 @@ export default function Quality() {
               </span>
               <div className="progress flex-grow-1" style={{ height: 8 }}>
                 <div
-                  className="progress-bar bg-warning"
+                  className="progress-bar"
                   role="progressbar"
                   aria-label={`Conflicts from ${s.source}`}
                   aria-valuemin={0}
@@ -166,7 +134,7 @@ export default function Quality() {
         <li className="nav-item">
           <button
             className={'nav-link' + (tab === 'conflicts' ? ' active' : '')}
-            onClick={() => switchTab('conflicts')}
+            onClick={() => setTab('conflicts')}
           >
             Conflicts
           </button>
@@ -174,7 +142,7 @@ export default function Quality() {
         <li className="nav-item">
           <button
             className={'nav-link' + (tab === 'duplicates' ? ' active' : '')}
-            onClick={() => switchTab('duplicates')}
+            onClick={() => setTab('duplicates')}
           >
             Duplicates
           </button>
@@ -237,7 +205,7 @@ export default function Quality() {
                       <td>{r.province}</td>
                       <td>{r.variety}</td>
                       <td>{r.season_type}</td>
-                      <td>{r.opt_date}</td>
+                      <td className="text-nowrap kvuno-status">{r.opt_date}</td>
                       <td>{r.source}</td>
                       <td className="d-none d-md-table-cell text-muted">{r.created_at?.slice(0, 10) ?? ''}</td>
                     </tr>
@@ -256,18 +224,16 @@ export default function Quality() {
         </div>
       ) : (
         <div className="kvuno-card p-3">
-          {dupsLoading ? (
+          {dupError && <div className="alert alert-danger">{dupError}</div>}
+          {dupsLoading && duplicates.length === 0 ? (
             <p className="text-muted text-center py-4 mb-0">Loading duplicates…</p>
           ) : duplicates.length === 0 ? (
-            <p className="text-muted text-center py-4 mb-0">No duplicates found.</p>
+            <div className="kv-empty">
+              <p>No duplicates found.</p>
+            </div>
           ) : (
             <>
-              {dupsTruncated && (
-                <div className="alert alert-warning small">
-                  Showing a partial set — these counts are a lower bound.
-                </div>
-              )}
-              <div className="kvuno-table-fit">
+              <div className="kvuno-table-fit" aria-busy={dupsLoading}>
                 <table className="table table-hover align-middle mb-0">
                   <thead className="table-light">
                     <tr>
@@ -282,12 +248,16 @@ export default function Quality() {
                   </thead>
                   <tbody>
                     {duplicates.map((g) => (
-                      <tr key={g.key}>
+                      <tr
+                        key={[g.country, g.province, g.variety, g.season_type, g.opt_date]
+                          .map((v) => v ?? '')
+                          .join('|')}
+                      >
                         <td>{g.country}</td>
                         <td>{g.province}</td>
                         <td>{g.variety}</td>
                         <td>{g.season_type}</td>
-                        <td>{g.opt_date}</td>
+                        <td className="text-nowrap kvuno-status">{g.opt_date}</td>
                         <td>
                           <span className="badge text-bg-warning">{g.count}x</span>
                         </td>
@@ -300,6 +270,12 @@ export default function Quality() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="d-flex align-items-center mt-3">
+                <Pagination page={dupMeta.current_page} pages={dupMeta.pages} onChange={setDupPage} />
+                <span className="text-muted small">
+                  {dupMeta.total.toLocaleString()} group{dupMeta.total !== 1 ? 's' : ''}
+                </span>
               </div>
             </>
           )}

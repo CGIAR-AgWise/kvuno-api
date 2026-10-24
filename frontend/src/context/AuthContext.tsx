@@ -2,15 +2,20 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { ReactNode } from 'react'
 import {
   getToken,
+  fetchMe,
   login as apiLogin,
   logout as apiLogout,
   ApiError,
   UNAUTHORIZED_EVENT,
 } from '../api'
+import type { Me } from '../api'
 
 interface AuthState {
   token: string | null
   ready: boolean
+  /** The signed-in account; null until loaded (or when signed out). */
+  me: Me | null
+  isAdmin: boolean
   login: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
 }
@@ -29,11 +34,16 @@ const AuthContext = createContext<AuthState | null>(null)
  * A 401 from any request clears storage in `request()` and dispatches
  * UNAUTHORIZED_EVENT; this provider drops its token on that event, and
  * RequireAuth then redirects to /login?next=<current page>. Without it the UI
- * stayed "signed in" while every call failed.
+ * stayed "signed in" while every call failed. That also covers an account an
+ * administrator disables: its tokens start returning 401.
+ *
+ * `me` is loaded whenever the token changes, so the navbar and the admin
+ * route know whether this account may approve others.
  */
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setTokenState] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const [me, setMe] = useState<Me | null>(null)
 
   useEffect(() => {
     setTokenState(getToken())
@@ -43,6 +53,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
   }, [])
+
+  useEffect(() => {
+    if (!token) {
+      setMe(null)
+      return
+    }
+    const controller = new AbortController()
+    fetchMe(controller.signal)
+      .then(setMe)
+      .catch(() => undefined) // a 401 is handled by UNAUTHORIZED_EVENT
+    return () => controller.abort()
+  }, [token])
 
   const login = useCallback(async (username: string, password: string) => {
     const issued = await apiLogin(username, password)
@@ -60,8 +82,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const value = useMemo<AuthState>(
-    () => ({ token, ready, login, logout }),
-    [token, ready, login, logout],
+    () => ({ token, ready, me, isAdmin: !!me?.is_admin, login, logout }),
+    [token, ready, me, login, logout],
   )
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

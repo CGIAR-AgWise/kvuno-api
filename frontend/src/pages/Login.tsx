@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { ApiError } from '../api'
+import AuthShell from '../components/AuthShell'
 
 export default function Login() {
   const { login } = useAuth()
@@ -10,26 +11,44 @@ export default function Login() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  // A 403 is a known account that may not sign in yet (awaiting approval,
+  // rejected, disabled) — shown as a notice, not as a failed attempt.
+  const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     setBusy(true)
     setError('')
+    setNotice('')
     try {
       await login(username.trim(), password)
       navigate(params.get('next') ?? '/jobs', { replace: true })
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Login failed')
+      const message = err instanceof ApiError ? err.message : 'Login failed'
+      const sentence = message.charAt(0).toUpperCase() + message.slice(1) + '.'
+      if (err instanceof ApiError && err.status === 403) setNotice(sentence)
+      else setError(sentence)
       setBusy(false)
     }
   }
 
   return (
-    <div className="container py-5" style={{ maxWidth: '26rem' }}>
-      <h1 className="h4 mb-4 text-center">Sign in to kvuno</h1>
+    <AuthShell
+      title="Sign in to KVuno"
+      after={
+        <>
+          No account? <Link to="/register">Request access</Link>
+        </>
+      }
+    >
+      {notice && (
+        <div className="alert alert-warning" role="status">
+          {notice}
+        </div>
+      )}
       {error && <div className="alert alert-danger">{error}</div>}
-      <form onSubmit={submit} className="kvuno-card p-4">
+      <form onSubmit={submit}>
         <div className="mb-3">
           <label htmlFor="username" className="form-label">
             Username
@@ -61,9 +80,6 @@ export default function Login() {
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
-      <p className="text-center text-muted small mt-3">
-        No account? <Link to="/register">Register</Link>
-      </p>
-    </div>
+    </AuthShell>
   )
 }

@@ -59,21 +59,23 @@ The compose file reads these variables from the host environment (or `.env` file
 | `TAG` | `latest` | `api` / `worker` / `web` image tag |
 | `DEV_TAG` | `develop` | `api-dev` image tag |
 | `DB_HOST` | *(required)* | Postgres host for `api`, `api-dev`, and `worker` — no default, since Postgres is external |
-| `FLASK_DEBUG` / `DEBUG_DB` | `false` (`true` for `api-dev`) | Debug mode / SQL echo |
+| `FLASK_DEBUG` / `DEBUG_DB` | from `.env` (`true` for `api-dev`) | Debug mode / SQL logging |
 | `RUN_MIGRATIONS` | `false` | Whether the `api` entrypoint migrates on start (see §4) |
 | `DATA_DIR` | `./data` | Host directory mounted at `/app/static/data` |
 | `DB_NAME` | *(required)* | Database name |
 | `DB_USER` | *(required)* | Database user |
 | `DB_PASSWORD` | *(required)* | Database password |
 
-`DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation, so e.g. `FLASK_DEBUG=true` there (as in `.env.example`) also turns debug on for `api`.
+`DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation too. `FLASK_DEBUG` only affects `python run.py` (`api-dev`); the production `api` runs gunicorn.
+
+Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the README's Configuration tables are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
 
 ### Env loading per service
 
 | Service | How it gets config |
 |---|---|
-| `api` / `api-dev` | `env_file: .env`, plus a small `environment:` block (`FLASK_DEBUG`, `DEBUG_DB`, `DB_DRIVER`, `DB_HOST`, `RUN_MIGRATIONS`, `HOUSEKEEPING_ENABLED`) that overrides `.env` |
-| `worker` | Explicit `environment:` block with `${VAR:-default}` interpolation — **no `env_file`**, so a worker setting not listed there (e.g. `WORKER_MAX_MEMORY_PER_CHILD`; `CELERY_VISIBILITY_TIMEOUT`, `INGEST_LOCK_STALE_SECONDS` and `REMOTE_RDS_MAX_BYTES` are listed) keeps its code default unless you add it to that block or an override |
+| `api` / `api-dev` | `env_file: .env`, plus an `environment:` block holding only what differs in compose (`ENVIRONMENT=production`, required `DB_HOST`, `RUN_MIGRATIONS=false`, `HOUSEKEEPING_ENABLED=false`; `api-dev` adds `FLASK_DEBUG`/`DEBUG_DB=true`) |
+| `worker` | `env_file: .env` as well — every setting reaches it — plus `ENVIRONMENT=production`, the required `DB_*`, and `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` defaulting to `redis://redis:6379/0`. (It used to list each variable by hand, so a worker setting missing from the list kept its code default.) |
 | `web` | None — nginx needs no application config; the proxy target is `api:80` in `frontend/nginx.conf` |
 | All | `load_dotenv()` at import time, so a mounted/baked `.env` also applies |
 
@@ -91,13 +93,23 @@ DB_NAME=agwise_api
 # Optional: full URL override
 # DB_URL=postgresql://postgres:postgres@<postgres-host>:5432/agwise_api
 
-# Self-registration allow-list (exact email domains, case-insensitive).
-# UNSET OR EMPTY DISABLES REGISTRATION — POST /api/v1/users/register returns 403
-# and nobody can sign up. Existing accounts and login are unaffected.
-REGISTRATION_ALLOWED_DOMAINS=cgiar.org
+# Owners: administrators who approve new accounts (comma-separated addresses,
+# case-insensitive). UNSET MEANS NOBODY CAN APPROVE NEW ACCOUNTS — anyone can
+# register, but every new account stays `pending` until an administrator acts.
+ADMIN_EMAILS=you@cgiar.org
+
+# Optional email (activation / rejection / new-registration notices).
+# With SMTP_HOST or MAIL_FROM unset nothing is sent; the API logs "email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses).
+# SMTP_HOST=smtp.example.org
+# SMTP_PORT=587
+# SMTP_SECURITY=starttls        # starttls | ssl | none
+# SMTP_USERNAME=
+# SMTP_PASSWORD=
+# MAIL_FROM=no-reply@example.org
+# SPA_ROOT_URL=https://kvuno.example.org   # absolute http(s), or emails carry no links
 ```
 
-> **Set `REGISTRATION_ALLOWED_DOMAINS` before go-live.** Registration is closed by default; matching is on the exact domain after `@`, so list subdomains (`sub.cgiar.org`) separately.
+> **Set `ADMIN_EMAILS` before go-live.** Registration is open to any address, but a new account can neither sign in nor use a token until an administrator approves it in the SPA's **Accounts** page (`/admin/users`). Owners in `ADMIN_EMAILS` are administrators by configuration: register with one of those addresses and the account is approved at once; you can then give the admin role to other approved accounts. Accounts that existed before migration `a8c4e2f1d9b3` were backfilled `approved`. In the production stack (`proxy-tool/stacks/kvuno`) set `ADMIN_EMAILS` (and the SMTP variables, if wanted) on the API service; its `RUN_MIGRATIONS=true` applies `a8c4e2f1d9b3` and `e16b8fad5988` on the next start.
 
 > **Important:** `DB_HOST` must be the *host* of your Postgres/PostGIS instance. Because `db` is no longer a compose service, `localhost` will not work from inside a container either — use the container name, service DNS name, or reachable IP.
 
@@ -257,6 +269,8 @@ docker compose exec api alembic upgrade head
 
 > **Upgrading past revision `f3a9c2d4e5b6`** (`20261022130000_planting_unique_nulls_not_distinct.py`) changes data, not just schema. On PostgreSQL ≥ 15 it **deletes** rows of `planting_recommendations` that duplicate another row on the seven key columns (`country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`) with NULLs compared as equal, keeping the lowest `id`, and prints the count; then it recreates `uq_planting_recommendation` as `UNIQUE NULLS NOT DISTINCT`, so rows with a NULL key column stop being re-inserted on every replay. The downgrade restores the plain constraint but **not** the deleted rows. On SQLite or PostgreSQL < 15 it is a no-op (logged). Because compose does not migrate by default, run it explicitly after pulling this release — and back up first if you need the duplicates.
 
+> **Revisions `a8c4e2f1d9b3`** (`20261023100000_add_user_approval_status.py`, after `f3a9c2d4e5b6`: `users.status`, `reviewed_at`, `reviewed_by`, `ix_users_status`) **and `e16b8fad5988`** (`20261023142312_add_role_column_to_users_table.py`: `users.role`, default `user`). Existing accounts get the server default `approved`, so nobody is locked out; only new registrations start `pending`. It uses `batch_alter_table`, so it also runs on SQLite. Set `ADMIN_EMAILS` in the same deploy, or new accounts pile up with nobody able to approve them.
+
 **Set it to `false` when you run more than one API replica**, otherwise each replica races to migrate the same schema — concurrent `alembic upgrade head` calls can deadlock or fail. This is the reason startup migrations were originally removed in favour of a separate step.
 
 The `worker` never migrates. It only receives tasks from the already-running API, and `process_pending()` is enqueued from `create_app()`. A task already sitting in the broker when the worker restarts could execute before the API migrates. Celery's `autoretry_for=(Exception,)` (10 retries at 60s) only covers that window for **transient** database errors (connection refused, dropped connection): `process_file` now records any other failure — including "relation does not exist" — as an `error` job and returns, so it is not retried. Migrate before starting the worker, and use the Jobs page Retry for anything that failed in between. `depends_on: api` would **not** help — the API container counts as started the moment its entrypoint begins, which is before migrations finish.
@@ -382,7 +396,7 @@ Gunicorn boots a fresh worker on every `MAX_REQUESTS` recycle and every timeout,
 
 **Worker (`docker/Dockerfile.worker`)**
 - Entrypoint `docker/entrypoint.worker.sh` runs the preflight (`scripts/preflight.py worker`: database + Redis) and never migrates
-- `celery -A app.celery_app worker --loglevel=info --concurrency=1`
+- `celery -A app.celery_app worker --loglevel="${LOG_LEVEL:-info}" --concurrency=1`
 - `restart: unless-stopped`; compose healthcheck `celery inspect ping` against its own node
 - `task_acks_late` + `task_reject_on_worker_lost=True`: a worker killed mid-ingest (OOM, container stop) puts the task back on the queue, and the retry resumes from the stored offset. Redis redelivers any unacked task after `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) **even if it is still running**, so set it above the longest single-file ingest; the per-file `.ingest.lock` stops a redelivered copy from ingesting concurrently, but the copy is wasted work
 - Celery's own SIGTERM handling (warm shutdown) is untouched — the housekeeper's graceful-shutdown handlers are installed only by `python housekeeping.py`
@@ -432,7 +446,11 @@ There is no Postgres volume to back up here — the database is external (see §
 | `ImportError: libpq` / `could not find libpq` at runtime | Plain `psycopg` needs system libpq, absent from `python:3.14-slim` | Depend on `psycopg[binary]`, or install libpq in the runtime image |
 | Port 5000 already in use on the host | Another service on host port 5000 | Stop it, or remap the host side in an override: `ports: - "127.0.0.1:5003:80"` (5001 and 5002 are taken by `web` and `api-dev`) |
 | Port 5001 already in use on the host | Another service on the `web` host port | The mapping is hardcoded (`127.0.0.1:5001:80`); change it in a `docker-compose.override.yml` |
-| Sign-up fails with `403` "registration is disabled" | `REGISTRATION_ALLOWED_DOMAINS` unset or empty — registration is closed by default | Set it on the `api` (e.g. `cgiar.org,iita.org`); a different domain gets `403` "not open to this email domain" |
+| User can sign up but not sign in (`403`, "awaiting approval") | The account is `pending` — every new registration is | An administrator approves it in **Accounts** (`/admin/users`) or with `POST /api/v1/admin/users/<id>/approve`. `rejected`/`disabled` accounts get `403` too and are re-activated the same way |
+| Nobody can approve accounts / no **Accounts** link in the navbar | `ADMIN_EMAILS` unset (and no account holds the admin role), or the admin signed up with a different address | Set `ADMIN_EMAILS` on the `api`, restart, and sign in (or register) with that address. It is read per request and compared case-insensitively |
+| Login/register 500 right after upgrading (`column users.status does not exist`) | Migrations `a8c4e2f1d9b3`/`e16b8fad5988` not applied — compose does not migrate by default | `docker compose exec api python scripts/run_migrations.py`; it backfills existing accounts as `approved` |
+| No approval / activation emails arrive | `SMTP_HOST` or `MAIL_FROM` unset — sending is skipped | Check the API log: `"email not sent: SMTP_HOST/MAIL_FROM unset" (logged with user ids, never addresses) '…'` means email is not configured; `Email … failed:` means SMTP rejected it (check `SMTP_SECURITY`/port/credentials). Emails have no links unless `SPA_ROOT_URL` is an absolute `http(s)` URL |
+| A user's tokens suddenly return `401` | Their account was disabled or rejected — tokens of an inactive account stop working at once, and disable/reject delete them | Re-activate the account in **Accounts**; the user signs in again for a new token |
 | Worker logs "already being ingested by another worker" | A second copy of the task (double submit, or Redis redelivery after `CELERY_VISIBILITY_TIMEOUT`) found the live `<file>.ingest.lock` | Harmless — the duplicate exits. If it happens on long files, raise `CELERY_VISIBILITY_TIMEOUT` (default 21600 s) above the longest ingest. A lock untouched for `INGEST_LOCK_STALE_SECONDS` (600) is taken over |
 | API restarted but the startup scan did not run | `process_pending()` claims the Redis key `kvuno:process_pending` (`SET NX EX 300`) so only one gunicorn worker enqueues it; a restart within 5 minutes skips it | Wait 5 minutes, or delete the key, or run `python housekeeping.py` |
 | `Permission denied` binding, app exits at startup | Container runs as non-root and port 80 is privileged | Add `cap_add: [NET_BIND_SERVICE]` (compose already does for `api`) |
@@ -481,6 +499,19 @@ to keep in sync. `app/config.py` falls back to `GITHUB_REF_NAME`, then
 
 ---
 
+### Web container → API (`API_UPSTREAM`)
+
+The `kvuno-web` nginx proxies `/api`, `/ui`, `/api-docs` and `/health` to `API_UPSTREAM`, rendered into its config at start (`frontend/nginx.conf` is a template). Set it to the API **by a name unique on the network**:
+
+| Deployment | `API_UPSTREAM` |
+|---|---|
+| this repo's `docker-compose.yml` | `http://kvuno-api:80` (default) |
+| production stack (`proxy-tool/stacks/kvuno`, API service `kvuno`) | `http://kvuno:80` |
+| UI hosted apart from the API | the API's public URL, e.g. `https://kvuno.akilimo.org` |
+
+⚠️ Never a bare `api`: on `dokploy-network`, which other projects share, it resolved to another project's container — `kvuno-ui.akilimo.org/health` returned someone else's JSON and every `/api`, `/ui` call a 404 page. A public-URL upstream works but goes out through the router and back; if that router replaces `X-Forwarded-For`, the API rate-limits every UI user as one client — prefer the internal name.
+
+Behind Caddy, nginx takes the client address from Caddy's `X-Forwarded-For` (trusted from private ranges only) and forwards just that, so `PROXY_FIX_HOPS=1` is right for both paths: browser → Caddy → API, and browser → Caddy → kvuno-web → API.
 ## 9. Container Registry (GHCR)
 
 Images are published to **GitHub Container Registry**, not Docker Hub:

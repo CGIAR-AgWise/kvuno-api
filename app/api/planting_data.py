@@ -2,20 +2,21 @@ import csv
 import io
 import json
 import math
-import os
 
 from flask import request, Response, stream_with_context
 from flask_openapi3 import Tag, APIBlueprint
 
 from app.auth import require_auth
 from app.cache import api_cache
-from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_COORDINATES_BULK, RATE_LIMIT_DATA
+from app.config import API_PREFIX, API_VERSION, get_settings
 from app.dto.data_filters import PlantingDataFilter
 from app.dto.pagination import get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
 from app.rate_limit import limiter
 from app.repo.planting_recommendation import PlantingRecommendationRepo
-from app.utils.logging import SharedLogger
+from app.utils.geometry import point_geojson
+from app.utils.logging import get_logger
+from app.utils.opt_date import month_day
 from pydantic import BaseModel, Field
 
 __bp__ = "/planting-data"
@@ -40,8 +41,7 @@ protected_api = APIBlueprint(
     abp_security=[{"jwt": []}]
 )
 
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 repo = PlantingRecommendationRepo()
 
@@ -109,7 +109,8 @@ MAX_PER_PAGE = 500
 # points is enough to show the shape of the distribution and costs ~120 KB.
 # The rows returned are a random sample of the whole filtered set, not the
 # first N, so the sample is representative however the data was ingested.
-COORDINATES_BULK_MAX_ROWS = int(os.getenv('COORDINATES_BULK_MAX_ROWS', '5000'))
+def _data_limit() -> str:
+    return get_settings().RATE_LIMIT_DATA
 
 
 @public_api.get('',
@@ -117,7 +118,7 @@ COORDINATES_BULK_MAX_ROWS = int(os.getenv('COORDINATES_BULK_MAX_ROWS', '5000'))
          summary="Query planting recommendation data",
          description="Return paginated planting recommendation records with optional filters (country, province, variety, season_type, date range, coordinates). Defaults to 100 records per page, capped at 500.",
          security=[])
-@limiter.limit(RATE_LIMIT_DATA)
+@limiter.limit(_data_limit)
 def get_data(query: PlantingDataFilter):
     pagination = get_pagination()
 
@@ -133,9 +134,13 @@ def get_data(query: PlantingDataFilter):
             variety=item.variety,
             season_type=item.season_type,
             opt_date=item.opt_date,
+            opt_month_day=month_day(item.opt_date),
             planting_option=item.planting_option,
             check_sum=item.check_sum,
-            coordinates=str(item.coordinates),
+            # GeoJSON Point; str() of the geometry was hex EWKB.
+            coordinates=point_geojson(item.coordinates),
+            created_at=item.created_at,
+            updated_at=item.updated_at,
         ) for item in paginated_data.items]
 
         return PlantingRecommendationResponse(
@@ -159,7 +164,7 @@ FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type']
          summary="Get distinct filter values",
          description="Return distinct values for country, province, variety, and season_type columns for use in filter dropdowns. Each column is paginated independently; `totals` reports the distinct count per column so a client can keep paging until it has them all.")
 @require_auth
-@limiter.limit(RATE_LIMIT_DATA)
+@limiter.limit(_data_limit)
 @api_cache('filters', ttl=300)
 def get_filter_options():
     pagination = get_pagination()
@@ -185,7 +190,7 @@ def get_filter_options():
          description="Return an array of {lat, lon} objects matching the specified filters, paginated server-side. Defaults to 100 points per page, capped at 500. "
                      "Pass format=compact for two flat arrays (`lats`/`lons`) instead, which is about 40% smaller on the wire and lets a client fill typed arrays directly.")
 @require_auth
-@limiter.limit(RATE_LIMIT_DATA)
+@limiter.limit(_data_limit)
 @api_cache('coordinates', ttl=120)
 def get_coordinates(query: PlantingDataFilter):
     pagination = get_pagination()
@@ -218,10 +223,10 @@ def get_coordinates(query: PlantingDataFilter):
                      "Paging /coordinates to reach the same data costs one request per 500 rows, which at 2M+ rows means thousands of round trips and exhausts the rate limit long before the map finishes. "
                      "`truncated` reports whether the cap was reached, so the UI can say the map is a sample rather than implying completeness.")
 @require_auth
-@limiter.limit(RATE_LIMIT_COORDINATES_BULK)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_COORDINATES_BULK)
 @api_cache('coordinates_bulk', ttl=120)
 def get_coordinates_all(query: PlantingDataFilter):
-    cap = max(1, min(COORDINATES_BULK_MAX_ROWS, MAX_PER_PAGE * 1000))
+    cap = max(1, min(get_settings().COORDINATES_BULK_MAX_ROWS, MAX_PER_PAGE * 1000))
     try:
         total = repo.count_coordinates(query)
         # sample=True: a random subset rather than the first N by id, which
@@ -245,7 +250,7 @@ def get_coordinates_all(query: PlantingDataFilter):
          summary="Get spatially clustered data points",
          description="Aggregate data points into spatial clusters at the given zoom level for map rendering, paginated server-side. Densest clusters are returned first.")
 @require_auth
-@limiter.limit(RATE_LIMIT_DATA)
+@limiter.limit(_data_limit)
 @api_cache('clusters', ttl=120)
 def get_clusters(query: PlantingDataFilter):
     pagination = get_pagination()
@@ -295,7 +300,7 @@ def _row_to_dict(row):
          summary="Export filtered data",
          description="Download filtered planting recommendation data as CSV (default) or JSON. Paginated server-side like the other data endpoints: 100 rows by default, 500 maximum. To export a full dataset, request successive pages and concatenate them.")
 @require_auth
-@limiter.limit(RATE_LIMIT_DATA)
+@limiter.limit(_data_limit)
 def export_data(query: PlantingDataFilter):
     fmt = request.args.get('format', 'csv')
     pagination = get_pagination()

@@ -95,15 +95,21 @@ jobs:
       - name: Run tests
         run: poetry run pytest -q --tb=short
 
-      # app/config.py raises at import if the DB env vars are missing, and
-      # pytest-env only injects them for pytest runs — a bare `python -c` gets
-      # nothing. Mirrors [tool.pytest.ini_options] env so both paths agree.
+      # .env.example and the README configuration table are generated from
+      # app/config.py; a setting changed there without regenerating fails here.
+      - name: Check generated configuration docs
+        run: poetry run python scripts/gen_config_docs.py --check
+
+      # pytest-env only injects the DB settings for pytest runs — a bare
+      # `python -c` gets nothing. Mirrors [tool.pytest.ini_options] env so both
+      # paths agree. Imports the API and worker entry modules and validates
+      # the settings, as a container start would.
       - name: Smoke-test app import
         env:
           DB_URL: "sqlite:///:memory:"
           DB_DRIVER: "sqlite"
           DB_NAME: ":memory:"
-        run: poetry run python -c "from app.config import build_db_url; print('import OK:', build_db_url())"
+        run: poetry run python -c "import app, app.celery_app, app.tasks; from app.config import get_settings; get_settings().database_url()"
 
   frontend:
     name: Frontend (typecheck + build)

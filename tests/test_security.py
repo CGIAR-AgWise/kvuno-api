@@ -35,12 +35,12 @@ class TestPathTraversalNpmServe:
 
 class TestUploadSizeEnforcement:
     def test_max_size_constant_defined(self):
-        from app.api.upload import MAX_FILE_SIZE
-        assert MAX_FILE_SIZE == 20 * 1024 * 1024
+        from app.config import get_settings
+        assert get_settings().max_file_size == 20 * 1024 * 1024
 
     def test_upload_rejects_oversized(self):
-        from app.api.upload import MAX_FILE_SIZE
-        max_mb = MAX_FILE_SIZE / 1024 / 1024
+        from app.config import get_settings
+        max_mb = get_settings().max_file_size / 1024 / 1024
         assert max_mb == 20
 
 

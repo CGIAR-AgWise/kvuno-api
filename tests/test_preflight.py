@@ -6,28 +6,16 @@ check silently permissive is worse than no check at all, so each case asserts
 the exit code for both roles.
 """
 
-import importlib
-import sys
-
 import pytest
 
-
-@pytest.fixture(autouse=True)
-def _reload_env(monkeypatch):
-    """Force app.config to re-read the environment for each scenario.
-
-    app.config binds module-level constants at import time, so without
-    dropping it from sys.modules a monkeypatched CELERY_BROKER_URL would be
-    ignored and the test would silently measure the previous scenario.
-    """
-    for name in ("app.config", "app.utils.preflight"):
-        sys.modules.pop(name, None)
-    yield
-    for name in ("app.config", "app.utils.preflight"):
-        sys.modules.pop(name, None)
+import app.utils.preflight as pf
+from app.config import get_settings
 
 
 def _preflight(monkeypatch, **env):
+    # Settings are read per call (get_settings() follows the environment), so
+    # setting the variables is enough — no module reload. Reloading app.config
+    # used to be needed and left two copies of its classes in the process.
     values = {
         "PREFLIGHT_RETRIES": "1",
         "PREFLIGHT_DELAY_SECONDS": "0.01",
@@ -36,8 +24,6 @@ def _preflight(monkeypatch, **env):
     values.update(env)
     for key, value in values.items():
         monkeypatch.setenv(key, value)
-    import app.utils.preflight as pf
-    importlib.reload(pf)
     return pf
 
 
@@ -88,8 +74,22 @@ class TestOptOut:
         ("true", True), ("1", True), ("yes", True), ("on", True),
     ])
     def test_truthy_parsing(self, monkeypatch, value, expected):
-        pf = _preflight(monkeypatch, PREFLIGHT_ENABLED=value)
-        assert pf._as_bool(value, True) is expected
+        _preflight(monkeypatch, PREFLIGHT_ENABLED=value)
+        assert get_settings().PREFLIGHT_ENABLED is expected
+
+
+class TestInvalidConfiguration:
+    def test_invalid_setting_fails_at_once_without_retrying(self, monkeypatch):
+        # Waiting cannot fix a typo, so this must not sit through the retries.
+        pf = _preflight(monkeypatch, **OK_DB, PREFLIGHT_RETRIES="1000", PREFLIGHT_DELAY_SECONDS="60",
+                        SMTP_PORT="not-a-port")
+        assert pf.run_preflight("api") == 1
+
+    def test_unknown_lookalike_variable_is_reported(self, monkeypatch):
+        from app.config import unknown_settings
+        monkeypatch.setenv("LOG_LEVLE", "DEBUG")
+        assert "LOG_LEVLE" in unknown_settings()
+        assert "LOG_LEVEL" not in unknown_settings()
 
 
 class TestCredentialRedaction:
@@ -135,8 +135,6 @@ class TestDatabaseConnectTimeoutOption:
 
         monkeypatch.setenv("DB_URL", url)
         monkeypatch.setenv("DB_DRIVER", url.split("://", 1)[0])
-        import app.utils.preflight as pf
-        importlib.reload(pf)
         monkeypatch.setattr(sqlalchemy, "create_engine", spy_create_engine)
         try:
             pf.check_database(3)
@@ -154,3 +152,29 @@ class TestDatabaseConnectTimeoutOption:
 
     def test_sqlite_gets_no_connect_args(self, monkeypatch):
         assert self._connect_args(monkeypatch, "sqlite:///:memory:") == {}
+
+
+class TestDataDirectory:
+    """Reported, never blocking: the classic root-owned volume problem."""
+
+    def test_writable_directory_is_ok(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOUSEKEEPING_DATA_DIR", str(tmp_path))
+        result = pf.check_data_dir()
+        assert result.ok and not result.blocking
+        assert (tmp_path / "uploads").is_dir()
+
+    def test_unwritable_directory_is_reported_but_not_blocking(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x")  # makedirs under a file fails on every OS
+        monkeypatch.setenv("HOUSEKEEPING_DATA_DIR", str(blocker))
+        result = pf.check_data_dir()
+        assert not result.ok
+        assert not result.blocking
+        assert "not writable" in result.detail
+
+    def test_it_does_not_stop_startup(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x")
+        _preflight(monkeypatch, **OK_DB, HOUSEKEEPING_ENABLED="false",
+                   CELERY_BROKER_URL=DEAD_REDIS, HOUSEKEEPING_DATA_DIR=str(blocker))
+        assert pf.run_preflight("api") == 0

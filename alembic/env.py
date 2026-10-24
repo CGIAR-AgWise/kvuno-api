@@ -1,14 +1,11 @@
-from logging.config import fileConfig
-
 from alembic import context
-from dotenv import load_dotenv
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from app.config import build_db_url
 from app.models import kvuno
+from app.utils.logging import setup_logging
 
-load_dotenv()
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
@@ -17,10 +14,12 @@ config = context.config
 section = config.config_ini_section
 config.set_section_option(section, "DB_URL", build_db_url())
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Logging is the app's (app/utils/logging.py): one format, one LOG_LEVEL.
+# This used to be `fileConfig(alembic.ini)`, which reset the root logger to
+# WARN with its own handler and disabled existing loggers — so in any process
+# that ran migrations, app logging went quiet and changed format afterwards.
+# alembic.ini's [loggers] sections are therefore not used.
+setup_logging()
 
 # add your model's MetaData object here
 # for 'autogenerate' support

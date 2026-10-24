@@ -41,9 +41,9 @@ import json
 import os
 import time
 
-from app.utils.logging import SharedLogger
+from app.config import get_settings
+from app.utils.logging import get_logger
 
-_shared_logger = SharedLogger()
 
 PROGRESS_CHANNEL = 'jobs:updates'
 KEY_PREFIX = 'job:'
@@ -52,20 +52,17 @@ INDEX_KEY = 'jobs:index'
 # Terminal states: always written through, never throttled.
 TERMINAL_STATUSES = {'completed', 'error'}
 
-# How long a job may go without reporting before we call it abandoned.
-STALE_AFTER_SECONDS = int(os.getenv('JOB_STALE_AFTER_SECONDS', '1800'))
-
-# Keys expire on their own so a crashed run cannot leak entries forever.
-KEY_TTL_SECONDS = int(os.getenv('JOB_PROGRESS_TTL_SECONDS', str(7 * 24 * 3600)))
-
-# Minimum seconds between published updates for one job in an active state.
-MIN_INTERVAL_SECONDS = float(os.getenv('JOB_PROGRESS_MIN_INTERVAL', '1.0'))
-
-# Minimum seconds between DURABLE writes for one job. Postgres is the record of
-# truth, but writing it on every published tick would put one write per second
-# per running job on the database. Slower than the publish throttle, terminal
-# states always write through.
-DB_CHECKPOINT_SECONDS = float(os.getenv('JOB_DB_CHECKPOINT_SECONDS', '5.0'))
+# Timings, all from app.config:
+# - JOB_STALE_AFTER_SECONDS: how long a job may go without reporting before
+#   we call it abandoned.
+# - JOB_PROGRESS_TTL_SECONDS: keys expire on their own so a crashed run cannot
+#   leak entries forever.
+# - JOB_PROGRESS_MIN_INTERVAL: minimum seconds between published updates for
+#   one job in an active state.
+# - JOB_DB_CHECKPOINT_SECONDS: minimum seconds between DURABLE writes for one
+#   job. Postgres is the record of truth, but writing it on every published
+#   tick would put one write per second per running job on the database.
+#   Slower than the publish throttle; terminal states always write through.
 
 # Postgres column widths, so a long message or error is truncated rather than
 # raising a DataError mid-ingest.
@@ -85,7 +82,7 @@ _migrated = False
 def _redis_client():
     try:
         from redis import Redis
-        url = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+        url = get_settings().CELERY_BROKER_URL
         return Redis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
     except Exception:
         return None
@@ -103,7 +100,7 @@ def mark_stale(job: dict, now: float | None = None) -> dict:
 
     last_seen = job.get('mtime') or 0
     age = now - last_seen
-    if age <= STALE_AFTER_SECONDS:
+    if age <= get_settings().JOB_STALE_AFTER_SECONDS:
         return job
 
     job['status'] = 'stale'
@@ -163,7 +160,7 @@ def _should_publish(stem: str, status: str, now: float) -> bool:
     if status in TERMINAL_STATUSES:
         return True
     last = _last_published.get(stem)
-    if last is not None and (now - last) < MIN_INTERVAL_SECONDS:
+    if last is not None and (now - last) < get_settings().JOB_PROGRESS_MIN_INTERVAL:
         return False
     return True
 
@@ -205,7 +202,7 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
                 'started_at': (r.hget(key, 'started_at') or now) if exists else now,
             })
             # Refresh expiry on every write so an active job never disappears.
-            r.expire(key, KEY_TTL_SECONDS)
+            r.expire(key, get_settings().JOB_PROGRESS_TTL_SECONDS)
             r.zadd(INDEX_KEY, {stem: now})
             job = _to_job(stem, r.hgetall(key))
             r.publish(PROGRESS_CHANNEL, json.dumps(job))
@@ -239,21 +236,21 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
 
 
 def _logger():
-    return _shared_logger.get_logger()
+    return get_logger(__name__)
 
 
 def _should_write_db(stem: str, status: str, now: float) -> bool:
     """Throttle durable writes independently of the publish throttle.
 
     Terminal states always write. Otherwise a job is checkpointed at most once
-    per DB_CHECKPOINT_SECONDS, and only when the same file has not just been
+    per JOB_DB_CHECKPOINT_SECONDS, and only when the same file has not just been
     written.
     """
     if status in TERMINAL_STATUSES:
         _last_db_write.pop(stem, None)
         return True
     last = _last_db_write.get(stem)
-    if last is not None and (now - last) < DB_CHECKPOINT_SECONDS:
+    if last is not None and (now - last) < get_settings().JOB_DB_CHECKPOINT_SECONDS:
         return False
     _last_db_write[stem] = now
     return True
@@ -366,7 +363,7 @@ def _migrate_legacy(r) -> None:
                 'mtime': data.get('mtime', time.time()),
                 'started_at': data.get('mtime', time.time()),
             })
-            r.expire(key, KEY_TTL_SECONDS)
+            r.expire(key, get_settings().JOB_PROGRESS_TTL_SECONDS)
             r.zadd(INDEX_KEY, {stem: data.get('mtime', time.time())})
     except Exception:
         pass

@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from sqlalchemy.exc import OperationalError, PendingRollbackError
 
+from app.config import get_settings
 from app.services import housekeeper as hk
 from app.services import progress_store as ps
 from app.utils.file_lock import FileLock
@@ -151,7 +152,7 @@ class TestProcessFileLock:
                                                            progress_calls, monkeypatch):
         data = tmp_path / 'a.parquet'
         data.write_bytes(b'x')
-        holder = FileLock(str(data) + hk.INGEST_LOCK_SUFFIX, hk.INGEST_LOCK_STALE_SECONDS)
+        holder = FileLock(str(data) + hk.INGEST_LOCK_SUFFIX, get_settings().INGEST_LOCK_STALE_SECONDS)
         assert holder.acquire()
 
         checksum = MagicMock()
@@ -172,7 +173,7 @@ class TestProcessFileLock:
         lock_path = str(data) + hk.INGEST_LOCK_SUFFIX
         with open(lock_path, 'w'):
             pass
-        old = time.time() - hk.INGEST_LOCK_STALE_SECONDS - 60
+        old = time.time() - get_settings().INGEST_LOCK_STALE_SECONDS - 60
         os.utime(lock_path, (old, old))
 
         seen = []
@@ -285,7 +286,7 @@ class TestRunsAndAttempts:
     def unthrottled(self, monkeypatch):
         # Back-to-back writes in a test would otherwise be dropped by the
         # publish throttle before reaching the database.
-        monkeypatch.setattr(ps, 'MIN_INTERVAL_SECONDS', 0.0)
+        monkeypatch.setenv('JOB_PROGRESS_MIN_INTERVAL', '0')
 
     def test_new_run_for_a_known_file_counts_as_another_attempt(self, db):
         from app.models.kvuno import ProcessingJob

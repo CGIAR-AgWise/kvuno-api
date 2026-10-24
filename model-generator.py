@@ -1,14 +1,13 @@
 import os
 import subprocess
 
-from dotenv import load_dotenv
-from loguru import logger
 from sqlalchemy import create_engine, MetaData
 
-from app.config import build_db_url
+from app.config import build_db_url, get_settings
+from app.utils.logging import get_logger
 
-# Load environment variables from .env file
-load_dotenv()
+
+logger = get_logger('model-generator')
 
 
 def create_dummy_file(filepath):
@@ -75,8 +74,9 @@ def run_sqlacodegen():
     # Read environment variables
     db_url = build_db_url()
 
-    outfile_path = os.getenv('OUTFILE_PATH', 'app/models/kvuno.py')
-    excluded_tables = os.getenv('EXCLUDED_TABLES', 'spatial_ref_sys,alembic_version').split(',')
+    settings = get_settings()
+    outfile_path = settings.OUTFILE_PATH
+    excluded_tables = settings.EXCLUDED_TABLES.split(',')
 
     # Create dummy file
     create_dummy_file(outfile_path)
