@@ -12,6 +12,8 @@
     "lint": "tsc -b"
   },
   "dependencies": {
+    "@fontsource/montserrat": "5.3.0",
+    "@fontsource/open-sans": "5.3.0",
     "bootstrap": "5.3.8",
     "bootstrap-icons": "1.13.2",
     "leaflet": "1.9.4",

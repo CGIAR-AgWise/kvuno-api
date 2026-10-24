@@ -4,6 +4,12 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import 'bootstrap/dist/css/bootstrap.min.css'
 import 'bootstrap-icons/font/bootstrap-icons.css'
+// AKILIMO's typefaces, self-hosted (CSP font-src 'self'): Montserrat for the
+// wordmark and titles, Open Sans for text. Latin only, the weights used.
+import '@fontsource/montserrat/latin-700.css'
+import '@fontsource/open-sans/latin-400.css'
+import '@fontsource/open-sans/latin-600.css'
+import '@fontsource/open-sans/latin-700.css'
 import './lib/theme.css'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(

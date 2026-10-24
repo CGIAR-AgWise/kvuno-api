@@ -18,6 +18,7 @@ export default function AuthShell({
     <div className="kv-auth">
       <header className="kv-auth-bar">
         <Link to="/login" className="kv-brand">
+          <span className="kv-mark" aria-hidden="true" />
           KVuno
         </Link>
         {/* Served by the API, proxied by nginx — not an SPA route. */}

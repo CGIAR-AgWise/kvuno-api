@@ -175,7 +175,7 @@ export default function Layout() {
 
       <aside ref={sidebarRef} id="kv-sidebar" className={'kv-sidebar' + (drawerOpen ? ' is-open' : '')} aria-label="Main">
         <NavLink to="/jobs" className="kv-brand" title="KVuno">
-          <span className="kv-brand-short" aria-hidden="true">K</span>
+          <span className="kv-mark" aria-hidden="true" />
           <span className="kv-label">KVuno</span>
         </NavLink>
 
@@ -264,7 +264,10 @@ export default function Layout() {
           >
             <i className="bi bi-list" />
           </button>
-          <span className="kv-topbar-brand">KVuno</span>
+          <span className="kv-topbar-brand">
+            <span className="kv-mark" aria-hidden="true" />
+            KVuno
+          </span>
         </header>
 
         <main id="kv-main" className="kv-content" tabIndex={-1}>
