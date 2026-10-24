@@ -207,3 +207,33 @@ services:
     networks:
       - dokploy-network
       - internal
+
+  # One-shot housekeeping: processes RDS/Parquet files from the data directory
+  # into the database. Run manually:
+  #   docker compose run --rm housekeeping
+  #   docker compose run --rm housekeeping --dry-run
+  #   docker compose run --rm housekeeping --watch  (runs until interrupted)
+  housekeeping:
+    container_name: kvuno-housekeeping
+    hostname: kvuno-housekeeping
+    image: ghcr.io/cgiar-agwise/kvuno-worker:${TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      DB_NAME: ${DB_NAME:?DB_NAME is required}
+    entrypoint: ["python", "housekeeping.py"]
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    volumes:
+      - ${DATA_DIR:-./data}:/app/static/data
+    networks:
+      - internal
