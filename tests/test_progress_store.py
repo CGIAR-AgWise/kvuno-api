@@ -17,6 +17,7 @@ import time
 
 import pytest
 
+from app.config import get_settings
 from app.services import progress_store as ps
 
 
@@ -142,7 +143,7 @@ class TestInFlightJobsAreDurable:
     def test_db_writes_are_throttled_but_terminal_always_writes(self, db, monkeypatch):
         from app.models.kvuno import ProcessingJob
 
-        monkeypatch.setattr(ps, 'DB_CHECKPOINT_SECONDS', 60.0)
+        monkeypatch.setenv('JOB_DB_CHECKPOINT_SECONDS', '60')
         ps.save_progress('h.parquet', 'processing', 1, 10, 'first')   # writes
         ps.save_progress('h.parquet', 'processing', 2, 10, 'second')  # throttled
         row = db.query(ProcessingJob).filter_by(file_name='h.parquet').one()
@@ -251,12 +252,12 @@ class TestClipping:
 
 class TestMarkStaleStillWorks:
     def test_long_silent_processing_job_goes_stale(self):
-        old = time.time() - (ps.STALE_AFTER_SECONDS + 10)
+        old = time.time() - (get_settings().JOB_STALE_AFTER_SECONDS + 10)
         job = {'status': 'processing', 'mtime': old, 'message': ''}
         assert ps.mark_stale(job)['status'] == 'stale'
 
     def test_terminal_jobs_are_never_marked_stale(self):
-        old = time.time() - (ps.STALE_AFTER_SECONDS + 10)
+        old = time.time() - (get_settings().JOB_STALE_AFTER_SECONDS + 10)
         for status in ('completed', 'error'):
             assert ps.mark_stale({'status': status, 'mtime': old})['status'] == status
 
@@ -336,7 +337,8 @@ class TestHousekeepingSettingsContract:
 
     def test_max_workers_is_still_reachable_for_the_batch_task(self):
         """Dropping it from the shared dict must not silently disable the pool."""
-        from app.config import HOUSEKEEPING_MAX_WORKERS
+        from app.config import get_settings
+        HOUSEKEEPING_MAX_WORKERS = get_settings().HOUSEKEEPING_MAX_WORKERS
         import inspect
         from app.services.housekeeper import load_rds_to_db
         assert 'max_workers' in inspect.signature(load_rds_to_db).parameters

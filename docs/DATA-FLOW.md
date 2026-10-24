@@ -437,4 +437,4 @@ Indexes: `ix_processing_jobs_run_id`, `ix_processing_jobs_status`, `ix_processin
 | Routes | `app/routes/uploads.py` | tus 1.0 server (`/ui/uploads/tus`) + upload lifecycle (`/ui/uploads/*`) |
 | Frontend | `frontend/` | React + TypeScript SPA (Vite/pnpm), served by nginx; the UI is not in this repo's Python layer |
 | App | `app/__init__.py` | `create_app()` — OpenAPI factory, CORS, rate limiter, security headers, DB init |
-| Config | `app/config.py` | Constants + `build_db_url()`; **raises at import if `DB_USER`/`DB_PASSWORD`/`DB_NAME` are unset** (no `DB_URL`) |
+| Config | `app/config.py` | `Settings` (pydantic-settings): every environment variable, typed and validated; read with `get_settings()`. `build_db_url()` raises when `DB_USER`/`DB_PASSWORD`/`DB_NAME` are unset (no `DB_URL`, not sqlite) |

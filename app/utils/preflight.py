@@ -16,11 +16,11 @@ off, progress is stored in PostgreSQL and no Celery worker is involved, so
 requiring Redis would break a documented, supported configuration.
 """
 
-import os
 import sys
 import time
 from dataclasses import dataclass
 
+from app.config import ConfigurationError, get_settings, unknown_settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,12 +37,6 @@ class CheckResult:
     def blocking(self) -> bool:
         """A required dependency that is not available must stop the process."""
         return self.required and not self.ok
-
-
-def _as_bool(value: str | None, default: bool) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _sanitize(url: str) -> str:
@@ -67,7 +61,7 @@ def check_database(timeout: float) -> CheckResult:
 
         from app.config import build_db_url
         url = build_db_url()
-    except Exception as exc:  # config raises at import time when misconfigured
+    except Exception as exc:  # missing DB_* variables
         return CheckResult(name, False, True, f"configuration error: {exc}")
 
     # The connect-timeout option name is driver-specific, and passing the wrong
@@ -106,31 +100,28 @@ def check_redis(timeout: float, role: str = "api") -> CheckResult:
     documented, supported configuration.
     """
     name = "redis"
-    try:
-        from app.config import CELERY_BROKER_URL
-    except Exception as exc:
-        return CheckResult(name, False, role == "worker", f"configuration error: {exc}")
-
-    required = role == "worker" or _as_bool(os.getenv("HOUSEKEEPING_ENABLED"), False)
+    settings = get_settings()
+    broker_url = settings.CELERY_BROKER_URL
+    required = role == "worker" or settings.HOUSEKEEPING_ENABLED
     client = None
     try:
         from redis import Redis
 
         client = Redis.from_url(
-            CELERY_BROKER_URL,
+            broker_url,
             socket_connect_timeout=timeout,
             socket_timeout=timeout,
         )
         client.ping()
         return CheckResult(
-            name, True, required, f"connected ({_sanitize(CELERY_BROKER_URL)})"
+            name, True, required, f"connected ({_sanitize(broker_url)})"
         )
     except Exception as exc:
         if not required:
             # Not an error: the app stores progress in PostgreSQL and enqueues
             # no work when housekeeping is off.
             return CheckResult(name, False, False, f"not reachable, not required: {exc}")
-        return CheckResult(name, False, True, f"unreachable ({_sanitize(CELERY_BROKER_URL)}): {exc}")
+        return CheckResult(name, False, True, f"unreachable ({_sanitize(broker_url)}): {exc}")
     finally:
         if client is not None:
             try:
@@ -146,13 +137,23 @@ def run_preflight(role: str = "api") -> int:
     require Redis unconditionally. Returns a process exit code rather than
     calling ``sys.exit`` so it is testable.
     """
-    if not _as_bool(os.getenv("PREFLIGHT_ENABLED"), True):
+    for name in unknown_settings():
+        # Most likely a typo (LOG_LEVLE): it is ignored, so its default applies.
+        logger.warning(f"[preflight] {name} is set but is not a setting; ignored")
+    # Invalid settings next, and without retrying: waiting cannot fix them.
+    try:
+        settings = get_settings()
+    except ConfigurationError as exc:
+        logger.error(f"[preflight] {exc}")
+        return 1
+
+    if not settings.PREFLIGHT_ENABLED:
         logger.info(f"[preflight] PREFLIGHT_ENABLED=false — skipping ({role})")
         return 0
 
-    timeout = float(os.getenv("PREFLIGHT_TIMEOUT_SECONDS", "3"))
-    retries = int(os.getenv("PREFLIGHT_RETRIES", "30"))
-    delay = float(os.getenv("PREFLIGHT_DELAY_SECONDS", "2"))
+    timeout = settings.PREFLIGHT_TIMEOUT_SECONDS
+    retries = settings.PREFLIGHT_RETRIES
+    delay = settings.PREFLIGHT_DELAY_SECONDS
 
     def database_probe() -> CheckResult:
         return check_database(timeout)
@@ -197,7 +198,13 @@ def run_preflight(role: str = "api") -> int:
 
 
 def main() -> None:
-    role = sys.argv[1] if len(sys.argv) > 1 else os.getenv("PREFLIGHT_ROLE", "api")
+    if len(sys.argv) > 1:
+        role = sys.argv[1]
+    else:
+        try:
+            role = get_settings().PREFLIGHT_ROLE
+        except ConfigurationError:
+            role = "api"  # run_preflight() reports the configuration error
     sys.exit(run_preflight(role))
 
 

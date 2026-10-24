@@ -34,15 +34,15 @@ services:
       context: .
       dockerfile: docker/Dockerfile.prod.dockerfile
     restart: unless-stopped
+    # Settings come from .env; their defaults live in app/config.py (see
+    # .env.example, generated from it). `environment:` holds only what differs
+    # in compose — restating a default here is how values used to drift.
     env_file:
       - .env
     environment: &api-environment
       # production = JSON log lines (app/utils/logging.py); set development for
       # readable console output.
       ENVIRONMENT: ${ENVIRONMENT:-production}
-      FLASK_DEBUG: ${FLASK_DEBUG:-false}
-      DEBUG_DB: ${DEBUG_DB:-false}
-      DB_DRIVER: ${DB_DRIVER:-postgresql}
       # Postgres/PostGIS is not a compose service, so there is no sensible
       # default host: set it in .env (or the shell) to a host reachable from
       # inside the container — not localhost.
@@ -54,17 +54,9 @@ services:
       # Set true to let the api migrate on start — but never with more than one
       # replica, or they race to migrate the same schema.
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
-    #      DB_PORT: ${DB_PORT:-5432}
-    #      DB_USER: ${DB_USER:?DB_USER is required}
-    #      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-    #      DB_NAME: ${DB_NAME:?DB_NAME is required}
-    #      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
-    #      SERVER_PORT: ${SERVER_PORT:-80}
+      # Pinned off whatever .env says: this compose file's api enqueues no
+      # work (set it true, with CELERY_BROKER_URL, to hand uploads to `worker`).
       HOUSEKEEPING_ENABLED: false
-    #      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
-    #      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
-    #      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
-
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
@@ -149,34 +141,21 @@ services:
       context: .
       dockerfile: docker/Dockerfile.worker
     restart: unless-stopped
+    # The same .env as the api, so every setting reaches the worker. It used
+    # to list each variable by hand, and a new worker-side setting silently
+    # kept its default until someone remembered to add it here as well.
+    env_file:
+      - .env
     environment:
-      DEBUG_DB: ${DEBUG_DB:-false}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # JSON log lines, matching the api (app/utils/logging.py).
       ENVIRONMENT: ${ENVIRONMENT:-production}
-      DB_DRIVER: ${DB_DRIVER:-postgresql}
       DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
-      DB_PORT: ${DB_PORT:-5432}
       DB_USER: ${DB_USER:?DB_USER is required}
       DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
       DB_NAME: ${DB_NAME:?DB_NAME is required}
+      # Redis is external too; the app's default (localhost) is wrong in a container.
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
-      CELERY_TASK_DEFAULT_QUEUE: ${CELERY_TASK_DEFAULT_QUEUE:-kvuno}
-      CELERY_TASK_MAX_RETRIES: ${CELERY_TASK_MAX_RETRIES:-10}
-      CELERY_TASK_RETRY_DELAY: ${CELERY_TASK_RETRY_DELAY:-60}
-      # Redis redelivers an unacked task after this; keep it above the longest
-      # single-file ingest or a second worker picks the same file up.
-      CELERY_VISIBILITY_TIMEOUT: ${CELERY_VISIBILITY_TIMEOUT:-21600}
-      INGEST_LOCK_STALE_SECONDS: ${INGEST_LOCK_STALE_SECONDS:-600}
-      REMOTE_RDS_MAX_BYTES: ${REMOTE_RDS_MAX_BYTES:-1073741824}
-      HOUSEKEEPING_BATCH_SIZE: ${HOUSEKEEPING_BATCH_SIZE:-2000}
-      HOUSEKEEPING_CHUNK_SIZE: ${HOUSEKEEPING_CHUNK_SIZE:-5000}
-      HOUSEKEEPING_CHECKPOINT_INTERVAL: ${HOUSEKEEPING_CHECKPOINT_INTERVAL:-50}
-      HOUSEKEEPING_MAX_WORKERS: ${HOUSEKEEPING_MAX_WORKERS:-1}
-      REMOTE_RDS_URLS: ${REMOTE_RDS_URLS:-}
-
-      RDS_COLUMN_MAP: ${RDS_COLUMN_MAP:-}
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     # Contain an ingest spike in this container instead of letting it OOM the

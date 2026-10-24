@@ -5,7 +5,7 @@ import json
 from redis import Redis
 from redis.exceptions import RedisError
 
-from app.config import CELERY_BROKER_URL
+from app.config import get_settings
 
 _client = None
 
@@ -13,7 +13,7 @@ _client = None
 def _get_client() -> Redis:
     global _client
     if _client is None:
-        _client = Redis.from_url(CELERY_BROKER_URL, socket_connect_timeout=1, socket_timeout=1)
+        _client = Redis.from_url(get_settings().CELERY_BROKER_URL, socket_connect_timeout=1, socket_timeout=1)
     return _client
 
 

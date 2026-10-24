@@ -233,7 +233,7 @@ class TestNoPersonalDataInLogs:
     def test_register_review_and_email_logs_carry_ids_not_addresses(self, env, monkeypatch, caplog):
         from app.services import mailer
         monkeypatch.setattr(mailer, 'send_mail', _real_send_mail)
-        monkeypatch.setattr(mailer.config, 'SMTP_HOST', '')  # logged as "not sent"
+        monkeypatch.setenv('SMTP_HOST', '')  # logged as "not sent"
 
         token = _admin_token(env)
         caplog.clear()
@@ -257,8 +257,8 @@ class TestNoPersonalDataInLogs:
     def test_smtp_failure_logs_the_code_not_the_message(self, monkeypatch, caplog):
         import smtplib
         from app.services import mailer
-        monkeypatch.setattr(mailer.config, 'SMTP_HOST', 'smtp.example.org')
-        monkeypatch.setattr(mailer.config, 'MAIL_FROM', 'noreply@example.org')
+        monkeypatch.setenv('SMTP_HOST', 'smtp.example.org')
+        monkeypatch.setenv('MAIL_FROM', 'noreply@example.org')
 
         def refuse(*args, **kwargs):
             raise smtplib.SMTPRecipientsRefused({'secret@cgiar.org': (550, b'no such user secret@cgiar.org')})
@@ -273,18 +273,15 @@ class TestNoPersonalDataInLogs:
 
 
 class TestMailer:
-    # Patch mailer.config, the module object the mailer actually reads: other
-    # tests re-import app.config, so `from app import config` here can be a
-    # different object in a full run.
     def test_unconfigured_mail_is_logged_not_sent(self, monkeypatch):
         from app.services import mailer
-        monkeypatch.setattr(mailer.config, 'SMTP_HOST', '')
+        monkeypatch.setenv('SMTP_HOST', '')
         assert mailer.send_mail(['a@b.org'], 'Hi', 'body') is False
 
     def test_configured_mail_builds_a_proper_message(self, monkeypatch):
         from app.services import mailer
-        monkeypatch.setattr(mailer.config, 'SMTP_HOST', 'smtp.example.org')
-        monkeypatch.setattr(mailer.config, 'MAIL_FROM', 'noreply@example.org')
+        monkeypatch.setenv('SMTP_HOST', 'smtp.example.org')
+        monkeypatch.setenv('MAIL_FROM', 'noreply@example.org')
         captured = []
         monkeypatch.setattr(mailer, '_deliver', lambda msg, ref: captured.append(msg) or True)
         assert mailer.send_mail(['a@b.org'], 'Hi', 'body', background=False) is True

@@ -35,7 +35,8 @@ dependencies = [
     "bcrypt (>=5.0.0,<6.0.0)",
     "psycopg[binary] (>=3.3.6,<4.0.0)",
     "pyarrow (>=20.0.0,<26.0.0)",
-    "structlog (>=26.1.0,<27.0.0)"
+    "structlog (>=26.1.0,<27.0.0)",
+    "pydantic-settings (>=2.15.0,<3.0.0)"
 ]
 
 [project.scripts]

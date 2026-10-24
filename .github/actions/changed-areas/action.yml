@@ -81,8 +81,10 @@ runs:
                 image_python=true; image_web=true ;;
             esac
 
+            # README.md and .env.example: their configuration parts are
+            # generated from app/config.py, and the Python job checks the drift.
             case "$f" in
-              app/*|tests/*|alembic/*|scripts/*|pyproject.toml|poetry.lock|alembic.ini|*.py) python=true ;;
+              app/*|tests/*|alembic/*|scripts/*|pyproject.toml|poetry.lock|alembic.ini|*.py|README.md|.env.example) python=true ;;
             esac
             case "$f" in
               frontend/*.md) ;;

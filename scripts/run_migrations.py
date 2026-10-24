@@ -8,7 +8,6 @@ It does not start the web server.
 """
 import os
 import sys
-from dotenv import load_dotenv
 
 # Ensure the project root is on sys.path
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,8 +16,6 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 
-
-load_dotenv()
 
 from app.__init__ import run_migrations  # noqa: E402
 from app.models.database_conn import MyDb  # noqa: E402

@@ -133,11 +133,9 @@ _REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
 def _max_download_bytes() -> int:
-    """REMOTE_RDS_MAX_BYTES, default 1 GiB. Read per download, not at import."""
-    try:
-        value = int(os.getenv('REMOTE_RDS_MAX_BYTES', str(1024 ** 3)))
-    except ValueError:
-        value = 1024 ** 3
+    """REMOTE_RDS_MAX_BYTES (default 1 GiB; 0 or less means the default). Read per download."""
+    from app.config import get_settings
+    value = get_settings().REMOTE_RDS_MAX_BYTES
     return value if value > 0 else 1024 ** 3
 
 

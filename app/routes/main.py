@@ -7,7 +7,7 @@ from flask import abort, redirect, jsonify, request, Response, stream_with_conte
 from pathlib import Path
 
 from app.auth import require_auth
-from app.config import HOUSEKEEPING_DATA_DIR, MAX_FILE_SIZE
+from app.config import ALLOWED_EXTENSIONS, APP_NAME, get_settings
 from app.models.database_conn import MyDb
 from app.routes.uploads import enqueue_upload, register_upload_routes
 from app.services import uploads as upload_service
@@ -15,9 +15,6 @@ from app.services.uploads import COLUMN_ALIASES, DB_TARGET_COLUMNS, UploadError
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-DATA_DIR = HOUSEKEEPING_DATA_DIR
-ALLOWED_EXTENSIONS = {'.rds', '.parquet'}
 
 
 def _load_jobs():
@@ -38,7 +35,7 @@ def _in_data_dir(file_name: str) -> Path | None:
 
     `is_relative_to`, not a string prefix: '/data2/x' starts with '/data'.
     """
-    data_dir = Path(DATA_DIR).resolve()
+    data_dir = Path(get_settings().HOUSEKEEPING_DATA_DIR).resolve()
     file_path = (data_dir / file_name).resolve()
     return file_path if file_path.is_relative_to(data_dir) else None
 
@@ -65,13 +62,13 @@ def register_app_routes(app):
         '/': that pointed the redirect back at *this* service, an infinite
         loop reported as ERR_TOO_MANY_REDIRECTS.
         """
-        spa_root = os.getenv('SPA_ROOT_URL', '').strip()
+        settings = get_settings()
+        spa_root = settings.SPA_ROOT_URL.strip()
         # Explicit text/html only: curl, fetch and test clients send */*, and
         # must keep getting JSON or the redirect.
         if 'text/html' in request.headers.get('Accept', ''):
-            from app.config import APP_NAME, APP_VERSION
             from app.routes.dashboard import render_dashboard
-            return Response(render_dashboard(APP_NAME, APP_VERSION, spa_root),
+            return Response(render_dashboard(APP_NAME, settings.app_version, spa_root),
                             mimetype='text/html')
         if not spa_root:
             return jsonify({
@@ -87,12 +84,10 @@ def register_app_routes(app):
     def health_check():
         db_connected = MyDb.check_db_connection()
 
-        from app.config import APP_NAME, APP_VERSION
-
         health_status = {
             "status": "healthy" if db_connected else "unhealthy",
             "name": APP_NAME,
-            "version": APP_VERSION,
+            "version": get_settings().app_version,
             "database": "UP" if db_connected else "DOWN",
         }
         return jsonify(health_status), 200 if db_connected else 500
@@ -103,7 +98,7 @@ def register_app_routes(app):
         # max_file_size lets the SPA refuse an oversized file before sending a
         # byte, from the server's own limit rather than a hardcoded copy of it.
         return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES,
-                       max_file_size=MAX_FILE_SIZE)
+                       max_file_size=get_settings().max_file_size)
 
     register_upload_routes(app)
 
@@ -152,8 +147,7 @@ def register_app_routes(app):
             with open(str(file_path) + '.map.json', 'w') as f:
                 json.dump(column_map, f)
 
-        from app.config import HOUSEKEEPING_ENABLED
-        if HOUSEKEEPING_ENABLED:
+        if get_settings().HOUSEKEEPING_ENABLED:
             from app.services.housekeeper import process_file_async
             if process_file_async(file_path=file_path):
                 return jsonify(id=file_name, message="Processing started")
@@ -240,7 +234,7 @@ def register_app_routes(app):
                 # indefinitely; a 2s read timeout made the connection raise
                 # TimeoutError whenever a job list was simply quiet. The wait is
                 # bounded by get_message() instead.
-                r = Redis.from_url(os.getenv('CELERY_BROKER_URL', 'redis://localhost:6379/0'),
+                r = Redis.from_url(get_settings().CELERY_BROKER_URL,
                                    socket_connect_timeout=2, socket_timeout=None,
                                    health_check_interval=30)
                 r.ping()

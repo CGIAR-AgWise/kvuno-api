@@ -15,7 +15,6 @@ import time
 
 import pandas as pd
 import pyreadr
-from dotenv import load_dotenv
 from geoalchemy2 import WKTElement
 from sqlalchemy import text as db_text
 from sqlalchemy.dialects.postgresql import insert
@@ -31,15 +30,7 @@ from sqlalchemy.exc import (
 from tqdm import tqdm
 
 from app import create_app
-from app.config import (
-    CELERY_BROKER_URL,
-    HOUSEKEEPING_BATCH_SIZE,
-    HOUSEKEEPING_CHECKPOINT_INTERVAL,
-    HOUSEKEEPING_CHUNK_SIZE,
-    HOUSEKEEPING_DATA_DIR,
-    HOUSEKEEPING_MAX_WORKERS,
-    celery_broker_available,
-)
+from app.config import celery_broker_available, get_settings
 from app.dto.planting_recommendation import PlantingRecommendationCreate
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, ImportConflict
@@ -50,20 +41,17 @@ from app.utils.downloader import RDSDownloader
 from app.utils.file_lock import FileLock
 from app.utils.logging import get_logger
 
-load_dotenv()
-
 logger = get_logger(__name__)
 
 _app = None
-DATA_DIR = HOUSEKEEPING_DATA_DIR
 
 # Per-file ingest lock, next to the data file. Two workers could ingest the
 # same file at once (a double-click enqueues twice; a Redis redelivery after
 # the visibility timeout runs a task that is still running), interleaving
 # commits and offsets. The holder refreshes it every chunk, so it only goes
-# stale when the holder is dead; set this well above the slowest chunk.
+# stale when the holder is dead; set INGEST_LOCK_STALE_SECONDS well above the
+# slowest chunk.
 INGEST_LOCK_SUFFIX = '.ingest.lock'
-INGEST_LOCK_STALE_SECONDS = float(os.getenv('INGEST_LOCK_STALE_SECONDS', '600'))
 
 # How long process_pending()'s de-dupe key lives. create_app() calls it once
 # per gunicorn worker, so without this N workers enqueued N identical scans.
@@ -99,10 +87,11 @@ def housekeeping_settings() -> dict:
     'max_workers'`` and failed every Celery ingest. Pass it explicitly at the
     ``load_rds_to_db`` call sites instead.
     """
+    settings = get_settings()
     return {
-        'batch_size': HOUSEKEEPING_BATCH_SIZE,
-        'chunk_size': HOUSEKEEPING_CHUNK_SIZE,
-        'checkpoint_interval': HOUSEKEEPING_CHECKPOINT_INTERVAL,
+        'batch_size': settings.HOUSEKEEPING_BATCH_SIZE,
+        'chunk_size': settings.HOUSEKEEPING_CHUNK_SIZE,
+        'checkpoint_interval': settings.HOUSEKEEPING_CHECKPOINT_INTERVAL,
     }
 
 
@@ -179,13 +168,10 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
         'Opt_date': 'opt_date',
         'Planting_Option': 'planting_option',
     }
-    raw = os.getenv('RDS_COLUMN_MAP')
+    raw = get_settings().RDS_COLUMN_MAP
     if raw:
-        try:
-            overrides = json.loads(raw)
-            default_map.update(overrides)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"Invalid RDS_COLUMN_MAP JSON, using defaults: {e}")
+        # Validated as a JSON object when the settings were loaded.
+        default_map.update(json.loads(raw))
 
     if file_path:
         mapping_path = file_path + '.map.json'
@@ -214,6 +200,7 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
     save_progress(
         file_path, status, current, total, message,
         run_id=run_id, error=error,
+        # HOSTNAME is the container's, set by the runtime: not a setting.
         worker=os.getenv('HOSTNAME') or socket.gethostname(),
         original_filename=original_filename or os.path.basename(file_path),
     )
@@ -324,12 +311,12 @@ def download_remote_files(data_folder: str) -> list[str]:
     """
     from app.utils.downloader import configure_ssrf
 
-    allowed_domains_raw = os.getenv("REMOTE_RDS_ALLOWED_DOMAINS", "").strip()
-    allowed_domains = [d.strip() for d in allowed_domains_raw.split(",") if d.strip()] or None
-    require_https = os.getenv("REMOTE_RDS_ALLOW_HTTP", "").lower() != "true"
+    settings = get_settings()
+    allowed_domains = [d.strip() for d in settings.REMOTE_RDS_ALLOWED_DOMAINS.split(",") if d.strip()] or None
+    require_https = not settings.REMOTE_RDS_ALLOW_HTTP
     configure_ssrf(allowed_domains=allowed_domains, require_https=require_https)
 
-    urls_raw = os.getenv("REMOTE_RDS_URLS", "").strip()
+    urls_raw = settings.REMOTE_RDS_URLS.strip()
     if not urls_raw:
         logger.info("No REMOTE_RDS_URLS defined, skipping remote download")
         return []
@@ -337,9 +324,9 @@ def download_remote_files(data_folder: str) -> list[str]:
     urls = [u.strip() for u in urls_raw.split(";") if u.strip()]
     logger.info(f"Found {len(urls)} remote RDS URL(s) to download")
 
-    token = os.getenv("REMOTE_RDS_TOKEN")
-    cookies_raw = os.getenv("REMOTE_RDS_COOKIES")
-    headers_raw = os.getenv("REMOTE_RDS_HEADERS")
+    token = settings.REMOTE_RDS_TOKEN.get_secret_value() or None
+    cookies_raw = settings.REMOTE_RDS_COOKIES.get_secret_value()
+    headers_raw = settings.REMOTE_RDS_HEADERS.get_secret_value()
 
     cookies = {}
     if cookies_raw:
@@ -503,7 +490,7 @@ def process_file(
         _write_progress(file_path, status, current, total, message, run_id=run_id,
                         original_filename=original_filename or None, **kw)
 
-    lock = FileLock(file_path + INGEST_LOCK_SUFFIX, INGEST_LOCK_STALE_SECONDS)
+    lock = FileLock(file_path + INGEST_LOCK_SUFFIX, get_settings().INGEST_LOCK_STALE_SECONDS)
     # Initialised before the try so every error path can report the last
     # known position. Reporting 0/0 used to wipe it from the Jobs page.
     num_rows = 0
@@ -914,7 +901,7 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
     if not celery_broker_available():
         logger.warning(
             f"Cannot enqueue {task.__name__} — Redis at "
-            f"{CELERY_BROKER_URL} "
+            f"{get_settings().CELERY_BROKER_URL} "
             f"is not reachable. Start Redis or disable HOUSEKEEPING_ENABLED."
         )
         return False
@@ -936,7 +923,7 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
         logger.warning(
             f"Timed out enqueuing {task.__name__} — "
             f"Kombu/Celery cannot connect to Redis at "
-            f"{CELERY_BROKER_URL}. "
+            f"{get_settings().CELERY_BROKER_URL}. "
             f"Run the worker in Docker for housekeeping, or set HOUSEKEEPING_ENABLED=false."
         )
         return False
@@ -1007,7 +994,7 @@ def _claim_process_pending() -> bool:
     """
     try:
         from redis import Redis
-        client = Redis.from_url(CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
+        client = Redis.from_url(get_settings().CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
         return bool(client.set(PROCESS_PENDING_DEDUPE_KEY, str(os.getpid()),
                                nx=True, ex=PROCESS_PENDING_DEDUPE_SECONDS))
     except Exception as e:
@@ -1045,7 +1032,7 @@ def cli_run(args):
     # install_signal_handlers() for why this is not done at import time.
     install_signal_handlers()
 
-    data_folder = args.data_folder or DATA_DIR
+    data_folder = args.data_folder or get_settings().HOUSEKEEPING_DATA_DIR
     os.makedirs(data_folder, exist_ok=True)
     set_app(_get_app())
 
@@ -1056,6 +1043,6 @@ def cli_run(args):
             load_rds_to_db(
                 data_folder=data_folder,
                 dry_run=args.dry_run,
-                max_workers=HOUSEKEEPING_MAX_WORKERS,
+                max_workers=get_settings().HOUSEKEEPING_MAX_WORKERS,
                 **settings,
             )

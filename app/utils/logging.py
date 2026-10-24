@@ -22,9 +22,9 @@ structlog on top of the standard `logging` module, configured once by
 Usage:  `logger = get_logger(__name__)`, then `logger.info("message", key=value)`.
 Use `logger.exception(...)` inside `except` blocks so the traceback is kept.
 
-Settings are read from the environment directly, not from app.config, so
-logging can be set up before (and without) the database configuration that
-app.config validates at import.
+Settings come from app.config (LOG_*, ENVIRONMENT, DEBUG_DB). When the
+configuration itself is invalid, logging still starts with the defaults, so
+the configuration error can be logged rather than lost.
 """
 from __future__ import annotations
 
@@ -38,32 +38,34 @@ import structlog
 _configured = False
 
 
-def _env(name: str, default: str) -> str:
-    return os.getenv(name, default).strip()
+def _settings():
+    from app.config import ConfigurationError, Settings, get_settings
+    try:
+        return get_settings()
+    except ConfigurationError:
+        # Defaults only: never lose logs (or the error itself) to a bad setting.
+        return Settings.model_construct()
 
 
-def _handler() -> logging.Handler:
-    destination = _env('LOG_DESTINATION', 'stdout').lower()
-    if destination == 'stderr':
+def _handler(settings) -> logging.Handler:
+    if settings.LOG_DESTINATION == 'stderr':
         return logging.StreamHandler(sys.stderr)
-    if destination == 'file':
-        path = _env('LOG_FILE_PATH', '')
+    if settings.LOG_DESTINATION == 'file':
+        path = settings.LOG_FILE_PATH
         if not path:
             # Same fallback as budget-assist: never lose logs to a bad setting.
             return logging.StreamHandler(sys.stderr)
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        backups = int(_env('LOG_BACKUP_COUNT', '5'))
-        if _env('LOG_ROTATION', 'size').lower() == 'daily':
-            return TimedRotatingFileHandler(path, when='D', interval=1, backupCount=backups)
-        return RotatingFileHandler(path, maxBytes=int(_env('LOG_MAX_BYTES', str(10 * 1024 * 1024))),
-                                   backupCount=backups)
+        if settings.LOG_ROTATION == 'daily':
+            return TimedRotatingFileHandler(path, when='D', interval=1, backupCount=settings.LOG_BACKUP_COUNT)
+        return RotatingFileHandler(path, maxBytes=settings.LOG_MAX_BYTES, backupCount=settings.LOG_BACKUP_COUNT)
     return logging.StreamHandler(sys.stdout)
 
 
 def is_production() -> bool:
-    return _env('ENVIRONMENT', 'development').lower() in ('production', 'prod')
+    return _settings().is_production
 
 
 def setup_logging(force: bool = False) -> None:
@@ -73,8 +75,8 @@ def setup_logging(force: bool = False) -> None:
         return
     _configured = True
 
-    level = _env('LOG_LEVEL', 'INFO').upper()
-    numeric_level = getattr(logging, level, logging.INFO)
+    settings = _settings()
+    numeric_level = getattr(logging, settings.LOG_LEVEL, logging.INFO)
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,
@@ -85,7 +87,7 @@ def setup_logging(force: bool = False) -> None:
         structlog.processors.format_exc_info,
     ]
 
-    renderer = (structlog.processors.JSONRenderer() if is_production()
+    renderer = (structlog.processors.JSONRenderer() if settings.is_production
                 else structlog.dev.ConsoleRenderer())
     formatter = structlog.stdlib.ProcessorFormatter(
         # Records from plain stdlib loggers (Flask, SQLAlchemy, Celery…) get the
@@ -93,7 +95,7 @@ def setup_logging(force: bool = False) -> None:
         foreign_pre_chain=shared_processors,
         processors=[structlog.stdlib.ProcessorFormatter.remove_processors_meta, renderer],
     )
-    handler = _handler()
+    handler = _handler(settings)
     handler.setFormatter(formatter)
 
     logging.basicConfig(level=numeric_level, handlers=[handler], force=True)
@@ -104,7 +106,7 @@ def setup_logging(force: bool = False) -> None:
     # format. It used to set SQLALCHEMY_ECHO, which makes SQLAlchemy attach its
     # own stdout handler: SQL lines then bypassed LOG_LEVEL and the JSON format.
     # It is an explicit opt-in, so it shows SQL whatever LOG_LEVEL says.
-    if _env('DEBUG_DB', 'false').lower() == 'true':
+    if settings.DEBUG_DB:
         logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
 
     structlog.configure(

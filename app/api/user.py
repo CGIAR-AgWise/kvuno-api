@@ -9,8 +9,7 @@ from flask_openapi3 import Tag, APIBlueprint
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from app.config import API_PREFIX, API_VERSION, RATE_LIMIT_REGISTER, RATE_LIMIT_LOGIN, TOKEN_TTL_DAYS
-from app.config import admin_emails
+from app.config import API_PREFIX, API_VERSION, admin_emails, get_settings
 from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, CreateTokenRequest
 from app.dto.auth import password_too_long
 from app.dto.pagination import get_pagination
@@ -141,7 +140,7 @@ def is_active(user) -> bool:
                       "administrator approves it; the user gets an activation email then (when "
                       "email is configured). Addresses in ADMIN_EMAILS are approved at once.",
           security=[])
-@limiter.limit(RATE_LIMIT_REGISTER)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_REGISTER)
 def register(body: RegisterRequest):
     # Open to any address: administrator approval is the gate (it replaced the
     # REGISTRATION_ALLOWED_DOMAINS allow-list).
@@ -180,7 +179,7 @@ def register(body: RegisterRequest):
           description="Exchange valid credentials for an opaque access token ({id}|{secret}). Accounts must be "
                       "approved by an administrator first. Token TTL is configurable via TOKEN_TTL_DAYS.",
           security=[])
-@limiter.limit(RATE_LIMIT_LOGIN)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_LOGIN)
 def login(body: LoginRequest):
     db = MyDb.get_db()
     # bcrypt 5.x raises ValueError on passwords over 72 bytes. No account can
@@ -198,13 +197,14 @@ def login(body: LoginRequest):
                 "status": user.status}, 403
 
     secret = secrets.token_hex(32)
+    ttl_days = get_settings().TOKEN_TTL_DAYS
     # created_at is bound, not SQL now(): naive UTC like every token timestamp,
     # and portable (SQLite has no now()).
     token_id = db.session.execute(
         text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
              "VALUES (:uid, '', :exp, :created) RETURNING id"),
-        {"uid": user.id, "created": _utcnow(), "exp": None if TOKEN_TTL_DAYS <= 0
-         else _utcnow() + timedelta(days=TOKEN_TTL_DAYS)},
+        {"uid": user.id, "created": _utcnow(), "exp": None if ttl_days <= 0
+         else _utcnow() + timedelta(days=ttl_days)},
     ).scalar()
     token_hash = _hash_token(token_id, secret)
     db.session.execute(
@@ -352,7 +352,7 @@ def create_token(body: CreateTokenRequest):
         return {"msg": "authentication required"}, 401
     _db = MyDb.get_db()
     secret = secrets.token_hex(32)
-    ttl = body.expires_in_days if body.expires_in_days is not None else TOKEN_TTL_DAYS
+    ttl = body.expires_in_days if body.expires_in_days is not None else get_settings().TOKEN_TTL_DAYS
     token_id = _db.session.execute(
         text("INSERT INTO user_tokens (user_id, token, expires_at, created_at) "
              "VALUES (:uid, '', :exp, :created) RETURNING id"),

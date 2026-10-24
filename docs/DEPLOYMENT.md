@@ -59,21 +59,23 @@ The compose file reads these variables from the host environment (or `.env` file
 | `TAG` | `latest` | `api` / `worker` / `web` image tag |
 | `DEV_TAG` | `develop` | `api-dev` image tag |
 | `DB_HOST` | *(required)* | Postgres host for `api`, `api-dev`, and `worker` — no default, since Postgres is external |
-| `FLASK_DEBUG` / `DEBUG_DB` | `false` (`true` for `api-dev`) | Debug mode / SQL echo |
+| `FLASK_DEBUG` / `DEBUG_DB` | from `.env` (`true` for `api-dev`) | Debug mode / SQL logging |
 | `RUN_MIGRATIONS` | `false` | Whether the `api` entrypoint migrates on start (see §4) |
 | `DATA_DIR` | `./data` | Host directory mounted at `/app/static/data` |
 | `DB_NAME` | *(required)* | Database name |
 | `DB_USER` | *(required)* | Database user |
 | `DB_PASSWORD` | *(required)* | Database password |
 
-`DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation, so e.g. `FLASK_DEBUG=true` there (as in `.env.example`) also turns debug on for `api`.
+`DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation too. `FLASK_DEBUG` only affects `python run.py` (`api-dev`); the production `api` runs gunicorn.
+
+Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the README's Configuration tables are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
 
 ### Env loading per service
 
 | Service | How it gets config |
 |---|---|
-| `api` / `api-dev` | `env_file: .env`, plus a small `environment:` block (`FLASK_DEBUG`, `DEBUG_DB`, `DB_DRIVER`, `DB_HOST`, `RUN_MIGRATIONS`, `HOUSEKEEPING_ENABLED`) that overrides `.env` |
-| `worker` | Explicit `environment:` block with `${VAR:-default}` interpolation — **no `env_file`**, so a worker setting not listed there (e.g. `WORKER_MAX_MEMORY_PER_CHILD`; `CELERY_VISIBILITY_TIMEOUT`, `INGEST_LOCK_STALE_SECONDS` and `REMOTE_RDS_MAX_BYTES` are listed) keeps its code default unless you add it to that block or an override |
+| `api` / `api-dev` | `env_file: .env`, plus an `environment:` block holding only what differs in compose (`ENVIRONMENT=production`, required `DB_HOST`, `RUN_MIGRATIONS=false`, `HOUSEKEEPING_ENABLED=false`; `api-dev` adds `FLASK_DEBUG`/`DEBUG_DB=true`) |
+| `worker` | `env_file: .env` as well — every setting reaches it — plus `ENVIRONMENT=production`, the required `DB_*`, and `CELERY_BROKER_URL`/`CELERY_RESULT_BACKEND` defaulting to `redis://redis:6379/0`. (It used to list each variable by hand, so a worker setting missing from the list kept its code default.) |
 | `web` | None — nginx needs no application config; the proxy target is `api:80` in `frontend/nginx.conf` |
 | All | `load_dotenv()` at import time, so a mounted/baked `.env` also applies |
 

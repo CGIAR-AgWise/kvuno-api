@@ -150,7 +150,7 @@ class TestTokenExpiry:
 
     def test_created_tokens_get_naive_utc_expiry(self, client, monkeypatch):
         import bcrypt
-        monkeypatch.setattr("app.api.user.TOKEN_TTL_DAYS", 30)
+        monkeypatch.setenv("TOKEN_TTL_DAYS", "30")
         pw_hash = bcrypt.hashpw(b"correct-horse", bcrypt.gensalt(4)).decode()
         session = MagicMock()
         session.query.return_value.filter.return_value.first.return_value = User(

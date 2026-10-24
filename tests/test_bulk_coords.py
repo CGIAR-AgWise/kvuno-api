@@ -80,8 +80,8 @@ def test_default_cap_is_a_small_sample(client):
     shape of the distribution for ~120 KB.
     """
     from app.api import planting_data
-
-    assert planting_data.COORDINATES_BULK_MAX_ROWS == 5000
+    from app.config import get_settings
+    assert get_settings().COORDINATES_BULK_MAX_ROWS == 5000
     with patch.object(planting_data, 'repo', _repo(2_282_356, [(1.0, 2.0)] * 5000)):
         body = client.get('/api/v1/planting-data/coordinates/all').get_json()
     assert body['returned'] == 5000

@@ -44,9 +44,10 @@ def env(tmp_path, monkeypatch):
     from app.models.kvuno import Base, FileImport, Upload
     from app.routes.main import register_app_routes
 
-    monkeypatch.setattr(service, 'UPLOAD_ROOT', str(tmp_path / 'uploads'))
-    monkeypatch.setattr('app.routes.uploads.MAX_FILE_SIZE', 1024 * 1024)
-    monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', False)
+    # Settings are read per call, so the environment is all a test changes.
+    monkeypatch.setenv('HOUSEKEEPING_DATA_DIR', str(tmp_path))  # uploads in tmp/uploads
+    monkeypatch.setenv('MAX_FILE_SIZE_MB', '1')
+    monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'false')
     monkeypatch.setattr(service.threading, 'Thread', _InlineThread)
 
     current = {'user': OWNER}
@@ -226,7 +227,7 @@ class TestSubmission:
 
     def test_enqueues_with_the_users_exact_mapping(self, env, monkeypatch):
         calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async',
                             lambda **kw: calls.append(kw) or True)
 
@@ -240,7 +241,7 @@ class TestSubmission:
 
     def test_retry_reuses_the_saved_mapping(self, env, monkeypatch):
         calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async',
                             lambda **kw: calls.append(kw) or True)
 
@@ -253,7 +254,7 @@ class TestSubmission:
         assert calls[1]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
     def test_unreachable_queue_is_reported_not_hidden(self, env, monkeypatch):
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
+        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
         monkeypatch.setattr('app.services.housekeeper.process_file_async', lambda **kw: False)
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',

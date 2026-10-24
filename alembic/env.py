@@ -1,5 +1,4 @@
 from alembic import context
-from dotenv import load_dotenv
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
@@ -7,7 +6,6 @@ from app.config import build_db_url
 from app.models import kvuno
 from app.utils.logging import setup_logging
 
-load_dotenv()
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config

@@ -12,14 +12,13 @@ matters; the email is a courtesy.
 """
 from __future__ import annotations
 
-import os
 import smtplib
 import ssl
 import threading
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
-from app import config
+from app.config import admin_emails, get_settings
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -27,13 +26,14 @@ logger = get_logger(__name__)
 
 def _app_url(path: str) -> str | None:
     """An absolute link into the web app, or None when SPA_ROOT_URL is unset."""
-    root = os.getenv('SPA_ROOT_URL', '').strip().rstrip('/')
+    root = get_settings().SPA_ROOT_URL.strip().rstrip('/')
     if not root.startswith(('http://', 'https://')):
         return None
     return f"{root}{path}"
 
 
 def _deliver(message: EmailMessage, log_ref: dict) -> bool:
+    config = get_settings()
     try:
         if config.SMTP_SECURITY == 'ssl':
             server = smtplib.SMTP_SSL(config.SMTP_HOST, config.SMTP_PORT,
@@ -46,7 +46,7 @@ def _deliver(message: EmailMessage, log_ref: dict) -> bool:
             if config.SMTP_SECURITY == 'starttls':
                 server.starttls(context=ssl.create_default_context())
             if config.SMTP_USERNAME:
-                server.login(config.SMTP_USERNAME, config.SMTP_PASSWORD)
+                server.login(config.SMTP_USERNAME, config.SMTP_PASSWORD.get_secret_value())
             server.send_message(message)
         logger.info("email sent", **log_ref)
         return True
@@ -69,6 +69,7 @@ def send_mail(to: list[str], subject: str, body: str, *, background: bool = True
     recipients = [addr for addr in to if addr]
     if not recipients:
         return False
+    config = get_settings()
     ref = {'subject': subject, 'recipients': len(recipients), **(log_ref or {})}
     if not config.SMTP_HOST or not config.MAIL_FROM:
         logger.info("email not sent: SMTP_HOST/MAIL_FROM unset", **ref)
@@ -76,7 +77,7 @@ def send_mail(to: list[str], subject: str, body: str, *, background: bool = True
 
     message = EmailMessage()
     message['Subject'] = subject
-    message['From'] = formataddr((config.MAIL_APP_NAME, config.MAIL_FROM))
+    message['From'] = formataddr((get_settings().MAIL_APP_NAME, config.MAIL_FROM))
     message['To'] = ', '.join(recipients)
     message['Message-ID'] = make_msgid(domain=config.MAIL_FROM.rpartition('@')[2] or None)
     message.set_content(body)
@@ -90,7 +91,7 @@ def send_mail(to: list[str], subject: str, body: str, *, background: bool = True
 # ── Messages ───────────────────────────────────────────────────
 
 def _sign_off() -> str:
-    return f"\n\n— {config.MAIL_APP_NAME}\n(Automated message; replies are not monitored.)"
+    return f"\n\n— {get_settings().MAIL_APP_NAME}\n(Automated message; replies are not monitored.)"
 
 
 def send_account_activated(email: str, username: str, user_id: int | None = None) -> bool:
@@ -98,12 +99,12 @@ def send_account_activated(email: str, username: str, user_id: int | None = None
     login = _app_url('/login')
     body = (
         f"Hello {username},\n\n"
-        f"Your {config.MAIL_APP_NAME} account has been approved and is now active."
+        f"Your {get_settings().MAIL_APP_NAME} account has been approved and is now active."
         + (f"\n\nSign in here: {login}" if login else "\n\nYou can now sign in.")
         + f"\nUsername: {username}"
         + _sign_off()
     )
-    return send_mail([email], f"Your {config.MAIL_APP_NAME} account is active", body,
+    return send_mail([email], f"Your {get_settings().MAIL_APP_NAME} account is active", body,
                      log_ref={'kind': 'account_activated', 'user_id': user_id})
 
 
@@ -111,18 +112,18 @@ def send_account_rejected(email: str, username: str, reason: str | None = None,
                           user_id: int | None = None) -> bool:
     body = (
         f"Hello {username},\n\n"
-        f"Your request for a {config.MAIL_APP_NAME} account was not approved."
+        f"Your request for a {get_settings().MAIL_APP_NAME} account was not approved."
         + (f"\n\nReason: {reason}" if reason else "")
         + "\n\nIf you think this is a mistake, contact the administrator who manages access."
         + _sign_off()
     )
-    return send_mail([email], f"Your {config.MAIL_APP_NAME} account request", body,
+    return send_mail([email], f"Your {get_settings().MAIL_APP_NAME} account request", body,
                      log_ref={'kind': 'account_rejected', 'user_id': user_id})
 
 
 def send_new_registration(username: str, email: str, user_id: int | None = None) -> bool:
     """Tell the administrators someone is waiting for approval."""
-    admins = sorted(config.admin_emails())
+    admins = sorted(admin_emails())
     review = _app_url('/admin/users')
     body = (
         f"A new account is waiting for approval.\n\n"
@@ -131,5 +132,5 @@ def send_new_registration(username: str, email: str, user_id: int | None = None)
         + _sign_off()
     )
     # Logged as the account it concerns; the recipients are the owners.
-    return send_mail(admins, f"{config.MAIL_APP_NAME}: new account awaiting approval", body,
+    return send_mail(admins, f"{get_settings().MAIL_APP_NAME}: new account awaiting approval", body,
                      log_ref={'kind': 'new_registration', 'about_user_id': user_id})

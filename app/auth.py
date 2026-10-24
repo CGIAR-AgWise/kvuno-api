@@ -1,12 +1,12 @@
 """Authentication middleware for protecting endpoints."""
 
-import os
 from functools import wraps
 
 from flask import request, redirect
 
 
 from app.api.user import get_current_user
+from app.config import get_settings
 
 
 def _is_html_request():
@@ -21,7 +21,7 @@ def _login_path():
     a server-rendered page. Overridable because a deployment may mount the SPA
     under a prefix (e.g. /app/login) behind a reverse proxy.
     """
-    return os.getenv('SPA_LOGIN_PATH', '/login')
+    return get_settings().SPA_LOGIN_PATH
 
 
 def require_auth(f):
