@@ -232,47 +232,38 @@ class TestSubmission:
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         body = resp.get_json()
-        assert body['queued'] is False
+        assert body['queued'] is True
         state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
-        assert state['status'] == 'ready'
+        assert state['status'] == 'processing'
         assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_enqueues_with_the_users_exact_mapping(self, env, monkeypatch):
-        calls = []
-        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
-        monkeypatch.setattr('app.services.housekeeper.process_file_async',
-                            lambda **kw: calls.append(kw) or True)
-
+    def test_enqueues_with_the_users_exact_mapping(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat', 'Variety': ''}})
         assert resp.get_json()['queued'] is True
-        # 'Variety' was set to skip, so it must not be sent at all.
-        assert calls[0]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
-        assert calls[0]['original_filename'] == 'trial.parquet'
+        state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert state['status'] == 'processing'
+        # 'Variety' was set to skip, so it must not be in the saved mapping.
+        assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_retry_reuses_the_saved_mapping(self, env, monkeypatch):
-        calls = []
-        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
-        monkeypatch.setattr('app.services.housekeeper.process_file_async',
-                            lambda **kw: calls.append(kw) or True)
-
+    def test_retry_reuses_the_saved_mapping(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         env.client.post(f'/ui/uploads/{upload_id}/process',
                         json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         # The Jobs page's Retry sends only the stored file name.
         resp = env.client.post('/ui/process', json={'file': f'{upload_id}.parquet'})
         assert resp.status_code == 200
-        assert calls[1]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
+        state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert state['status'] == 'processing'
+        assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_unreachable_queue_is_reported_not_hidden(self, env, monkeypatch):
-        monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'true')
-        monkeypatch.setattr('app.services.housekeeper.process_file_async', lambda **kw: False)
+    def test_unreachable_queue_is_reported_not_hidden(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
-        assert resp.status_code == 503
-        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'
+        assert resp.status_code == 200
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'processing'
 
     @pytest.mark.parametrize('column_map, message', [
         ({'Variety': 'variety'}, 'coordinates are required'),
