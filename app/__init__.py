@@ -6,6 +6,7 @@ from alembic.config import Config as AlembicConfig
 
 from pathlib import Path
 import shutil
+import threading
 
 from app.models.database_conn import MyDb
 from app.routes.main import register_app_routes
@@ -344,10 +345,29 @@ def create_app():
     with app.app_context():
         _cleanup_temp_files()
 
-    # Enqueue background processing of any unprocessed files via Celery
-    if settings.HOUSEKEEPING_ENABLED:
-        from app.services.housekeeper import process_pending
-        process_pending()
+    # Start background scan for unprocessed files in the data directory.
+    # Runs in a thread so it works with or without HOUSEKEEPING_ENABLED/Redis.
+    from app.services.housekeeper import load_rds_to_db, housekeeping_settings, set_app
+    from app.utils.logging import get_logger
+    set_app(app)
+
+    logger = get_logger(__name__)
+
+    def _startup_scan():
+        with app.app_context():
+            try:
+                settings = housekeeping_settings()
+                load_rds_to_db(
+                    data_folder=get_settings().HOUSEKEEPING_DATA_DIR,
+                    dry_run=False,
+                    max_workers=get_settings().HOUSEKEEPING_MAX_WORKERS,
+                    **settings,
+                )
+            except Exception as e:
+                logger.exception("Startup scan failed: %s", e)
+
+    thread = threading.Thread(target=_startup_scan, name='startup-scan', daemon=True)
+    thread.start()
 
     # Behind a reverse proxy (Dokploy, nginx) request.remote_addr is the
     # proxy's address, so every client shares one rate-limit bucket and the
