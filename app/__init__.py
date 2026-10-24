@@ -363,8 +363,9 @@ def create_app():
                     max_workers=get_settings().HOUSEKEEPING_MAX_WORKERS,
                     **settings,
                 )
-            except Exception as e:
-                logger.exception("Startup scan failed: %s", e)
+            except Exception:
+                # structlog takes key=value, not %-args: "%s" was logged literally.
+                logger.exception("startup scan failed")
 
     thread = threading.Thread(target=_startup_scan, name='startup-scan', daemon=True)
     thread.start()
