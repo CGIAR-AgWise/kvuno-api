@@ -97,6 +97,10 @@ function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
       return { label: 'Failed', tone: 'danger' }
     case 'submitted':
       return { label: 'Submitted', tone: 'neutral', icon: 'bi-send-check' }
+    case 'processing':
+      // Listed by GET /ui/uploads since processing moved into the API; without
+      // this case the badge was undefined and the page crashed on reload.
+      return { label: 'Processing', tone: 'info' }
   }
 }
 
@@ -381,7 +385,8 @@ export default function Upload() {
               </h2>
               <div className="d-flex align-items-center gap-2 flex-shrink-0">
                 <StatusBadge tone={badge.tone} label={badge.label} icon={badge.icon} />
-                {item.status !== 'submitted' && (
+                {/* The server refuses to discard once submitted (409). */}
+                {item.status !== 'submitted' && item.status !== 'processing' && (
                   <button
                     className="btn btn-sm btn-outline-secondary"
                     onClick={() => void discard(item)}

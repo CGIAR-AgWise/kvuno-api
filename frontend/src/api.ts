@@ -647,7 +647,7 @@ export interface DuplicateInfo {
 /** tus endpoint. Files are sent here by lib/tus.ts, not by `request()`. */
 export const TUS_ENDPOINT = '/ui/uploads/tus'
 
-/** receiving -> received -> inspecting -> ready | failed -> submitted */
+/** receiving -> received -> inspecting -> ready | failed -> submitted -> processing */
 export type UploadStatus =
   | 'receiving'
   | 'received'
@@ -655,6 +655,7 @@ export type UploadStatus =
   | 'ready'
   | 'failed'
   | 'submitted'
+  | 'processing'
 
 /** One upload as the server tracks it (app/services/uploads.py `to_dict`). */
 export interface UploadRecord {
