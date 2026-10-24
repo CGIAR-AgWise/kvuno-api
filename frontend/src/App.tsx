@@ -20,7 +20,16 @@ const Tokens = lazy(() => import('./pages/Tokens'))
 const AdminUsers = lazy(() => import('./pages/AdminUsers'))
 
 function Loading() {
-  return <div className="container py-5 text-center text-muted">Loading…</div>
+  return (
+    <div className="kv-loading" role="status">
+      <span className="kv-seeds" aria-hidden="true">
+        <i />
+        <i />
+        <i />
+      </span>
+      <span className="visually-hidden">Loading…</span>
+    </div>
+  )
 }
 
 /**

@@ -109,7 +109,7 @@ export default function Quality() {
   const maxSource = stats?.conflicts_by_source?.reduce((m, s) => Math.max(m, s.count), 1) ?? 1
 
   return (
-    <div className="py-3">
+    <div className="pb-3">
       <div className="row g-3 mb-3">
         {(
           [

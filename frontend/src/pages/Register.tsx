@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ApiError, register } from '../api'
+import AuthShell from '../components/AuthShell'
 import { useAuth } from '../context/AuthContext'
 
 export default function Register() {
@@ -41,11 +42,11 @@ export default function Register() {
 
   if (pending) {
     return (
-      <div className="container py-5" style={{ maxWidth: '26rem' }}>
-        <div className="kvuno-card p-4 text-center">
+      <AuthShell>
+        <div>
           <i className="bi bi-hourglass-split fs-1 text-primary" aria-hidden="true" />
-          <h1 className="h5 mt-2">Request received</h1>
-          <p className="text-muted mb-3">
+          <h1 className="kv-auth-title mt-2">Request received</h1>
+          <p className="text-muted mb-4">
             An administrator needs to approve your account before you can sign in. You&rsquo;ll get
             an email at <span className="fw-semibold text-body">{pending}</span> once it&rsquo;s
             activated.
@@ -54,18 +55,16 @@ export default function Register() {
             Back to sign in
           </Link>
         </div>
-      </div>
+      </AuthShell>
     )
   }
 
   return (
-    <div className="container py-5" style={{ maxWidth: '26rem' }}>
-      <h1 className="h4 mb-2 text-center">Create an account</h1>
-      <p className="text-center text-muted small mb-4">
-        New accounts are activated by an administrator.
-      </p>
+    <AuthShell>
+      <h1 className="kv-auth-title">Request an account</h1>
+      <p className="text-muted mb-4">An administrator approves new accounts before they can sign in.</p>
       {error && <div className="alert alert-danger">{error}</div>}
-      <form onSubmit={submit} className="kvuno-card p-4">
+      <form onSubmit={submit}>
         {(
           [
             ['username', 'Username', 'username'],
@@ -89,13 +88,13 @@ export default function Register() {
             />
           </div>
         ))}
-        <button className="btn btn-primary w-100" disabled={busy}>
-          {busy ? 'Creating…' : 'Register'}
+        <button className="btn btn-primary w-100 py-2 mt-2" disabled={busy}>
+          {busy ? 'Sending request…' : 'Request account'}
         </button>
       </form>
-      <p className="text-center text-muted small mt-3">
-        Already registered? <Link to="/login">Sign in</Link>
+      <p className="text-muted small mt-4">
+        Already have an account? <Link to="/login">Sign in</Link>
       </p>
-    </div>
+    </AuthShell>
   )
 }

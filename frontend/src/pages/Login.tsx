@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useNavigate, useSearchParams, Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { ApiError } from '../api'
+import AuthShell from '../components/AuthShell'
 
 export default function Login() {
   const { login } = useAuth()
@@ -33,8 +34,9 @@ export default function Login() {
   }
 
   return (
-    <div className="container py-5" style={{ maxWidth: '26rem' }}>
-      <h1 className="h4 mb-4 text-center">Sign in to kvuno</h1>
+    <AuthShell>
+      <h1 className="kv-auth-title">Sign in</h1>
+      <p className="text-muted mb-4">Use the username you registered with.</p>
       {notice && (
         <div className="alert alert-warning d-flex gap-2" role="status">
           <i className="bi bi-hourglass-split" aria-hidden="true" />
@@ -42,7 +44,7 @@ export default function Login() {
         </div>
       )}
       {error && <div className="alert alert-danger">{error}</div>}
-      <form onSubmit={submit} className="kvuno-card p-4">
+      <form onSubmit={submit}>
         <div className="mb-3">
           <label htmlFor="username" className="form-label">
             Username
@@ -70,13 +72,13 @@ export default function Login() {
             required
           />
         </div>
-        <button className="btn btn-primary w-100" disabled={busy}>
+        <button className="btn btn-primary w-100 py-2 mt-2" disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
-      <p className="text-center text-muted small mt-3">
-        No account? <Link to="/register">Register</Link>
+      <p className="text-muted small mt-4">
+        No account? <Link to="/register">Request one</Link>
       </p>
-    </div>
+    </AuthShell>
   )
 }

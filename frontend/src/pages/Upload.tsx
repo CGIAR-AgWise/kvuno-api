@@ -323,7 +323,7 @@ export default function Upload() {
   }
 
   return (
-    <div className="py-3" style={{ maxWidth: '60rem' }}>
+    <div className="pb-3">
       <div
         className={'kvuno-card p-5 text-center mb-3' + (dragging ? ' border-primary' : '')}
         style={{ borderStyle: 'dashed', cursor: 'pointer' }}

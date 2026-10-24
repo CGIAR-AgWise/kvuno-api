@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
+import { Link } from 'react-router-dom'
 import { fetchJobProgress, startProcessing } from '../api'
 import type { Job } from '../api'
 import { STATUSES, useJobStream } from '../hooks/useJobStream'
@@ -98,31 +99,33 @@ export default function Jobs() {
   }
 
   return (
-    <div className="py-3">
+    <div className="pb-3">
       <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
-        <div className="btn-group btn-group-sm" role="group" aria-label="Filter by status">
+        <div className="kv-segment" role="group" aria-label="Filter by status">
           {STATUSES.map((status) => (
             <button
               key={status}
-              className={'btn ' + (filter === status ? 'btn-primary' : 'btn-outline-secondary')}
+              type="button"
+              className={filter === status ? 'active' : ''}
+              aria-pressed={filter === status}
               onClick={() => setFilter(status)}
             >
               {status === 'all' ? 'All' : statusMeta(status).label}
-              {status !== 'all' && counts[status] ? ' (' + counts[status] + ')' : ''}
+              {status !== 'all' && counts[status] ? <span className="kv-count">{counts[status]}</span> : null}
             </button>
           ))}
         </div>
         <input
           type="search"
           aria-label="Search files"
-          className="form-control form-control-sm ms-auto"
+          className="form-control form-control-sm ms-md-auto"
           style={{ maxWidth: '18rem' }}
           placeholder="Search files…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        <span className={'badge ' + (connected ? 'text-bg-success' : 'text-bg-secondary')}>
-          {connected ? 'live' : 'reconnecting…'}
+        <span className={'kv-live' + (connected ? ' is-live' : '')} role="status">
+          {connected ? 'Live' : 'Reconnecting…'}
         </span>
       </div>
 
@@ -135,8 +138,20 @@ export default function Jobs() {
         </div>
         <div className="col-lg-8 order-lg-1">
       <div className="kvuno-card p-3">
-        {visible.length === 0 ? (
-          <p className="text-muted text-center py-5 mb-0">No matching jobs.</p>
+        {jobs.length === 0 ? (
+          <div className="kv-empty">
+            <i className="bi bi-inbox" aria-hidden="true" />
+            <p className="kv-empty-title">No imports yet</p>
+            <p>Upload a file and its import will appear here as it runs.</p>
+            <Link className="btn btn-primary btn-sm" to="/upload">
+              Upload a file
+            </Link>
+          </div>
+        ) : visible.length === 0 ? (
+          <div className="kv-empty">
+            <p className="kv-empty-title">No jobs match</p>
+            <p>Try another status or clear the search.</p>
+          </div>
         ) : (
           <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">

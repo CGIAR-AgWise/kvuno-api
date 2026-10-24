@@ -155,15 +155,8 @@ export default function AdminUsers() {
   const users = data?.users ?? []
 
   return (
-    <div className="py-3" style={{ maxWidth: '72rem' }}>
-      <div className="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-3">
-        <div>
-          <h1 className="h5 mb-0">Accounts</h1>
-          <p className="text-muted small mb-0">
-            New registrations wait here until approved. Approving sends the user their activation
-            email.
-          </p>
-        </div>
+    <div className="pb-3">
+      <div className="d-flex flex-wrap align-items-center justify-content-end gap-2 mb-3">
         <div className="form-check form-switch mb-0">
           <input
             className="form-check-input"

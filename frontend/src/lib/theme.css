@@ -1,17 +1,869 @@
-/* A thin layer over Bootstrap 5. The old Jinja UI used a hand-rolled
-   "material"-ish look; these tokens keep the new app visually familiar
-   without carrying over the old stylesheets wholesale. */
+/* kvuno's look, as a layer over Bootstrap 5 (CSS only; no Bootstrap JS).
+
+   Tokens
+   - loam     #1D2621  the sidebar: dark, worked soil
+   - leaf     #2E6B4E  primary actions, links, focus
+   - sorghum  #E0A526  the one accent: the seed row (brand mark, current page)
+   - field    #F3F5F0  page background
+   - ash      #DCE1D8  borders and rules
+   Type: Bricolage Grotesque for titles only, Public Sans for everything else,
+   IBM Plex Mono for data (file names, counts, coordinates). All are bundled
+   from npm (@fontsource), so nothing loads from a CDN (CSP font-src 'self'). */
+
 :root {
-  --kvuno-bg: #f6f7f9;
-  --kvuno-border: #e3e6ea;
+  --kv-loam: #1d2621;
+  --kv-loam-2: #27322c;
+  --kv-leaf: #2e6b4e;
+  --kv-leaf-dark: #245a40;
+  --kv-leaf-rgb: 46, 107, 78;
+  --kv-sorghum: #e0a526;
+  --kv-field: #f3f5f0;
+  --kv-ash: #dce1d8;
+  --kv-ink: #1a1f1c;
+  --kv-muted: #5d6a62;
+
+  --kv-font-display: 'Bricolage Grotesque Variable', 'Public Sans Variable', system-ui, sans-serif;
+  --kv-font-body: 'Public Sans Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --kv-font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --kv-sidebar-w: 15.5rem;
+  --kv-sidebar-w-collapsed: 4.25rem;
+  --kv-radius: 0.625rem;
+
+  /* Bootstrap, re-pointed at the tokens. */
+  --bs-body-font-family: var(--kv-font-body);
+  --bs-font-monospace: var(--kv-font-mono);
+  --bs-body-color: var(--kv-ink);
+  --bs-body-bg: var(--kv-field);
+  --bs-secondary-color: var(--kv-muted);
+  --bs-border-color: var(--kv-ash);
+  --bs-border-radius: 0.5rem;
+  --bs-border-radius-sm: 0.375rem;
+  --bs-border-radius-lg: var(--kv-radius);
+  --bs-primary: var(--kv-leaf);
+  --bs-primary-rgb: var(--kv-leaf-rgb);
+  --bs-link-color: var(--kv-leaf);
+  --bs-link-color-rgb: var(--kv-leaf-rgb);
+  --bs-link-hover-color: var(--kv-leaf-dark);
+  --bs-link-hover-color-rgb: 36, 90, 64;
+  --bs-focus-ring-color: rgba(var(--kv-leaf-rgb), 0.3);
 }
 
 body {
-  background: var(--kvuno-bg);
+  background: var(--kv-field);
   /* Last-resort guard against a sideways page scrollbar. `clip`, not
      `hidden`: it creates no scroll container, so position: sticky (the map,
-     table headers) keeps working. Layouts below are built to fit anyway. */
+     table headers, the sidebar) keeps working. Layouts below fit anyway. */
   overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .h1, .h2, .h3 {
+  font-family: var(--kv-font-display);
+  letter-spacing: -0.01em;
+}
+
+/* ── Bootstrap components in the palette ─────────────────────── */
+
+.btn {
+  font-weight: 500;
+}
+
+.btn-primary {
+  --bs-btn-bg: var(--kv-leaf);
+  --bs-btn-border-color: var(--kv-leaf);
+  --bs-btn-hover-bg: var(--kv-leaf-dark);
+  --bs-btn-hover-border-color: var(--kv-leaf-dark);
+  --bs-btn-active-bg: var(--kv-leaf-dark);
+  --bs-btn-active-border-color: var(--kv-leaf-dark);
+  --bs-btn-disabled-bg: var(--kv-leaf);
+  --bs-btn-disabled-border-color: var(--kv-leaf);
+  --bs-btn-focus-shadow-rgb: var(--kv-leaf-rgb);
+}
+
+.btn-outline-primary {
+  --bs-btn-color: var(--kv-leaf);
+  --bs-btn-border-color: var(--kv-leaf);
+  --bs-btn-hover-bg: var(--kv-leaf);
+  --bs-btn-hover-border-color: var(--kv-leaf);
+  --bs-btn-active-bg: var(--kv-leaf-dark);
+  --bs-btn-active-border-color: var(--kv-leaf-dark);
+  --bs-btn-disabled-color: var(--kv-leaf);
+  --bs-btn-disabled-border-color: var(--kv-leaf);
+  --bs-btn-focus-shadow-rgb: var(--kv-leaf-rgb);
+}
+
+.btn-outline-secondary {
+  --bs-btn-color: var(--kv-muted);
+  --bs-btn-border-color: var(--kv-ash);
+  --bs-btn-hover-color: var(--kv-ink);
+  --bs-btn-hover-bg: #e8ece5;
+  --bs-btn-hover-border-color: #cdd4c9;
+  --bs-btn-active-color: var(--kv-ink);
+  --bs-btn-active-bg: #dfe5db;
+  --bs-btn-active-border-color: #cdd4c9;
+  background: #fff;
+}
+
+.form-control,
+.form-select {
+  border-color: var(--kv-ash);
+}
+
+.form-control:focus,
+.form-select:focus {
+  border-color: rgba(var(--kv-leaf-rgb), 0.6);
+  box-shadow: 0 0 0 0.2rem rgba(var(--kv-leaf-rgb), 0.18);
+}
+
+.form-check-input:checked {
+  background-color: var(--kv-leaf);
+  border-color: var(--kv-leaf);
+}
+
+.form-check-input:focus {
+  border-color: rgba(var(--kv-leaf-rgb), 0.6);
+  box-shadow: 0 0 0 0.2rem rgba(var(--kv-leaf-rgb), 0.18);
+}
+
+.form-label {
+  font-weight: 500;
+  font-size: 0.875rem;
+}
+
+.nav-pills {
+  --bs-nav-pills-link-active-bg: var(--kv-leaf);
+  --bs-nav-link-color: var(--kv-muted);
+  --bs-nav-link-hover-color: var(--kv-ink);
+}
+
+.pagination {
+  --bs-pagination-color: var(--kv-leaf);
+  --bs-pagination-hover-color: var(--kv-leaf-dark);
+  --bs-pagination-focus-color: var(--kv-leaf-dark);
+  --bs-pagination-focus-box-shadow: 0 0 0 0.2rem rgba(var(--kv-leaf-rgb), 0.18);
+  --bs-pagination-active-bg: var(--kv-leaf);
+  --bs-pagination-active-border-color: var(--kv-leaf);
+}
+
+.progress {
+  --bs-progress-bg: #e4e9e1;
+  --bs-progress-bar-bg: var(--kv-leaf);
+}
+
+.badge {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.alert {
+  border-radius: var(--kv-radius);
+}
+
+.modal-content {
+  border: 0;
+  border-radius: 0.875rem;
+  box-shadow: 0 1.5rem 3rem rgba(29, 38, 33, 0.25);
+}
+
+.modal-backdrop.show {
+  opacity: 0.4;
+  background: var(--kv-loam);
+}
+
+/* Tables: quiet headers, generous rows. */
+.table {
+  --bs-table-hover-bg: rgba(var(--kv-leaf-rgb), 0.045);
+  --bs-table-border-color: #e9ede6;
+}
+
+.table > thead.table-light th,
+.table > thead th {
+  --bs-table-bg: transparent;
+  --bs-table-color: var(--kv-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--kv-ash);
+  padding-top: 0.6rem;
+  padding-bottom: 0.6rem;
+}
+
+.table > :not(caption) > * > * {
+  padding-top: 0.65rem;
+  padding-bottom: 0.65rem;
+}
+
+/* ── The shell: sidebar + main ───────────────────────────────── */
+
+.kv-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.kv-skip {
+  position: absolute;
+  left: 0.5rem;
+  top: -3rem;
+  z-index: 1100;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.375rem;
+  background: var(--kv-sorghum);
+  color: var(--kv-loam);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.kv-skip:focus {
+  top: 0.5rem;
+}
+
+.kv-sidebar {
+  position: sticky;
+  top: 0;
+  flex: 0 0 var(--kv-sidebar-w);
+  width: var(--kv-sidebar-w);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 1.1rem 0.75rem 0.75rem;
+  color: rgba(255, 255, 255, 0.72);
+  /* Furrows: faint ploughed lines across the soil. */
+  background:
+    repeating-linear-gradient(112deg, rgba(255, 255, 255, 0.028) 0 1px, transparent 1px 15px),
+    linear-gradient(180deg, var(--kv-loam) 0%, var(--kv-loam-2) 100%);
+  overflow-y: auto;
+  overflow-x: hidden;
+  transition: width 0.18s ease, flex-basis 0.18s ease;
+  z-index: 1040;
+}
+
+.kv-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.25rem 0.6rem 1.25rem;
+  color: #fff;
+  text-decoration: none;
+}
+
+.kv-brand:hover {
+  color: #fff;
+}
+
+.kv-brand-name {
+  font-family: var(--kv-font-display);
+  font-size: 1.4rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+
+/* The signature: a row of seeds. Brand mark here, current-page marker below. */
+.kv-seeds {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+
+.kv-seeds i {
+  display: block;
+  width: 7px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--kv-sorghum);
+  transform: rotate(-18deg);
+}
+
+.kv-seeds i:nth-child(2) {
+  transform: rotate(-18deg) translateY(-3px);
+}
+
+.kv-seeds-sm i {
+  width: 5px;
+  height: 8px;
+}
+
+.kv-nav {
+  flex: 1 1 auto;
+}
+
+.kv-nav-group + .kv-nav-group {
+  margin-top: 1.1rem;
+}
+
+.kv-nav-heading {
+  padding: 0 0.7rem 0.4rem;
+  font-family: var(--kv-font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.kv-nav-link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.925rem;
+  font-weight: 500;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.kv-nav-link > .bi:first-child {
+  flex: none;
+  width: 1.25rem;
+  font-size: 1.05rem;
+  text-align: center;
+}
+
+.kv-nav-link:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.kv-nav-link:focus-visible,
+.kv-collapse:focus-visible,
+.kv-menu:focus-visible,
+.kv-brand:focus-visible {
+  outline: 2px solid var(--kv-sorghum);
+  outline-offset: 2px;
+}
+
+.kv-nav-link.active {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+/* The current page is sown: a seed at the start of its row. */
+.kv-nav-link.active::before {
+  content: '';
+  position: absolute;
+  left: -0.75rem;
+  top: 50%;
+  width: 6px;
+  height: 18px;
+  margin-top: -9px;
+  border-radius: 0 6px 6px 0;
+  background: var(--kv-sorghum);
+}
+
+.kv-nav-link.active > .bi:first-child {
+  color: var(--kv-sorghum);
+}
+
+.kv-badge {
+  margin-left: auto;
+  min-width: 1.4rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--kv-sorghum);
+  color: var(--kv-loam);
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.kv-ext {
+  margin-left: auto;
+  font-size: 0.7rem;
+  opacity: 0.5;
+}
+
+.kv-sidebar-foot {
+  padding-top: 0.75rem;
+  margin-top: 0.75rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.kv-user {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.6rem;
+  margin: 0.25rem 0;
+}
+
+.kv-avatar {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  border-radius: 50%;
+  background: rgba(224, 165, 38, 0.16);
+  color: var(--kv-sorghum);
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.kv-user-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.kv-user-name {
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.875rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kv-user-role {
+  font-size: 0.75rem;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.kv-collapse {
+  display: none;
+  width: 100%;
+  margin-top: 0.4rem;
+  padding: 0.35rem;
+  border: 0;
+  border-radius: 0.5rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.kv-collapse:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.kv-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kv-topbar {
+  display: none;
+}
+
+.kv-content {
+  flex: 1 1 auto;
+  padding: 2rem clamp(1rem, 3vw, 2.75rem) 1rem;
+  outline: none;
+}
+
+/* Content is a centred column; the width suits the page (set per route in
+   Layout.tsx): forms read best narrow, tables and the map need room. */
+.kv-container {
+  width: 100%;
+  margin-inline: auto;
+}
+
+.kv-container-narrow {
+  max-width: 60rem;
+}
+
+.kv-container-medium {
+  max-width: 72rem;
+}
+
+.kv-container-wide {
+  max-width: 96rem;
+}
+
+.kv-page-head {
+  margin-bottom: 1.5rem;
+}
+
+.kv-lede {
+  max-width: 52rem;
+}
+
+.kv-eyebrow {
+  font-family: var(--kv-font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #8a6512;
+  margin-bottom: 0.35rem;
+}
+
+.kv-title {
+  font-family: var(--kv-font-display);
+  font-size: clamp(1.5rem, 1.2rem + 1vw, 2rem);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin: 0 0 0.4rem;
+}
+
+.kv-lede {
+  color: var(--kv-muted);
+  margin: 0;
+}
+
+.kv-footer {
+  padding: 1.25rem clamp(1rem, 3vw, 2.75rem) 1.5rem;
+  color: var(--kv-muted);
+  font-size: 0.8rem;
+}
+
+.kv-footer a {
+  color: inherit;
+}
+
+/* Desktop: the sidebar can be narrowed to icons. */
+@media (min-width: 992px) {
+  .kv-collapse {
+    display: block;
+  }
+
+  .kv-shell.is-collapsed .kv-sidebar {
+    flex-basis: var(--kv-sidebar-w-collapsed);
+    width: var(--kv-sidebar-w-collapsed);
+  }
+
+  .kv-shell.is-collapsed .kv-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .kv-shell.is-collapsed .kv-brand {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .kv-shell.is-collapsed .kv-nav-link,
+  .kv-shell.is-collapsed .kv-user {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .kv-shell.is-collapsed .kv-nav-heading {
+    height: 1px;
+    padding: 0;
+    margin: 0 0.6rem 0.6rem;
+    background: rgba(255, 255, 255, 0.1);
+  }
+
+  .kv-shell.is-collapsed .kv-badge {
+    position: absolute;
+    top: 0.15rem;
+    right: 0.35rem;
+    min-width: 0;
+    padding: 0 0.3rem;
+    font-size: 0.62rem;
+  }
+}
+
+/* Phones and tablets: the sidebar becomes a drawer behind a top bar. */
+@media (max-width: 991.98px) {
+  .kv-sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    box-shadow: none;
+  }
+
+  .kv-sidebar.is-open {
+    transform: translateX(0);
+    box-shadow: 0 0 2.5rem rgba(0, 0, 0, 0.35);
+  }
+
+  .kv-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 1030;
+    background: rgba(29, 38, 33, 0.45);
+  }
+
+  .kv-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 1020;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    background: var(--kv-loam);
+    color: #fff;
+  }
+
+  .kv-topbar-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-family: var(--kv-font-display);
+    font-weight: 700;
+    font-size: 1.15rem;
+  }
+
+  .kv-menu {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: 0;
+    border-radius: 0.5rem;
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+    font-size: 1.35rem;
+  }
+
+  .kv-content {
+    padding-top: 1.25rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kv-sidebar,
+  .kv-nav-link {
+    transition: none;
+  }
+}
+
+/* ── Sign-in and registration ────────────────────────────────── */
+
+.kv-auth {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.kv-auth-panel {
+  display: none;
+}
+
+.kv-auth-form {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  max-width: 25rem;
+  margin: 0 auto;
+  padding: 3rem 1rem;
+}
+
+.kv-auth-mobile-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 2rem;
+  font-family: var(--kv-font-display);
+  font-size: 1.4rem;
+  font-weight: 700;
+}
+
+@media (min-width: 992px) {
+  .kv-auth {
+    grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  }
+
+  .kv-auth-panel {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 2.75rem 3rem;
+    color: rgba(255, 255, 255, 0.75);
+    background:
+      repeating-linear-gradient(112deg, rgba(255, 255, 255, 0.03) 0 1px, transparent 1px 15px),
+      linear-gradient(160deg, var(--kv-loam) 0%, #2a3a30 100%);
+  }
+
+  .kv-auth-mobile-brand {
+    display: none;
+  }
+}
+
+.kv-auth-panel .kv-brand {
+  padding: 0;
+}
+
+.kv-auth-statement {
+  font-family: var(--kv-font-display);
+  font-size: clamp(1.9rem, 1.2rem + 1.6vw, 2.75rem);
+  font-weight: 650;
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  color: #fff;
+  max-width: 28rem;
+  margin: 0 0 1rem;
+}
+
+.kv-auth-statement em {
+  font-style: normal;
+  color: var(--kv-sorghum);
+}
+
+.kv-auth-panel p {
+  max-width: 26rem;
+}
+
+.kv-auth-foot {
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.kv-auth-title {
+  font-family: var(--kv-font-display);
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  margin-bottom: 0.35rem;
+}
+
+/* ── Shared pieces used by the pages ─────────────────────────── */
+
+/* Segmented filter: one choice of several, wraps on narrow screens rather
+   than running off the edge as a .btn-group did. */
+.kv-segment {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--kv-ash);
+  border-radius: 0.6rem;
+  background: #fff;
+}
+
+.kv-segment > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.7rem;
+  border: 0;
+  border-radius: 0.45rem;
+  background: transparent;
+  color: var(--kv-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.kv-segment > button:hover {
+  color: var(--kv-ink);
+  background: #eef1eb;
+}
+
+.kv-segment > button.active {
+  background: var(--kv-leaf);
+  color: #fff;
+}
+
+.kv-segment > button:focus-visible {
+  outline: 2px solid var(--kv-leaf);
+  outline-offset: 1px;
+}
+
+.kv-count {
+  font-family: var(--kv-font-mono);
+  font-size: 0.72rem;
+  opacity: 0.75;
+}
+
+/* Connection state of a live list: a dot and a word. */
+.kv-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--kv-muted);
+  white-space: nowrap;
+}
+
+.kv-live::before {
+  content: '';
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #a7b0a8;
+}
+
+.kv-live.is-live {
+  color: var(--kv-leaf);
+}
+
+.kv-live.is-live::before {
+  background: var(--kv-leaf);
+  box-shadow: 0 0 0 3px rgba(var(--kv-leaf-rgb), 0.18);
+}
+
+/* Empty states say what to do next. */
+.kv-empty {
+  padding: 3rem 1rem;
+  text-align: center;
+  color: var(--kv-muted);
+}
+
+.kv-empty > .bi {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-size: 2rem;
+  color: #a7b0a8;
+}
+
+.kv-empty p {
+  margin-bottom: 1rem;
+}
+
+.kv-empty .kv-empty-title {
+  margin-bottom: 0.25rem;
+  font-family: var(--kv-font-display);
+  font-size: 1.1rem;
+  font-weight: 650;
+  color: var(--kv-ink);
+}
+
+/* Route loading: the seed row, gently. */
+.kv-loading {
+  display: grid;
+  place-items: center;
+  min-height: 40vh;
+}
+
+.kv-loading .kv-seeds i {
+  animation: kv-sprout 1s ease-in-out infinite alternate;
+}
+
+.kv-loading .kv-seeds i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.kv-loading .kv-seeds i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes kv-sprout {
+  from {
+    opacity: 0.25;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kv-loading .kv-seeds i {
+    animation: none;
+  }
 }
 
 /* Tables fit their container instead of scrolling sideways.
@@ -56,8 +908,15 @@ body {
 
 .kvuno-card {
   background: #fff;
-  border: 1px solid var(--kvuno-border);
-  border-radius: 0.5rem;
+  border: 1px solid var(--kv-ash);
+  border-radius: var(--kv-radius);
+  box-shadow: 0 1px 2px rgba(29, 38, 33, 0.04);
+}
+
+.kvuno-card h2.h6 {
+  font-family: var(--kv-font-display);
+  font-size: 1rem;
+  font-weight: 650;
 }
 
 .kvuno-toast-stack {
@@ -72,7 +931,7 @@ body {
 }
 
 .kvuno-toast {
-  box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.12);
+  box-shadow: 0 0.75rem 1.5rem rgba(29, 38, 33, 0.18);
   margin: 0;
 }
 
@@ -82,16 +941,17 @@ body {
 .kvuno-map {
   height: min(60vh, 34rem);
   min-height: 18rem;
-  border-radius: 0.375rem;
+  border-radius: var(--kv-radius);
+  border: 1px solid var(--kv-ash);
   overflow: hidden;
-  background: #e9ecef;
+  background: #e6ebe3;
 }
 
 @media (min-width: 992px) {
   /* Sticky so the map stays visible while working down a long table. */
   .kvuno-map {
     position: sticky;
-    top: 0.5rem;
+    top: 1rem;
   }
 }
 
@@ -101,8 +961,11 @@ body {
   overflow-y: auto;
 }
 
+/* Counts and figures line up and read as data. */
 .kvuno-status {
+  font-family: var(--kv-font-mono);
   font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
 }
 
 .kvuno-truncate {
