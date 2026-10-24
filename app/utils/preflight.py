@@ -102,7 +102,13 @@ def check_redis(timeout: float, role: str = "api") -> CheckResult:
     name = "redis"
     settings = get_settings()
     broker_url = settings.CELERY_BROKER_URL
-    required = role == "worker" or settings.HOUSEKEEPING_ENABLED
+    if role == "worker":
+        # HOUSEKEEPING_MODE runs housekeeping.py instead of Celery: it imports
+        # straight into the database and never touches the broker, so a
+        # missing Redis must not stop it.
+        required = not settings.HOUSEKEEPING_MODE
+    else:
+        required = settings.HOUSEKEEPING_ENABLED
     client = None
     try:
         from redis import Redis
@@ -160,9 +166,10 @@ def check_data_dir() -> CheckResult:
 def run_preflight(role: str = "api") -> int:
     """Wait for required dependencies, then exit 0 or 1.
 
-    ``role`` is informational today but keeps the door open for the worker to
-    require Redis unconditionally. Returns a process exit code rather than
-    calling ``sys.exit`` so it is testable.
+    ``role`` decides what is required: the database always; Redis for the API
+    only with HOUSEKEEPING_ENABLED, and for the worker unless HOUSEKEEPING_MODE
+    turns it into a housekeeping run (no broker involved). Returns a process
+    exit code rather than calling ``sys.exit`` so it is testable.
     """
     for name in unknown_settings():
         # Most likely a typo (LOG_LEVLE): it is ignored, so its default applies.
@@ -177,6 +184,9 @@ def run_preflight(role: str = "api") -> int:
     if not settings.PREFLIGHT_ENABLED:
         logger.info(f"[preflight] PREFLIGHT_ENABLED=false — skipping ({role})")
         return 0
+    if role == "worker" and settings.HOUSEKEEPING_MODE:
+        logger.info(f"[preflight] worker in housekeeping mode ({settings.HOUSEKEEPING_MODE}): "
+                    "database required, Redis not")
 
     timeout = settings.PREFLIGHT_TIMEOUT_SECONDS
     retries = settings.PREFLIGHT_RETRIES

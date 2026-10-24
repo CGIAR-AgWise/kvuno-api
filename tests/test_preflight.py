@@ -62,6 +62,23 @@ class TestRedisRequirementDependsOnRoleAndConfig:
         assert pf.run_preflight("worker") == 1
 
 
+class TestHousekeepingMode:
+    """HOUSEKEEPING_MODE makes the worker image run housekeeping.py, not Celery."""
+
+    @pytest.mark.parametrize("mode", ["oneshot", "watch", "dryrun"])
+    def test_worker_in_housekeeping_mode_does_not_need_redis(self, monkeypatch, mode):
+        pf = _preflight(monkeypatch, **OK_DB, CELERY_BROKER_URL=DEAD_REDIS, HOUSEKEEPING_MODE=mode)
+        assert pf.run_preflight("worker") == 0
+
+    def test_it_still_needs_the_database(self, monkeypatch):
+        pf = _preflight(monkeypatch, **DEAD_DB, CELERY_BROKER_URL=DEAD_REDIS, HOUSEKEEPING_MODE="oneshot")
+        assert pf.run_preflight("worker") == 1
+
+    def test_an_unknown_mode_fails_at_once(self, monkeypatch):
+        pf = _preflight(monkeypatch, **OK_DB, HOUSEKEEPING_MODE="sometimes")
+        assert pf.run_preflight("worker") == 1
+
+
 class TestOptOut:
     def test_preflight_can_be_disabled(self, monkeypatch):
         """Escape hatch: a broken dependency must not block a deliberate boot."""

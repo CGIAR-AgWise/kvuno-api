@@ -206,8 +206,13 @@ class Settings(BaseSettings):
 
     # ── Ingestion ──────────────────────────────────────────────
     HOUSEKEEPING_ENABLED: bool = _f(False, 'ingest',
-                                    "Process files with the Celery worker (needs Redis). Off: uploads are received "
-                                    "and mapped, but nothing is ingested.")
+                                    "Hand /api/v1/data/upload and Jobs retries of plain data-folder files to the "
+                                    "Celery worker (needs Redis). SPA uploads and the startup scan run in the API "
+                                    "process either way.")
+    HOUSEKEEPING_MODE: Optional[Literal['oneshot', 'watch', 'dryrun']] = _f(
+        None, 'ingest',
+        "Worker image only: run housekeeping.py instead of Celery — oneshot (scan once and exit), watch "
+        "(keep importing new files) or dryrun (report only). Unset: the normal Celery worker.")
     HOUSEKEEPING_DATA_DIR: str = _f('static/data', 'ingest',
                                     "Directory holding data files; uploads go to its `uploads/` subdirectory.")
     HOUSEKEEPING_BATCH_SIZE: int = _f(2000, 'ingest', "Rows per insert batch.")
