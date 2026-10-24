@@ -28,8 +28,9 @@ class TestPlantingDataFilter:
             PlantingDataFilter(coordinates="200,0")
 
     def test_valid_opt_date(self):
+        # Stored values have no year ('15-Nov'); a full date's year is ignored.
         f = PlantingDataFilter(opt_date="2024-11-15")
-        assert f.opt_date == "2024-11-15"
+        assert f.opt_date == "15-Nov"
 
     def test_invalid_opt_date_format(self):
         with pytest.raises(ValidationError, match="Date"):

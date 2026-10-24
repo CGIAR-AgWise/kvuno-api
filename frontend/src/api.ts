@@ -220,10 +220,16 @@ export interface PlantingRecord {
   lat: number | null
   variety: string | null
   season_type: string | null
+  /** Day-month as in the source data ('30-Nov'); there is no year. */
   opt_date: string | null
+  /** The same day as ISO 8601 month-day, '--11-30'. */
+  opt_month_day: string | null
   planting_option: string | null
   check_sum: string | null
-  coordinates: string | null
+  /** GeoJSON Point (RFC 7946): coordinates are [lon, lat]. */
+  coordinates: { type: 'Point'; coordinates: number[] } | null
+  created_at: string | null
+  updated_at: string | null
 }
 
 export interface LatLon {

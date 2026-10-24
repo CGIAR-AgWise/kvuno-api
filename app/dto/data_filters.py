@@ -72,8 +72,9 @@ class PlantingDataFilter(BaseModel):
     )
     opt_date: Optional[str] = Field(
         default=None,
-        description='Optional date in YYYY-MM-DD format',
-        json_schema_extra={"example": "2024-03-15"},
+        description="Optimal sowing day of the year (the data has no year): '30-Nov', ISO month-day "
+                    "'--11-30', or a full date '2026-11-30' whose year is ignored",
+        json_schema_extra={"example": "30-Nov"},
     )
     planting_option: Optional[int] = Field(
         default=None,
@@ -118,10 +119,12 @@ class PlantingDataFilter(BaseModel):
     @field_validator('opt_date', mode='before')
     @classmethod
     def validate_opt_date(cls, value):
+        # Stored values are day-month ('30-Nov'). This used to demand
+        # YYYY-MM-DD, which no stored value is, so the filter matched nothing
+        # and the Explore page's Date dropdown got a 422.
         if value:
-            pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-            if not pattern.match(value):
-                raise ValueError("Date must be in 'YYYY-MM-DD' format.")
+            from app.utils.opt_date import to_stored
+            return to_stored(value)
         return value
 
     @field_validator('sort_col', mode='before')

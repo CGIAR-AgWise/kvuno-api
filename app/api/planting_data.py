@@ -14,8 +14,9 @@ from app.dto.pagination import get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
 from app.rate_limit import limiter
 from app.repo.planting_recommendation import PlantingRecommendationRepo
-from app.utils.geometry import point_wkt
+from app.utils.geometry import point_geojson
 from app.utils.logging import get_logger
+from app.utils.opt_date import month_day
 from pydantic import BaseModel, Field
 
 __bp__ = "/planting-data"
@@ -133,10 +134,11 @@ def get_data(query: PlantingDataFilter):
             variety=item.variety,
             season_type=item.season_type,
             opt_date=item.opt_date,
+            opt_month_day=month_day(item.opt_date),
             planting_option=item.planting_option,
             check_sum=item.check_sum,
-            # WKT, as documented; str() of the geometry was hex EWKB.
-            coordinates=point_wkt(item.coordinates),
+            # GeoJSON Point; str() of the geometry was hex EWKB.
+            coordinates=point_geojson(item.coordinates),
             created_at=item.created_at,
             updated_at=item.updated_at,
         ) for item in paginated_data.items]

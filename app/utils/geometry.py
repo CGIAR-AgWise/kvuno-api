@@ -1,13 +1,16 @@
 """
-Turn a stored point into WKT ("POINT(30.025 -14.475)") for API responses.
+Turn a stored point into GeoJSON for API responses.
 
 GeoAlchemy2 hands a PostGIS geometry back as a WKBElement, and `str()` of
 that is the hex EWKB ("0101000020e6100000..."), which is what the API used to
-return. The `coordinates` column only ever holds points, so this decodes the
-EWKB point directly rather than adding shapely as a dependency.
+return. Responses now carry an RFC 7946 GeoJSON Point —
+{"type": "Point", "coordinates": [lon, lat]} — which every GIS library,
+Leaflet, and `json.loads` understand. The `coordinates` column only ever holds
+points, so this decodes the EWKB point directly rather than adding shapely.
 """
 from __future__ import annotations
 
+import re
 import struct
 from typing import Any
 
@@ -15,6 +18,7 @@ _WKB_POINT = 1
 _SRID_FLAG = 0x20000000
 _Z_FLAG = 0x80000000
 _M_FLAG = 0x40000000
+_WKT_POINT = re.compile(r'^\s*POINT\s*Z?\s*\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)(?:\s+([-+0-9.eE]+))?\s*\)\s*$', re.I)
 
 
 def _wkb_bytes(value: Any) -> bytes | None:
@@ -31,16 +35,18 @@ def _wkb_bytes(value: Any) -> bytes | None:
     return None
 
 
-def point_wkt(value: Any) -> str | None:
-    """WKT for a stored point; None if there is none or it is not a 2D/3D point.
+def point_coords(value: Any) -> tuple[float, ...] | None:
+    """(lon, lat[, z]) of a stored point; None if absent or not a point.
 
-    Accepts a GeoAlchemy2 element, raw (E)WKB bytes, a hex string, or text that
-    is already WKT (the SQLite schema stores `coordinates` as text).
+    Accepts a GeoAlchemy2 element, raw (E)WKB bytes, a hex string, or WKT text
+    (the SQLite schema stores `coordinates` as text).
     """
     if value is None:
         return None
-    if isinstance(value, str) and value.lstrip().upper().startswith('POINT'):
-        return value.strip()
+    if isinstance(value, str):
+        m = _WKT_POINT.match(value)
+        if m:
+            return tuple(float(g) for g in m.groups() if g is not None)
 
     data = _wkb_bytes(value)
     if not data or len(data) < 5:
@@ -56,5 +62,12 @@ def point_wkt(value: Any) -> str | None:
     count = 3 if has_z else 2
     if len(data) < offset + 8 * count:
         return None
-    coords = struct.unpack_from(order + 'd' * count, data, offset)
-    return 'POINT(' + ' '.join(repr(c) for c in coords) + ')'
+    return struct.unpack_from(order + 'd' * count, data, offset)
+
+
+def point_geojson(value: Any) -> dict | None:
+    """{"type": "Point", "coordinates": [lon, lat]} (RFC 7946), or None."""
+    coords = point_coords(value)
+    if coords is None:
+        return None
+    return {'type': 'Point', 'coordinates': list(coords)}
