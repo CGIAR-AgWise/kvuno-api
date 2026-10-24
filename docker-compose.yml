@@ -69,11 +69,11 @@ services:
       # docker/entrypoint.sh applies migrations before starting the server when
       # this is true (its own default). Compose overrides it to false, so
       # migrations must be run manually:
-      #   docker compose exec api python scripts/run_migrations.py
+      #   docker compose exec api Python scripts/run_migrations.py
       # Set true to let the api migrate on start — but never with more than one
       # replica, or they race to migrate the same schema.
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-false}
-      # Pinned off whatever .env says: this compose file's api enqueues no
+      # Pinned off whatever .env says: this the compose file's api enqueues no
       # work (set it true, with CELERY_BROKER_URL, to hand uploads to `worker`).
       HOUSEKEEPING_ENABLED: false
     depends_on:
@@ -84,7 +84,7 @@ services:
     ports:
       # host 5000 -> container 80 (the app's default port)
       - "127.0.0.1:5000:80"
-    # The app listens on port 80 but the container runs as the non-root `app`
+    # The app listens on port 80, but the container runs as the non-root `app`
     # user, and ports below 1024 are privileged on Linux. Without this the
     # process dies with Permission denied at bind time.
     cap_add:
@@ -97,7 +97,7 @@ services:
   # debug on. Only started with the `dev` profile:
   #   docker compose --profile dev up api-dev
   # Published on host 5002 so it can run beside `api`. Its image tag matches
-  # what CI pushes for develop builds of docker/Dockerfile.
+  # what CI pushes for develop branch builds of docker/Dockerfile.
   api-dev:
     profiles: [ dev ]
     container_name: kvuno-api-dev
@@ -143,6 +143,7 @@ services:
       # dokploy-network, shared with other projects, `api` resolved to another
       # project's container. (The production stack in proxy-tool names its API
       # service `kvuno` and sets API_UPSTREAM=http://kvuno:80.)
+      # noinspection HttpUrlsUsage
       API_UPSTREAM: ${API_UPSTREAM:-http://kvuno-api:80}
     ports:
       - "127.0.0.1:5001:80"
@@ -190,10 +191,6 @@ services:
         condition: service_completed_successfully
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
-    # Contain an ingest spike in this container instead of letting it OOM the
-    # host. Streaming Parquet keeps normal usage far below this; the limit is a
-    # backstop, not a target. Raise it if large files are legitimate.
-    mem_limit: ${WORKER_MEM_LIMIT:-3g}
     # Celery has no HTTP port, so ask the worker itself over the broker. The
     # node name is celery@<container hostname> (kvuno-worker); `$$` stops
     # compose from interpolating $HOSTNAME. The ping is answered by the parent
@@ -206,34 +203,4 @@ services:
       retries: 3
     networks:
       - dokploy-network
-      - internal
-
-  # One-shot housekeeping: processes RDS/Parquet files from the data directory
-  # into the database. Run manually:
-  #   docker compose run --rm housekeeping
-  #   docker compose run --rm housekeeping --dry-run
-  #   docker compose run --rm housekeeping --watch  (runs until interrupted)
-  housekeeping:
-    container_name: kvuno-housekeeping
-    hostname: kvuno-housekeeping
-    image: ghcr.io/cgiar-agwise/kvuno-worker:${TAG:-latest}
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.worker
-    restart: "no"
-    env_file:
-      - .env
-    environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      DB_HOST: ${DB_HOST:?DB_HOST is required (Postgres is external to compose)}
-      DB_USER: ${DB_USER:?DB_USER is required}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
-      DB_NAME: ${DB_NAME:?DB_NAME is required}
-    entrypoint: ["python", "housekeeping.py"]
-    depends_on:
-      data-init:
-        condition: service_completed_successfully
-    volumes:
-      - ${DATA_DIR:-./data}:/app/static/data
-    networks:
       - internal
