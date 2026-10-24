@@ -23,6 +23,25 @@ services:
       args:
         POETRY_VERSION: ${POETRY_VERSION:-2.3.2}
 
+  # One-shot, as root, before api/worker start: hand the data directory to the
+  # image's `app` user. The containers run as that non-root user, and a volume
+  # or host directory Docker created is owned by root — uploads then fail with
+  # "Permission denied: 'static/data/uploads'". The user is named, not
+  # numbered, so it resolves to whatever uid this image gives `app` (1000 in
+  # current images). Only entries with the wrong owner are touched, so a
+  # re-run is quick. It never blocks the app: if chown is impossible (some
+  # Docker Desktop bind mounts), the api preflight reports it as not writable.
+  data-init:
+    image: ghcr.io/cgiar-agwise/kvuno-api:${TAG:-latest}
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - "find /app/static/data \\( ! -user app -o ! -group app \\) -exec chown -h app:app {} + || echo 'data-init: could not chown /app/static/data' >&2"
+    restart: "no"
+    volumes:
+      - ${DATA_DIR:-./data}:/app/static/data
+
   # Production API: gunicorn (docker/Dockerfile.prod.dockerfile), debug off.
   # For the Flask dev server use the `api-dev` service below
   # (`docker compose --profile dev up api-dev`).
@@ -57,6 +76,9 @@ services:
       # Pinned off whatever .env says: this compose file's api enqueues no
       # work (set it true, with CELERY_BROKER_URL, to hand uploads to `worker`).
       HOUSEKEEPING_ENABLED: false
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
@@ -91,6 +113,9 @@ services:
       <<: *api-environment
       FLASK_DEBUG: ${FLASK_DEBUG:-true}
       DEBUG_DB: ${DEBUG_DB:-true}
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     ports:
@@ -156,6 +181,9 @@ services:
       # Redis is external too; the app's default (localhost) is wrong in a container.
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
     volumes:
       - ${DATA_DIR:-./data}:/app/static/data
     # Contain an ingest spike in this container instead of letting it OOM the

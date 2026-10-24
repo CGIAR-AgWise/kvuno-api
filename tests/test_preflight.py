@@ -152,3 +152,29 @@ class TestDatabaseConnectTimeoutOption:
 
     def test_sqlite_gets_no_connect_args(self, monkeypatch):
         assert self._connect_args(monkeypatch, "sqlite:///:memory:") == {}
+
+
+class TestDataDirectory:
+    """Reported, never blocking: the classic root-owned volume problem."""
+
+    def test_writable_directory_is_ok(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOUSEKEEPING_DATA_DIR", str(tmp_path))
+        result = pf.check_data_dir()
+        assert result.ok and not result.blocking
+        assert (tmp_path / "uploads").is_dir()
+
+    def test_unwritable_directory_is_reported_but_not_blocking(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x")  # makedirs under a file fails on every OS
+        monkeypatch.setenv("HOUSEKEEPING_DATA_DIR", str(blocker))
+        result = pf.check_data_dir()
+        assert not result.ok
+        assert not result.blocking
+        assert "not writable" in result.detail
+
+    def test_it_does_not_stop_startup(self, monkeypatch, tmp_path):
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x")
+        _preflight(monkeypatch, **OK_DB, HOUSEKEEPING_ENABLED="false",
+                   CELERY_BROKER_URL=DEAD_REDIS, HOUSEKEEPING_DATA_DIR=str(blocker))
+        assert pf.run_preflight("api") == 0

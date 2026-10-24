@@ -149,6 +149,18 @@ class TestTusProtocol:
         assert _create(env.client, 10, name='notes.csv').status_code == 415
         assert _create(env.client, 0).status_code == 400
 
+    def test_unwritable_storage_is_a_clear_503_not_a_500(self, env, monkeypatch):
+        # Production: a root-owned data volume while the app runs as uid 1000
+        # raised PermissionError from makedirs and returned a bare 500.
+        def denied(*args, **kwargs):
+            raise PermissionError(13, 'Permission denied', 'static/data/uploads')
+
+        monkeypatch.setattr(service.os, 'makedirs', denied)
+        res = _create(env.client, 10)
+        assert res.status_code == 503
+        assert 'not writable' in res.get_json()['error']
+        assert env.session.query(service.Upload).count() == 0
+
     def test_ids_are_server_issued_and_strict(self, env):
         location = _create(env.client, 10).headers['Location']
         assert service.valid_id(location.rsplit('/', 1)[1])

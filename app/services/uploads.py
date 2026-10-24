@@ -174,8 +174,18 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
         created_at=_now(),
         updated_at=_now(),
     )
-    os.makedirs(upload_dir(upload.id), exist_ok=True)
-    open(part_path(upload.id), 'wb').close()
+    try:
+        os.makedirs(upload_dir(upload.id), exist_ok=True)
+        open(part_path(upload.id), 'wb').close()
+    except OSError as e:
+        # Almost always the data volume's ownership: the container runs as the
+        # non-root `app` user (UID 1000) and a volume created before the image
+        # made the directory is owned by root. A server problem, not the
+        # client's — 503 with a stable message, and one clear log line.
+        logger.error('upload storage is not writable', path=upload_root(), error=e.__class__.__name__,
+                     errno=e.errno, hint='chown the HOUSEKEEPING_DATA_DIR volume to 1000:1000')
+        raise UploadError('Upload storage on the server is not writable. Ask an administrator to fix '
+                          'the data volume permissions.', 503) from None
 
     session = _session()
     session.add(upload)

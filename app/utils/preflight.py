@@ -130,6 +130,33 @@ def check_redis(timeout: float, role: str = "api") -> CheckResult:
                 pass
 
 
+def check_data_dir() -> CheckResult:
+    """Can this process write the data directory (uploads, downloaded files)?
+
+    Reported, not required: the API serves data without it, and refusing to
+    start would turn broken uploads into a full outage. But it is the classic
+    container failure — a volume owned by root while the app runs as UID 1000 —
+    and it otherwise only shows up as the first upload's error.
+    """
+    import os
+    import tempfile
+
+    name = "data directory"
+    path = os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, "uploads")
+    try:
+        os.makedirs(path, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=path, prefix=".preflight-"):
+            pass
+        return CheckResult(name, True, False, f"writable ({path})")
+    except OSError as exc:
+        return CheckResult(
+            name, False, False,
+            f"not writable ({path}): {exc.strerror or exc.__class__.__name__} — uploads will fail. "
+            f"Running as uid {os.getuid() if hasattr(os, 'getuid') else '?'}; give the volume to that "
+            "user (the compose files' data-init service does this on start).",
+        )
+
+
 def run_preflight(role: str = "api") -> int:
     """Wait for required dependencies, then exit 0 or 1.
 
@@ -161,7 +188,7 @@ def run_preflight(role: str = "api") -> int:
     def redis_probe() -> CheckResult:
         return check_redis(timeout, role=role)
 
-    probes = (("database", database_probe), ("redis", redis_probe))
+    probes = (("database", database_probe), ("redis", redis_probe), ("data directory", check_data_dir))
 
     attempt = 0
     while True:
