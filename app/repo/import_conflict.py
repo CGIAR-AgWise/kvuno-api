@@ -1,5 +1,5 @@
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Query
 
 from app.dto.data_filters import CONFLICT_SORT_COLUMNS, QualityFilter
@@ -7,6 +7,8 @@ from app.models.database_conn import MyDb
 from app.models.kvuno import ImportConflict
 from app.utils.logging import get_logger
 
+# What makes two conflicts "the same recommendation" on the Duplicates tab.
+DUPLICATE_KEYS = ('country', 'province', 'variety', 'season_type', 'opt_date')
 
 
 class ImportConflictRepo:
@@ -19,18 +21,7 @@ class ImportConflictRepo:
 
     def get_filtered_query(self, filters: QualityFilter) -> Query:
         session = self._get_session()
-        query = session.query(ImportConflict)
-
-        if filters.country:
-            query = query.filter(ImportConflict.country.ilike(f"%{filters.country}%"))
-        if filters.source:
-            query = query.filter(ImportConflict.source == filters.source)
-        if filters.search:
-            query = query.filter(
-                ImportConflict.country.ilike(f"%{filters.search}%")
-                | ImportConflict.variety.ilike(f"%{filters.search}%")
-                | ImportConflict.province.ilike(f"%{filters.search}%")
-            )
+        query = self._filtered(session.query(ImportConflict), filters)
 
         sort_col = filters.sort_col or 'created_at'
         sort_dir = filters.sort_dir or 'desc'
@@ -47,6 +38,68 @@ class ImportConflictRepo:
     def get_paginated(self, filters: QualityFilter, page: int, per_page: int):
         query = self.get_filtered_query(filters)
         return query.paginate(page=page, per_page=per_page, error_out=False)
+
+    def _filtered(self, query, filters: QualityFilter):
+        if filters.country:
+            query = query.filter(ImportConflict.country.ilike(f"%{filters.country}%"))
+        if filters.source:
+            query = query.filter(ImportConflict.source == filters.source)
+        if filters.search:
+            query = query.filter(
+                ImportConflict.country.ilike(f"%{filters.search}%")
+                | ImportConflict.variety.ilike(f"%{filters.search}%")
+                | ImportConflict.province.ilike(f"%{filters.search}%")
+            )
+        return query
+
+    def get_duplicate_groups(self, filters: QualityFilter, offset: int, limit: int) -> tuple[int, list[dict]]:
+        """One page of conflicts grouped by DUPLICATE_KEYS, most repeated first.
+
+        The grouping is done here, in SQL. The Duplicates tab used to download
+        every page of /conflicts and group them in the browser, which meant one
+        request per page of conflicts every time the tab opened.
+
+        Two bounded queries per page: the groups themselves, then the per-source
+        counts for just those groups (portable — no string_agg/group_concat).
+        Keys are matched with IS NOT DISTINCT FROM, so a NULL province groups
+        with other NULLs, as it does in GROUP BY.
+        """
+        session = self._get_session()
+        keys = [getattr(ImportConflict, k) for k in DUPLICATE_KEYS]
+        count = func.count(ImportConflict.id).label('count')
+
+        grouped = self._filtered(session.query(*keys, count), filters).group_by(*keys)
+        total = session.query(func.count()).select_from(grouped.subquery()).scalar() or 0
+
+        rows = (
+            grouped.order_by(count.desc(), *[k.asc() for k in keys])
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        if not rows:
+            return total, []
+
+        groups = [dict(zip(DUPLICATE_KEYS, row[:len(DUPLICATE_KEYS)]), count=row[-1], sources={})
+                  for row in rows]
+
+        page_keys = or_(*[
+            and_(*[col.is_not_distinct_from(group[name]) for name, col in zip(DUPLICATE_KEYS, keys)])
+            for group in groups
+        ])
+        by_source = (
+            self._filtered(session.query(*keys, ImportConflict.source, func.count(ImportConflict.id)), filters)
+            .filter(page_keys)
+            .group_by(*keys, ImportConflict.source)
+            .all()
+        )
+        index = {tuple(g[k] for k in DUPLICATE_KEYS): g for g in groups}
+        for row in by_source:
+            group = index.get(tuple(row[:len(DUPLICATE_KEYS)]))
+            if group is not None:
+                source = row[len(DUPLICATE_KEYS)] or 'unknown'
+                group['sources'][source] = group['sources'].get(source, 0) + row[-1]
+        return total, groups
 
     def get_stats(self):
         session = self._get_session()

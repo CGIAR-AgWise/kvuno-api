@@ -449,9 +449,23 @@ export const fetchConflicts = (
 export const fetchStats = (signal?: AbortSignal) =>
   request<QualityStats>('/api/v1/quality/stats', { signal })
 
-export async function fetchAllConflicts(signal?: AbortSignal): Promise<AllPages<Conflict>> {
-  return fetchAllPages<Conflict>('/api/v1/quality/conflicts', 'data', undefined, signal)
+/** Conflicts grouped by country/province/variety/season/date, most repeated first. */
+export interface DuplicateGroup {
+  country: string | null
+  province: string | null
+  variety: string | null
+  season_type: string | null
+  opt_date: string | null
+  count: number
+  sources: Record<string, number>
 }
+
+/**
+ * One page of duplicate groups. The server does the grouping; the tab used to
+ * fetch every page of /conflicts and group them here, one request per page.
+ */
+export const fetchDuplicates = (params: URLSearchParams, page: number, signal?: AbortSignal) =>
+  fetchPage<DuplicateGroup>('/api/v1/quality/duplicates', 'data', page, DEFAULT_PER_PAGE, params, signal)
 
 export async function fetchTokens(signal?: AbortSignal): Promise<TokenInfo[]> {
   const out: TokenInfo[] = []
