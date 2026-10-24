@@ -6,6 +6,7 @@ from redis import Redis
 from redis.exceptions import RedisError
 
 from app.config import get_settings
+from app.utils.json_encoding import json_default
 
 _client = None
 
@@ -54,7 +55,9 @@ def api_cache(prefix: str, ttl: int = 300):
                 return result
             try:
                 client = _get_client()
-                client.setex(key, ttl, json.dumps(body, default=str))
+                # Same encoder as the live response: default=str wrote
+                # "2026-10-22 07:59:49", so a cache hit differed from a miss.
+                client.setex(key, ttl, json.dumps(body, default=json_default))
             except RedisError:
                 pass
             return result

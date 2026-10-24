@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Optional
 
 from pydantic import Field, BaseModel
@@ -21,6 +22,8 @@ class PlantingRecommendationBase(BaseModel):
     planting_option: Optional[int] = Field(default=None, description="Planting option", examples=[1])
     check_sum: Optional[str] = Field(default=None, description="File checksum", examples=["a1b2c3d4e5f6..."])
     coordinates: Optional[str] = Field(default=None, description="WKT coordinate string", examples=["POINT(36.82 -1.29)"])
+    created_at: Optional[datetime] = Field(default=None, description="Record creation timestamp", examples=["2023-08-20T12:34:56Z"])
+    updated_at: Optional[datetime] = Field(default=None, description="Record update timestamp", examples=["2023-08-20T12:34:56Z"])
 
 
 class PlantingRecommendationCreate(PlantingRecommendationBase):

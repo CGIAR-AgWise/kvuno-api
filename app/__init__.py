@@ -327,6 +327,10 @@ def create_app():
     # DEBUG_DB is handled by app/utils/logging.py (through the shared handler);
     # echo would add SQLAlchemy's own stdout handler and bypass LOG_LEVEL.
     app.config['SQLALCHEMY_ECHO'] = False
+    # Dates as ISO 8601 UTC ("2026-10-22T07:59:49Z"), not Flask's default HTTP
+    # date ("Thu, 22 Oct 2026 07:59:49 GMT"), so clients can parse and sort them.
+    from app.utils.json_encoding import IsoJSONProvider
+    app.json = IsoJSONProvider(app)
     app.json.sort_keys = settings.SORT_JSON
 
     # Initialize the database

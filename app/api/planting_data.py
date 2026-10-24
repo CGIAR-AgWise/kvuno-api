@@ -135,6 +135,8 @@ def get_data(query: PlantingDataFilter):
             planting_option=item.planting_option,
             check_sum=item.check_sum,
             coordinates=str(item.coordinates),
+            created_at=item.created_at,
+            updated_at=item.updated_at,
         ) for item in paginated_data.items]
 
         return PlantingRecommendationResponse(
