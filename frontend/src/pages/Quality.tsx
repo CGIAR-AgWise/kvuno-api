@@ -113,7 +113,7 @@ export default function Quality() {
               </span>
               <div className="progress flex-grow-1" style={{ height: 8 }}>
                 <div
-                  className="progress-bar bg-warning"
+                  className="progress-bar"
                   role="progressbar"
                   aria-label={`Conflicts from ${s.source}`}
                   aria-valuemin={0}
@@ -229,8 +229,7 @@ export default function Quality() {
             <p className="text-muted text-center py-4 mb-0">Loading duplicates…</p>
           ) : duplicates.length === 0 ? (
             <div className="kv-empty">
-              <p className="kv-empty-title">No duplicates</p>
-              <p className="mb-0">No imported rows have conflicted with data already stored.</p>
+              <p>No duplicates found.</p>
             </div>
           ) : (
             <>

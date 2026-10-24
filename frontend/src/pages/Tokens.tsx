@@ -126,9 +126,7 @@ export default function Tokens() {
           <p className="text-muted text-center py-4 mb-0">Loading…</p>
         ) : tokens.length === 0 ? (
           <div className="kv-empty">
-            <i className="bi bi-key" aria-hidden="true" />
-            <p className="kv-empty-title">No tokens yet</p>
-            <p className="mb-0">Choose an expiry and select New token to give a script access to the API.</p>
+            <p>No tokens. Create one above for scripts that call the API.</p>
           </div>
         ) : (
           <div className="kvuno-table-fit">

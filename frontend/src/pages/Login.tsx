@@ -34,13 +34,17 @@ export default function Login() {
   }
 
   return (
-    <AuthShell>
-      <h1 className="kv-auth-title">Sign in</h1>
-      <p className="text-muted mb-4">Use the username you registered with.</p>
+    <AuthShell
+      title="Sign in to KVuno"
+      after={
+        <>
+          No account? <Link to="/register">Request access</Link>
+        </>
+      }
+    >
       {notice && (
-        <div className="alert alert-warning d-flex gap-2" role="status">
-          <i className="bi bi-hourglass-split" aria-hidden="true" />
-          <div>{notice}</div>
+        <div className="alert alert-warning" role="status">
+          {notice}
         </div>
       )}
       {error && <div className="alert alert-danger">{error}</div>}
@@ -72,13 +76,10 @@ export default function Login() {
             required
           />
         </div>
-        <button className="btn btn-primary w-100 py-2 mt-2" disabled={busy}>
+        <button className="btn btn-primary w-100" disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>
-      <p className="text-muted small mt-4">
-        No account? <Link to="/register">Request one</Link>
-      </p>
     </AuthShell>
   )
 }

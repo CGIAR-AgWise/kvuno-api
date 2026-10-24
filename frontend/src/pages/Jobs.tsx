@@ -140,17 +140,13 @@ export default function Jobs() {
       <div className="kvuno-card p-3">
         {jobs.length === 0 ? (
           <div className="kv-empty">
-            <i className="bi bi-inbox" aria-hidden="true" />
-            <p className="kv-empty-title">No imports yet</p>
-            <p>Upload a file and its import will appear here as it runs.</p>
-            <Link className="btn btn-primary btn-sm" to="/upload">
-              Upload a file
-            </Link>
+            <p>
+              No imports yet. <Link to="/upload">Upload a file</Link> to start one.
+            </p>
           </div>
         ) : visible.length === 0 ? (
           <div className="kv-empty">
-            <p className="kv-empty-title">No jobs match</p>
-            <p>Try another status or clear the search.</p>
+            <p>No jobs match this status or search.</p>
           </div>
         ) : (
           <div className="kvuno-table-fit">

@@ -36,17 +36,16 @@ interface Page {
   label: string
   icon: string
   title: string
-  description: string
+  /** Only where the page needs explaining; most do not. */
+  note?: string
   /** Column width: narrow for forms, medium for lists, wide for tables and the map. */
   width: 'narrow' | 'medium' | 'wide'
   adminOnly?: boolean
 }
 
 /**
- * The sidebar, grouped by what people do. "Data" follows a file through its
- * life — upload it, watch it import, explore it, review its conflicts — so the
- * order is the workflow. Each page's header (title + one line) comes from here
- * too, so every page opens the same way.
+ * The sidebar. "Data" is in workflow order: upload a file, watch it import,
+ * explore it, review its conflicts. Page titles come from here too.
  */
 const GROUPS: { label: string; pages: Page[] }[] = [
   {
@@ -56,32 +55,28 @@ const GROUPS: { label: string; pages: Page[] }[] = [
         to: '/upload',
         label: 'Upload',
         icon: 'bi-cloud-arrow-up',
-        title: 'Upload files',
-        description: 'Send RDS or Parquet files, then match their columns to planting data.',
+        title: 'Upload',
         width: 'narrow',
       },
       {
         to: '/jobs',
         label: 'Jobs',
         icon: 'bi-list-check',
-        title: 'Import jobs',
-        description: 'Follow each file from the queue to a finished import, and retry the ones that failed.',
+        title: 'Jobs',
         width: 'wide',
       },
       {
         to: '/explore',
         label: 'Explore',
         icon: 'bi-map',
-        title: 'Explore recommendations',
-        description: 'Filter planting recommendations and see where they apply on the map.',
+        title: 'Explore',
         width: 'wide',
       },
       {
         to: '/quality',
         label: 'Quality',
         icon: 'bi-shield-check',
-        title: 'Data quality',
-        description: 'Review rows that conflicted with data already stored.',
+        title: 'Quality',
         width: 'wide',
       },
     ],
@@ -94,7 +89,6 @@ const GROUPS: { label: string; pages: Page[] }[] = [
         label: 'API tokens',
         icon: 'bi-key',
         title: 'API tokens',
-        description: 'Create and revoke tokens for scripts that call the API.',
         width: 'narrow',
       },
       {
@@ -102,7 +96,7 @@ const GROUPS: { label: string; pages: Page[] }[] = [
         label: 'Accounts',
         icon: 'bi-people',
         title: 'Accounts',
-        description: 'New registrations wait here until approved. Approving sends the user their activation email.',
+        note: 'New registrations wait here until approved. Approving sends the user an activation email.',
         width: 'medium',
         adminOnly: true,
       },
@@ -118,17 +112,6 @@ function readCollapsed(): boolean {
   } catch {
     return false
   }
-}
-
-/** The brand mark: three seeds in a furrow. */
-function SeedRow({ className = '' }: { className?: string }) {
-  return (
-    <span className={'kv-seeds ' + className} aria-hidden="true">
-      <i />
-      <i />
-      <i />
-    </span>
-  )
 }
 
 export default function Layout() {
@@ -182,9 +165,7 @@ export default function Layout() {
   }
 
   const groups = GROUPS.map((g) => ({ ...g, pages: g.pages.filter((p) => !p.adminOnly || isAdmin) }))
-  const current = groups
-    .flatMap((g) => g.pages.map((p) => ({ ...p, group: g.label })))
-    .find((p) => location.pathname.startsWith(p.to))
+  const current = groups.flatMap((g) => g.pages).find((p) => location.pathname.startsWith(p.to))
 
   return (
     <div className={'kv-shell' + (collapsed ? ' is-collapsed' : '')}>
@@ -193,9 +174,9 @@ export default function Layout() {
       </a>
 
       <aside ref={sidebarRef} id="kv-sidebar" className={'kv-sidebar' + (drawerOpen ? ' is-open' : '')} aria-label="Main">
-        <NavLink to="/jobs" className="kv-brand">
-          <SeedRow />
-          <span className="kv-brand-name kv-label">kvuno</span>
+        <NavLink to="/jobs" className="kv-brand" title="KVuno">
+          <span className="kv-brand-short" aria-hidden="true">K</span>
+          <span className="kv-label">KVuno</span>
         </NavLink>
 
         <nav className="kv-nav">
@@ -240,14 +221,9 @@ export default function Layout() {
           </a>
 
           {me && (
-            <div className="kv-user" title={me.email}>
-              <span className="kv-avatar" aria-hidden="true">
-                {me.username.charAt(0).toUpperCase()}
-              </span>
-              <span className="kv-label kv-user-text">
-                <span className="kv-user-name">{me.username}</span>
-                <span className="kv-user-role">{isAdmin ? 'Administrator' : 'Member'}</span>
-              </span>
+            <div className="kv-user kv-label" title={me.email}>
+              Signed in as <strong>{me.username}</strong>
+              {isAdmin && <span className="text-muted"> (admin)</span>}
             </div>
           )}
 
@@ -288,10 +264,7 @@ export default function Layout() {
           >
             <i className="bi bi-list" />
           </button>
-          <span className="kv-topbar-brand">
-            <SeedRow className="kv-seeds-sm" />
-            kvuno
-          </span>
+          <span className="kv-topbar-brand">KVuno</span>
         </header>
 
         <main id="kv-main" className="kv-content" tabIndex={-1}>
@@ -300,9 +273,8 @@ export default function Layout() {
           <div className={'kv-container kv-container-' + (current?.width ?? 'wide')}>
             {current && (
               <header className="kv-page-head">
-                <div className="kv-eyebrow">{current.group}</div>
                 <h1 className="kv-title">{current.title}</h1>
-                <p className="kv-lede">{current.description}</p>
+                {current.note && <p className="kv-note">{current.note}</p>}
               </header>
             )}
             {/* Inside the shell: while a page's code loads, the sidebar and
@@ -315,7 +287,7 @@ export default function Layout() {
 
         <footer className="kv-footer">
           <div className={'kv-container kv-container-' + (current?.width ?? 'wide')}>
-            kvuno &middot;{' '}
+            KVuno, part of{' '}
             <a href="https://agwise.cgiar.org" target="_blank" rel="noreferrer">
               AgWise
             </a>

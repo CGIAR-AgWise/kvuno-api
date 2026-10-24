@@ -42,27 +42,28 @@ export default function Register() {
 
   if (pending) {
     return (
-      <AuthShell>
-        <div>
-          <i className="bi bi-hourglass-split fs-1 text-primary" aria-hidden="true" />
-          <h1 className="kv-auth-title mt-2">Request received</h1>
-          <p className="text-muted mb-4">
-            An administrator needs to approve your account before you can sign in. You&rsquo;ll get
-            an email at <span className="fw-semibold text-body">{pending}</span> once it&rsquo;s
-            activated.
-          </p>
-          <Link className="btn btn-outline-primary" to="/login">
-            Back to sign in
-          </Link>
-        </div>
+      <AuthShell title="Request received">
+        <p>
+          An administrator needs to approve your account before you can sign in. You&rsquo;ll get
+          an email at <strong>{pending}</strong> once it&rsquo;s activated.
+        </p>
+        <Link className="btn btn-outline-primary" to="/login">
+          Back to sign in
+        </Link>
       </AuthShell>
     )
   }
 
   return (
-    <AuthShell>
-      <h1 className="kv-auth-title">Request an account</h1>
-      <p className="text-muted mb-4">An administrator approves new accounts before they can sign in.</p>
+    <AuthShell
+      title="Request access"
+      after={
+        <>
+          Already have an account? <Link to="/login">Sign in</Link>
+        </>
+      }
+    >
+      <p className="text-muted small">An administrator approves new accounts before they can sign in.</p>
       {error && <div className="alert alert-danger">{error}</div>}
       <form onSubmit={submit}>
         {(
@@ -88,13 +89,10 @@ export default function Register() {
             />
           </div>
         ))}
-        <button className="btn btn-primary w-100 py-2 mt-2" disabled={busy}>
-          {busy ? 'Sending request…' : 'Request account'}
+        <button className="btn btn-primary w-100" disabled={busy}>
+          {busy ? 'Sending request…' : 'Request access'}
         </button>
       </form>
-      <p className="text-muted small mt-4">
-        Already have an account? <Link to="/login">Sign in</Link>
-      </p>
     </AuthShell>
   )
 }

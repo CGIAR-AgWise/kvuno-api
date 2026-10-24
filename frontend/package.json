@@ -12,9 +12,6 @@
     "lint": "tsc -b"
   },
   "dependencies": {
-    "@fontsource-variable/bricolage-grotesque": "5.3.0",
-    "@fontsource-variable/public-sans": "5.3.0",
-    "@fontsource/ibm-plex-mono": "5.3.0",
     "bootstrap": "5.3.8",
     "bootstrap-icons": "1.13.2",
     "leaflet": "1.9.4",
