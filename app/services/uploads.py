@@ -73,9 +73,9 @@ _ID_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # Statuses that still accept a mapping and a submit. `failed` is excluded:
 # there is nothing to map when the file could not be read.
-SUBMITTABLE = ('ready', 'submitted')
+SUBMITTABLE = ('ready', 'submitted', 'processing')
 # Uploads that never reached a worker; cleaned up once abandoned.
-UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed')
+UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed', 'processing')
 
 _EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
 DB_TARGET_COLUMNS = {
@@ -503,13 +503,15 @@ def ensure_inspection(app, upload: Upload) -> None:
 # ── Submission and removal ─────────────────────────────────────
 
 def submit(upload: Upload, column_map=None) -> Upload:
-    """Validate and store the mapping, ready to enqueue. `None` re-uses the saved one (Retry)."""
+    """Validate and store the mapping, ready to process. `None` re-uses the saved one (Retry)."""
     if upload.status not in SUBMITTABLE:
         raise UploadError(f'Upload is {upload.status}, not ready to process', 409)
     columns = (upload.preview or {}).get('columns', [])
     upload.column_map = validate_column_map(
         upload.column_map if column_map is None else column_map, columns)
-    upload.status = 'submitted'
+    # If already processing, keep that status; otherwise mark as submitted
+    if upload.status != 'processing':
+        upload.status = 'submitted'
     upload.error = None
     upload.updated_at = _now()
     _session().commit()

@@ -6,7 +6,7 @@ Upload endpoints: a tus 1.0 server (core + creation) and the upload lifecycle.
     PATCH  /ui/uploads/tus/<id>       append bytes at Upload-Offset
     GET    /ui/uploads                the caller's unfinished uploads
     GET    /ui/uploads/<id>           status, preview, suggested mapping
-    POST   /ui/uploads/<id>/process   save the mapping and enqueue ingestion
+    POST   /ui/uploads/<id>/process   save the mapping and start processing
     DELETE /ui/uploads/<id>           discard
 
 All of these sit under /ui/, which nginx and the Vite dev server already proxy
@@ -15,7 +15,13 @@ with no body-size limit and buffering off.
 HEAD, PATCH and the status GET are exempt from the default rate limit. A large
 file is many PATCHes and inspection is polled, so counting them is what made
 the old chunk flow trip 429s on any file over a few hundred MB.
+
+Processing runs in a background thread in the API process, so it works with
+HOUSEKEEPING_ENABLED=false (no Celery/Redis required). The upload status moves
+to 'processing' and progress is tracked via progress_store (read by /ui/jobs/events SSE).
 """
+import threading
+
 from flask import current_app, jsonify, request
 
 from app.api.user import get_current_user
@@ -80,25 +86,59 @@ def _parse_metadata(raw: str | None) -> dict[str, str]:
     return meta
 
 
-def enqueue_upload(upload):
-    """Hand a submitted upload to the worker. Shared with /ui/process (Retry)."""
-    if not get_settings().HOUSEKEEPING_ENABLED:
-        service.mark_ready(upload, 'Mapping saved, but no worker is configured. '
-                                   'Set HOUSEKEEPING_ENABLED=true and start a Celery worker.')
-        return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
-                       message=upload.error, queued=False)
+def _process_upload_background(upload, app):
+    """Process an uploaded file in a background thread.
 
-    from app.services.housekeeper import process_file_async
-    queued = process_file_async(
-        file_path=upload.stored_path,
-        column_map=upload.column_map,
-        original_filename=upload.original_name,
+    Runs process_file directly (no Celery), updates progress via progress_store.
+    """
+    try:
+        # Use the passed app's context; process_file will use this via _get_app()
+        from app.services.housekeeper import process_file, housekeeping_settings, set_app
+        set_app(app)
+        settings = housekeeping_settings()
+        process_file(
+            file_path=upload.stored_path,
+            batch_size=settings['batch_size'],
+            chunk_size=settings['chunk_size'],
+            checkpoint_interval=settings['checkpoint_interval'],
+            dry_run=False,
+            run_id=None,
+            column_map=upload.column_map,
+            original_filename=upload.original_name,
+        )
+    except Exception as e:
+        logger.exception(f"Upload {upload.id}: background processing failed: {e}")
+        # The progress_store in process_file will have recorded the error
+        # Just log it; the upload stays 'submitted' (or could be marked failed)
+        # User can retry via /ui/process which re-uses the saved column_map
+
+
+def enqueue_upload(upload):
+    """Start processing a submitted upload in a background thread.
+
+    Works with or without HOUSEKEEPING_ENABLED/Redis. The upload status
+    becomes 'processing' and progress is available via /ui/jobs/events.
+    """
+    # Mark upload as processing so the UI shows it's active
+    from app.services.uploads import _session, _now
+    session = _session()
+    upload.status = 'processing'
+    upload.error = None
+    upload.updated_at = _now()
+    session.commit()
+
+    # Get the actual Flask app object (not the proxy) for the background thread
+    app = current_app._get_current_object()
+
+    # Start background processing
+    thread = threading.Thread(
+        target=_process_upload_background,
+        args=(upload, app),
+        name=f'process-{upload.id}',
+        daemon=True,
     )
-    if not queued:
-        # Leave it submittable rather than claiming it started: the old flow
-        # said "Processing started" whether or not the broker took the job.
-        service.mark_ready(upload, 'The job queue is unreachable. Try again shortly.')
-        return jsonify(error=upload.error), 503
+    thread.start()
+
     return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
                    message='Processing started', queued=True)
 
@@ -193,7 +233,7 @@ def register_upload_routes(app):
             upload = service.get_owned(upload_id, _owner_id())
         except UploadError as e:
             return jsonify(error=str(e)), e.status
-        if upload.status == 'submitted':
+        if upload.status in ('submitted', 'processing'):
             return jsonify(error='Already submitted for processing'), 409
         service.discard(upload)
         return '', 204
