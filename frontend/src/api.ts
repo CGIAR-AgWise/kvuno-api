@@ -627,6 +627,17 @@ export function fetchJobProgress(file: string, signal?: AbortSignal) {
  * Omit `columnMap` to re-use the mapping saved with the upload. Sending `{}`
  * here used to overwrite it with nothing.
  */
+/**
+ * Administrators: delete a file with its upload and its job history. The rows
+ * already imported from it are kept. 409 while it is being processed.
+ */
+export function deleteJobFile(file: string) {
+  return request<{ file: string; file_deleted: boolean; upload_deleted: boolean; jobs_deleted: number }>(
+    '/ui/jobs/' + encodeURIComponent(file),
+    { method: 'DELETE' },
+  )
+}
+
 export function startProcessing(file: string, columnMap?: Record<string, string>) {
   return request<{ msg?: string; message?: string }>('/ui/process', {
     method: 'POST',

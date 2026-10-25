@@ -6,7 +6,7 @@ from flask import abort, redirect, jsonify, request, Response, stream_with_conte
 
 from pathlib import Path
 
-from app.auth import require_auth
+from app.auth import require_admin, require_auth
 from app.config import ALLOWED_EXTENSIONS, APP_NAME, get_settings
 from app.models.database_conn import MyDb
 from app.routes.uploads import enqueue_upload, register_upload_routes
@@ -173,6 +173,21 @@ def register_app_routes(app):
         if job is None:
             return jsonify(status='unknown', current=0, total=0, message='')
         return jsonify(job)
+
+    @app.route('/ui/jobs/<file_name>', methods=['DELETE'])
+    @require_admin
+    def ui_delete_file(file_name):
+        """Administrators: delete a file with its upload and its jobs (services/file_deletion.py).
+
+        Imported rows and the file's checksum record are kept.
+        """
+        from app.api.user import get_current_user
+        from app.services.file_deletion import delete_file
+        try:
+            result = delete_file(file_name, getattr(get_current_user(), 'id', None))
+        except UploadError as e:
+            return jsonify(error=str(e)), e.status
+        return jsonify(result)
 
     @app.route('/ui/jobs/data', methods=['GET'])
     @require_auth

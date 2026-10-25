@@ -590,6 +590,32 @@ def discard_run(run_id: int | None):
             session.commit()
 
 
+def delete_file_history(stem: str) -> int:
+    """Delete every job record of one file, in every run, and the runs left empty.
+
+    For an administrator deleting a file (services/file_deletion.py). Returns
+    the number of job rows removed. The Redis entry goes too, or the Jobs page
+    would show the file again from the hot path.
+    """
+    from app.models.kvuno import ProcessingJob, ProcessingRun
+
+    delete_job(stem)
+    _last_db_write.pop(stem, None)
+    with _db_session() as session:
+        rows = session.query(ProcessingJob).filter_by(file_name=stem).all()
+        run_ids = {row.run_id for row in rows if row.run_id is not None}
+        for row in rows:
+            session.delete(row)
+        session.flush()
+        for run_id in run_ids:
+            if not session.query(ProcessingJob).filter_by(run_id=run_id).count():
+                run = session.get(ProcessingRun, run_id)
+                if run is not None:
+                    session.delete(run)
+        session.commit()
+        return len(rows)
+
+
 def finish_run(run_id: int, status: str = 'completed'):
     """Close a run once all its jobs have settled."""
     from app.models.kvuno import ProcessingRun

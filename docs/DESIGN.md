@@ -92,6 +92,7 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 - SSE live-updating table with status, progress bar, timestamps
 - Status filter tabs (All / Completed / Processing / Failed) and filename search
 - Per-job detail modal with a Retry action, wired to `POST /ui/process` with only the file name, so the server re-uses the mapping saved with the upload (it used to send `{}` and wipe it). The modal reads `/ui/progress/<file_name>`, which returns the job record from `app/services/progress_store.py` (Redis hot path, Postgres durable record) — it used to read a `.progress.json` file nothing wrote, so it always showed `unknown` and hid Retry
+- Administrators get **Delete file** in the modal (not while the job is processing or converting): a second, inline confirmation, then `DELETE /ui/jobs/<file>` removes the file, its upload and its job history. The confirmation says imported rows are kept
 - The modal is a real dialog: `role="dialog"`, focus moves into it and back on close, Escape closes it
 - Rows open their detail from the keyboard (focusable, Enter/Space), and progress bars carry an accessible label and value
 - Highlight scroll from upload redirect
@@ -188,6 +189,7 @@ GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_f
 GET    /ui/jobs/data               → JSON: job list
 GET    /ui/jobs/runs               → JSON: recent processing runs
 GET    /ui/jobs/events             → SSE: live updates (Redis pub/sub, 3s poll fallback)
+DELETE /ui/jobs/<file>             → admin only: delete the file, its upload and its job history (imported rows kept; 409 while processing)
 POST   /ui/uploads/tus             → tus create (size/type checked before any bytes; 413/415)
 HEAD   /ui/uploads/tus/<id>        → tus Upload-Offset, for resuming
 PATCH  /ui/uploads/tus/<id>        → tus append at offset (409 mismatch, 423 busy)

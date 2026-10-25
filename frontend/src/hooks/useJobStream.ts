@@ -48,7 +48,10 @@ export function useJobStream() {
     return () => source.close()
   }, [])
 
-  return { jobs, connected }
+  /** Drop a job locally once it is deleted: the stream only adds and patches. */
+  const remove = (file: string) => setJobs((current) => current.filter((j) => j.file !== file))
+
+  return { jobs, connected, remove }
 }
 
 export { STATUSES }
