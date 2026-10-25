@@ -267,8 +267,18 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
 
 # ── DB helpers ─────────────────────────────────────────────────
 
-def retry_db(fn, attempts: int = 3, base_delay: float = 1.0):
-    """Call *fn* with retries on SQLAlchemyError using exponential backoff."""
+def retry_db(fn, attempts: int = 3, base_delay: float = 1.0, session=None):
+    """Call *fn* with retries on SQLAlchemyError using exponential backoff.
+
+    Pass ``session`` only where nothing uncommitted is at stake (e.g. before
+    an ingest starts): it is rolled back before each retry. A failed query —
+    a dropped connection above all — leaves the session's transaction
+    invalid, and retrying on it without a rollback could never succeed
+    ("Can't reconnect until invalid transaction is rolled back"). Mid-ingest
+    it must NOT be rolled back here: that would discard the rows written
+    since the last checkpoint while the offset carried on past them; there
+    the error propagates and the file resumes from its checkpoint instead.
+    """
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -276,6 +286,11 @@ def retry_db(fn, attempts: int = 3, base_delay: float = 1.0):
         except SQLAlchemyError as e:
             last_exc = e
             if attempt < attempts:
+                if session is not None:
+                    try:
+                        session.rollback()
+                    except Exception:
+                        logger.warning("rollback before retry failed", exc_info=True)
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(f"DB error (attempt {attempt}/{attempts}): {e}. Retrying in {delay}s")
                 time.sleep(delay)
@@ -578,7 +593,9 @@ def process_file(
                     logger.info(f"[DRY RUN] {file_name} — would process {os.path.getsize(file_path)} bytes")
                 return
 
-            existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum))
+            # Nothing is uncommitted yet, so a retry may roll the session back
+            # (a stale connection used to leave it unusable for every retry).
+            existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum), session=session)
             resume_offset = 0
             if existing and existing.offset is None:
                 logger.warning(f"File {file_name} is already fully processed. Checksum: {checksum}")

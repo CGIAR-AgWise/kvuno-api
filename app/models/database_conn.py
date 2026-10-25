@@ -19,8 +19,19 @@ class MyDb:
     # scope keyed by app context.
     db = SQLAlchemy()
 
+    # Every app (the API and the worker's own) gets these. Without
+    # pool_pre_ping a pooled connection that died while idle — database
+    # restart, idle timeout, network blip — was handed out as live; the first
+    # query failed, and reusing that session gave "Can't reconnect until
+    # invalid transaction is rolled back". pool_recycle retires connections
+    # before typical server/proxy idle timeouts close them.
+    ENGINE_OPTIONS = {'pool_pre_ping': True, 'pool_recycle': 1800}
+
     @classmethod
     def init_app(cls, app: Flask):
+        options = app.config.setdefault('SQLALCHEMY_ENGINE_OPTIONS', {})
+        for key, value in cls.ENGINE_OPTIONS.items():
+            options.setdefault(key, value)
         cls.db.init_app(app)
 
     @classmethod
