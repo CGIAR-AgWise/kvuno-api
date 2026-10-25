@@ -37,7 +37,9 @@ celery_app.config_from_object({
     # tasks, so without this a single large ingest permanently inflates the
     # worker. The child is replaced cleanly, so set it above the expected peak
     # of one file, not below it.
-    'worker_max_memory_per_child': _settings.WORKER_MAX_MEMORY_PER_CHILD,
+    # Celery counts this in KiB; the setting is MB. Passed as-is, 2048 meant
+    # 2 MiB and every child was replaced after every task.
+    'worker_max_memory_per_child': _settings.WORKER_MAX_MEMORY_PER_CHILD * 1024,
     'worker_max_tasks_per_child': _settings.WORKER_MAX_TASKS_PER_CHILD,
 })
 

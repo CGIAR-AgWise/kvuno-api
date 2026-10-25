@@ -730,8 +730,8 @@ Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — t
 | `CELERY_TASK_MAX_RETRIES` | `10` | Retries for a task failing on a transient error. |
 | `CELERY_TASK_RETRY_DELAY` | `60` | Seconds between task retries. |
 | `CELERY_VISIBILITY_TIMEOUT` | `21600` | Seconds before Redis redelivers an unacked task, even a running one: must exceed the longest single-file ingest. |
-| `CELERY_CONCURRENCY` | `2` | Worker processes (worker image and `python dev_worker.py`). 2: an upload is read while another file imports. Each RDS being read needs ~150x its size in memory. |
-| `WORKER_MAX_MEMORY_PER_CHILD` | `2048` | MB; recycle a worker child past this (set above one file's peak). |
+| `CELERY_CONCURRENCY` | `1` | Worker processes (worker image and `python dev_worker.py`). Each needs memory for one file: an import ~0.3 GB, an RDS read ~150x the file's size. 2 in a 2 GB worker got processes OOM-killed (WorkerLostError, signal 9); raise it only with the worker's memory limit. |
+| `WORKER_MAX_MEMORY_PER_CHILD` | `512` | MB; a worker process holding more than this after a task is replaced (pandas/pyarrow keep freed memory). Never stops a running task. |
 | `WORKER_MAX_TASKS_PER_CHILD` | `50` | Recycle a worker child after this many tasks. |
 
 **Job progress**
