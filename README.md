@@ -370,9 +370,11 @@ receiving → received → inspecting → ready | failed → submitted → proce
 ```
 
 1. **Receive** — bytes land in `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked at creation, before any bytes arrive
-2. **Inspect** — on a background thread in the API process (no Celery needed): RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping
+2. **Inspect** — RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping. On the **Celery worker** when one consumes the `kvuno` queue (the page shows "Waiting for the worker" until it starts); otherwise on a background thread in the API
 3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once
-4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it on a background thread in the API, using that mapping as-is (not merged over `RDS_COLUMN_MAP`). No worker or Redis is needed; progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
+4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it with that mapping as-is (not merged over `RDS_COLUMN_MAP`): on the **Celery worker** when there is one, otherwise in a separate `ingest_runner` process the API starts. Never inside a gunicorn worker — gunicorn recycles those every `MAX_REQUESTS` requests, which used to kill long imports over and over. Progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
+
+In production run the worker as a Celery worker (`HOUSEKEEPING_MODE` unset), so the API never reads or imports files itself.
 
 Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unfinished uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted when an API process starts. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
 

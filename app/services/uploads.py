@@ -462,7 +462,7 @@ def _claim_inspection(upload_id: str) -> bool:
             or_(Upload.status == 'received',
                 (Upload.status == 'inspecting') & (Upload.updated_at < stale_before)),
         )
-        .values(status='inspecting', updated_at=_now(), error=None)
+        .values(status='inspecting', updated_at=_now(), error=None, progress=None)
     ).rowcount
     session.commit()
     return bool(claimed)
@@ -578,18 +578,62 @@ def inspect(upload_id: str, app=None):
     session.commit()
 
 
+def _queue_inspection(upload: Upload) -> bool:
+    """Send the inspection to the worker; True if it was queued.
+
+    Marked queued *before* the task is sent: the worker can claim it at once,
+    and marking it afterwards would turn its `inspecting` back to `received`.
+    (Only a `received` row, or an `inspecting` one whose process died, gets
+    here — ensure_inspection returns early for a live one.)
+    """
+    from app.services.housekeeper import _enqueue_or_warn
+    from app.tasks import inspect_upload_task
+    session = _session()
+    session.execute(
+        update(Upload)
+        .where(Upload.id == upload.id, Upload.status.in_(('received', 'inspecting')))
+        .values(status='received', progress={'stage': 'queued', 'done': 0, 'total': 0, 'elapsed': 0},
+                updated_at=_now()))
+    session.commit()
+    if not _enqueue_or_warn(inspect_upload_task, upload_id=upload.id):
+        session.execute(update(Upload)
+                        .where(Upload.id == upload.id, Upload.status == 'received')
+                        .values(progress=None))
+        session.commit()
+        session.refresh(upload)
+        return False
+    session.refresh(upload)
+    logger.info("upload inspection queued for the worker", upload_id=upload.id)
+    return True
+
+
 def ensure_inspection(app, upload: Upload) -> None:
-    """Start inspection on a thread if the upload needs it.
+    """Start inspection if the upload needs it: on the worker, else on a thread.
 
     Called after the last byte arrives and on every status poll. The second
-    call site is what recovers an inspection whose worker was recycled: its
+    call site is what recovers an inspection whose process died: its
     heartbeat stops, the row goes stale, and the next poll re-claims it.
+
+    With a Celery worker on our queue the inspection is a task there, so the
+    API never reads a file (an RDS read needs ~150x its size in memory). The
+    upload stays `received` with progress stage `queued` until the worker
+    claims it; a poll re-queues only once that is older than the stale
+    window (the worker may be busy with an import), and inspect()'s claim
+    makes any duplicate a no-op.
     """
     if upload.status not in ('received', 'inspecting'):
         return
     stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
-    if upload.status == 'inspecting' and upload.updated_at and upload.updated_at >= stale_before:
+    fresh = upload.updated_at is not None and upload.updated_at >= stale_before
+    if upload.status == 'inspecting' and fresh:
         return  # alive: its heartbeat is recent
+    queued = (upload.progress or {}).get('stage') == 'queued'
+    if upload.status == 'received' and queued and fresh:
+        return  # waiting for the worker
+
+    from app.services.housekeeper import celery_worker_available
+    if celery_worker_available() and _queue_inspection(upload):
+        return
 
     def run():
         with app.app_context():
@@ -677,7 +721,7 @@ def to_dict(upload: Upload) -> dict:
         'duplicate': upload.duplicate,
         'column_map': upload.column_map or {},
         'error': upload.error,
-        'progress': upload.progress if upload.status == 'inspecting' else None,
+        'progress': upload.progress if upload.status in ('received', 'inspecting') else None,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

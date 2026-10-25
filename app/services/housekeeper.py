@@ -1264,6 +1264,51 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
     return True
 
 
+# (answer, valid until): asking Celery takes up to a second, and the Upload
+# page polls every 1.5 s.
+WORKER_CHECK_CACHE_SECONDS = 30
+_worker_check = (False, 0.0)
+
+
+def celery_worker_available(timeout: float = 1.0) -> bool:
+    """Is a Celery worker consuming this app's queue right now? (cached briefly)
+
+    A reachable broker is not enough: production's worker ran
+    HOUSEKEEPING_MODE=oneshot (no Celery), so a task sent there waited
+    forever. And another project's worker on the same Redis would answer a
+    plain ping, so this asks which queues the workers consume.
+    """
+    global _worker_check
+    if not get_settings().HOUSEKEEPING_ENABLED:
+        return False
+    answer, valid_until = _worker_check
+    if time.time() < valid_until:
+        return answer
+    answer = _ask_for_worker(timeout)
+    _worker_check = (answer, time.time() + WORKER_CHECK_CACHE_SECONDS)
+    return answer
+
+
+def _ask_for_worker(timeout: float) -> bool:
+    if not celery_broker_available():
+        return False
+    queue = get_settings().CELERY_TASK_DEFAULT_QUEUE
+    found = []
+
+    def ask():
+        try:
+            from app.celery_app import celery_app
+            active = celery_app.control.inspect(timeout=timeout).active_queues() or {}
+            found.append(any(q.get('name') == queue for queues in active.values() for q in queues or []))
+        except Exception:
+            found.append(False)
+
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    t.join(timeout + 2)
+    return bool(found and found[0])
+
+
 # ── Async wrappers (Flask integration, Celery only) ──────────────
 
 def process_file_async(file_path: str, app=None, column_map: dict | None = None,

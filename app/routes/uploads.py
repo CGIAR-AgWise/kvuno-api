@@ -18,11 +18,15 @@ HEAD, PATCH and the status GET are exempt from the default rate limit. A large
 file is many PATCHes and inspection is polled, so counting them is what made
 the old chunk flow trip 429s on any file over a few hundred MB.
 
-Processing runs in a background thread in the API process, so it works with
-HOUSEKEEPING_ENABLED=false (no Celery/Redis required). The upload status moves
-to 'processing' and progress is tracked via progress_store (read by /ui/jobs/events SSE).
+Processing never runs in the gunicorn worker (see enqueue_upload): it goes to
+the Celery worker when one consumes our queue, otherwise to a detached
+`ingest_runner` process, so it also works with HOUSEKEEPING_ENABLED=false. The
+upload status moves to 'processing' and progress is tracked via progress_store
+(read by /ui/jobs/events SSE).
 """
-import threading
+import os
+import subprocess
+import sys
 
 from flask import current_app, jsonify, request
 
@@ -37,6 +41,9 @@ from app.utils.logging import get_logger
 logger = get_logger(__name__)
 
 TUS_PATH = '/ui/uploads/tus'
+
+# Where `python -m app...` resolves: the directory holding the `app` package.
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _owner_id():
@@ -88,59 +95,58 @@ def _parse_metadata(raw: str | None) -> dict[str, str]:
     return meta
 
 
-def _process_upload_background(upload, app):
-    """Process an uploaded file in a background thread.
+def _spawn_runner(upload_id: str) -> None:
+    """Start `python -m app.services.ingest_runner <id>` detached from this worker.
 
-    Runs process_file directly (no Celery), updates progress via progress_store.
+    Its own session (POSIX) / process group (Windows), so gunicorn recycling
+    or stopping this worker does not take the import with it. Output goes to
+    the API's stdout, so its log lines are in the container log.
     """
-    try:
-        # Use the passed app's context; process_file will use this via _get_app()
-        from app.services.housekeeper import process_file, housekeeping_settings, set_app
-        set_app(app)
-        settings = housekeeping_settings()
-        process_file(
-            file_path=upload.stored_path,
-            batch_size=settings['batch_size'],
-            chunk_size=settings['chunk_size'],
-            checkpoint_interval=settings['checkpoint_interval'],
-            dry_run=False,
-            run_id=None,
-            column_map=upload.column_map,
-            original_filename=upload.original_name,
-        )
-    except Exception as e:
-        logger.exception(f"Upload {upload.id}: background processing failed: {e}")
-        # The progress_store in process_file will have recorded the error
-        # Just log it; the upload stays 'submitted' (or could be marked failed)
-        # User can retry via /ui/process which re-uses the saved column_map
+    kwargs = {'cwd': PROJECT_ROOT, 'stdin': subprocess.DEVNULL, 'close_fds': True}
+    if os.name == 'nt':
+        # Not DETACHED_PROCESS: with no console at all the child was ended
+        # with STATUS_CONTROL_C_EXIT a few seconds in (Windows dev only).
+        kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    else:
+        kwargs['start_new_session'] = True
+    subprocess.Popen([sys.executable, '-m', 'app.services.ingest_runner', upload_id], **kwargs)
 
 
 def enqueue_upload(upload):
-    """Start processing a submitted upload in a background thread.
+    """Start importing a submitted upload — never inside a gunicorn worker.
 
-    Works with or without HOUSEKEEPING_ENABLED/Redis. The upload status
-    becomes 'processing' and progress is available via /ui/jobs/events.
+    1. A Celery worker consuming our queue (HOUSEKEEPING_ENABLED): the task
+       goes there — more memory, untouched by web traffic, and it resumes
+       interrupted jobs when it restarts.
+    2. Otherwise a detached `ingest_runner` process in the API container.
+
+    Both used to be a daemon thread in the gunicorn worker that took the
+    request, which died whenever gunicorn recycled that worker (every
+    MAX_REQUESTS requests): long files restarted from their last checkpoint
+    again and again, for tens of hours.
     """
-    # Mark upload as processing so the UI shows it's active
-    from app.services.uploads import _session, _now
+    from app.services.housekeeper import celery_worker_available, process_file_async
+    from app.services.uploads import _now, _session
+
     session = _session()
     upload.status = 'processing'
     upload.error = None
     upload.updated_at = _now()
     session.commit()
 
-    # Get the actual Flask app object (not the proxy) for the background thread
-    app = current_app._get_current_object()
-
-    # Start background processing
-    thread = threading.Thread(
-        target=_process_upload_background,
-        args=(upload, app),
-        name=f'process-{upload.id}',
-        daemon=True,
-    )
-    thread.start()
-
+    if celery_worker_available():
+        if process_file_async(upload.stored_path, column_map=upload.column_map,
+                              original_filename=upload.original_name):
+            logger.info("upload queued for the worker", upload_id=upload.id)
+            return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
+                           message='Queued for the worker', queued=True)
+    try:
+        _spawn_runner(upload.id)
+    except OSError:
+        logger.exception("could not start the import process", upload_id=upload.id)
+        service.mark_ready(upload, 'Could not start the import. Try again.')
+        return jsonify(error='Could not start the import. Try again.'), 503
+    logger.info("upload import started in its own process", upload_id=upload.id)
     return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
                    message='Processing started', queued=True)
 

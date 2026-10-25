@@ -149,7 +149,9 @@ function InspectionProgress({ progress }: { progress: UploadRecord['progress'] }
     )
   }
   const text =
-    progress?.stage === 'reading'
+    progress?.stage === 'queued'
+      ? 'Waiting for the worker — it may be finishing another file first.'
+      : progress?.stage === 'reading'
       ? 'Converting to Parquet: reading the R file (' +
         formatDuration(progress.elapsed) +
         '). Large RDS files take a while; there is no way to measure this step.'
