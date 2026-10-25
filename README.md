@@ -394,11 +394,15 @@ In the production stack: `docker exec kvuno python scripts/cleanup_conflicts.py 
 Reading an RDS takes about 150× its size in memory (`pyreadr` reads the whole file), so the server can refuse a large one with *"Reading this R file needs more memory than the server allows"*. Convert it on a machine with more memory and upload the Parquet instead. `scripts/convert_rds.py` uses the same converter as the server, shows the read time and the rows written, keeps the RDS, never leaves a partial `.parquet`, and exits 1 if any file failed:
 
 ```bash
+python scripts/convert_rds.py                                # every .rds under static/, next to each file
 python scripts/convert_rds.py data/field.RDS                 # writes data/field.parquet
-python scripts/convert_rds.py data/ --out-dir converted/     # every .rds directly in data/
+python scripts/convert_rds.py data/ --out-dir converted/     # keeps data/'s folder layout under converted/
+python scripts/convert_rds.py data/ --no-recursive           # only data/ itself, not its subfolders
 python scripts/convert_rds.py data/field.RDS --overwrite     # replace an existing .parquet
 make convert-rds ARGS="data/ -o converted/"
 ```
+
+Directories are searched recursively, skipping hidden folders and `uploads/` (uploads in progress, which the app converts itself).
 
 From R, `arrow::write_parquet(df, "field.parquet")` does the same.
 

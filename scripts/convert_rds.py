@@ -7,10 +7,15 @@ uploading the Parquet skips that step entirely. It uses the same converter
 as the server (a child process, Parquet written in row groups), so the
 result imports exactly like a server-converted file.
 
+    python scripts/convert_rds.py                       # every RDS under static/
     python scripts/convert_rds.py data/field.RDS
     python scripts/convert_rds.py data/ --out-dir converted/
     make convert-rds ARGS="data/ --overwrite"
 
+Directories are searched recursively (--no-recursive for the top level only),
+skipping hidden directories and `uploads/` — those files belong to uploads in
+progress and are converted by the app. With --out-dir the layout under each
+directory is kept, so two `field.RDS` in different folders do not collide.
 The RDS files are kept. Exits 1 if any file failed.
 """
 import os
@@ -39,14 +44,35 @@ app = typer.Typer(
 )
 
 
-def _rds_files(paths: list[Path]) -> list[Path]:
-    """The RDS files named, and those directly inside any directory named."""
+# The default when no path is given: the app's static tree (static/data,
+# static/data_old, ...).
+STATIC_DIR = Path(_project_root) / 'static'
+
+# Directories never searched: uploads in progress are the app's to convert.
+SKIP_DIRS = {'uploads', 'node_modules', '__pycache__'}
+
+
+def _is_rds(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() == '.rds'
+
+
+def _rds_files(paths: list[Path], recursive: bool = True) -> list[tuple[Path, Path]]:
+    """(rds file, the directory it was found under) for every RDS named or found.
+
+    The directory is what --out-dir mirrors; a file named directly is its own
+    parent's.
+    """
     found = []
     for path in paths:
         if path.is_dir():
-            found.extend(sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() == '.rds'))
-        elif path.suffix.lower() == '.rds':
-            found.append(path)
+            if recursive:
+                for root, dirs, files in os.walk(path):
+                    dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith('.'))
+                    found.extend((Path(root) / f, path) for f in sorted(files) if f.lower().endswith('.rds'))
+            else:
+                found.extend((p, path) for p in sorted(path.iterdir()) if _is_rds(p))
+        elif _is_rds(path):
+            found.append((path, path.parent))
         else:
             typer.echo(f"skipped {path}: not an .rds file or a directory", err=True)
     return found
@@ -77,7 +103,12 @@ def _size(path: Path) -> str:
 
 @app.command()
 def main(
-    paths: list[Path] = typer.Argument(..., help="RDS files, or directories of them (not recursive)."),
+    paths: list[Path] | None = typer.Argument(
+        None, help="RDS files, or directories to search. Defaults to the static/ directory.",
+    ),
+    recursive: bool = typer.Option(
+        True, "--recursive/--no-recursive", help="Search directories' subdirectories too.",
+    ),
     out_dir: Path | None = typer.Option(
         None, "--out-dir", "-o",
         help="Where to write the Parquet files. Defaults to next to each RDS.",
@@ -86,28 +117,32 @@ def main(
         False, "--overwrite", help="Replace a Parquet file that already exists.",
     ),
 ):
-    files = _rds_files(paths)
+    paths = paths or [STATIC_DIR]
+    files = _rds_files(paths, recursive)
     if not files:
-        typer.echo("No .rds files found.", err=True)
+        typer.echo(f"No .rds files found in {', '.join(str(p) for p in paths)}.", err=True)
         raise typer.Exit(1)
-    if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
 
     failed = skipped = 0
-    for rds in files:
-        target = (out_dir or rds.parent) / (rds.stem + '.parquet')
+    for rds, base in files:
+        name = str(rds.relative_to(base)) if rds.is_relative_to(base) else rds.name
+        if out_dir is None:
+            target = rds.with_suffix('.parquet')
+        else:
+            target = out_dir / Path(name).with_suffix('.parquet')
+            target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() and not overwrite:
             skipped += 1
-            typer.echo(f"  {rds.name}: {target} exists, skipped (use --overwrite)")
+            typer.echo(f"  {name}: {target} exists, skipped (use --overwrite)")
             continue
         started = time.monotonic()
         try:
-            convert(str(rds), str(target), on_progress=_progress_line(rds.name))
+            convert(str(rds), str(target), on_progress=_progress_line(name))
         except ConversionError as e:
             failed += 1
-            typer.echo(f"\r  {rds.name}: FAILED — {e}".ljust(78))
+            typer.echo(f"\r  {name}: FAILED — {e}".ljust(78))
             continue
-        typer.echo(f"\r  {rds.name}: {_size(rds)} -> {target} ({_size(target)}) "
+        typer.echo(f"\r  {name}: {_size(rds)} -> {target} ({_size(target)}) "
                    f"in {_duration(time.monotonic() - started)}".ljust(78))
 
     typer.echo(f"{len(files) - failed - skipped} of {len(files)} converted"

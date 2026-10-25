@@ -39,8 +39,9 @@ logs
 **/*.log
 *.db
 *.db-journal
-static/data
-static/data_old
+# static/ is the data folder (RDS/Parquet, uploads); the images create
+# /app/static/data themselves and the volume is mounted there.
+static
 
 # The SPA: built into the separate kvuno-web image
 frontend
