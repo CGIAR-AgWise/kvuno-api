@@ -66,6 +66,9 @@ LOCK_STALE_SECONDS = 30
 WRITE_BLOCK = 64 * 1024
 
 INSPECT_HEARTBEAT_SECONDS = 30
+# Inspection progress is polled every 1.5 s by the Upload page; writing it
+# more often than this would only add database writes.
+PROGRESS_WRITE_SECONDS = 2
 
 ERROR_MAX = 2000
 
@@ -479,6 +482,41 @@ def _heartbeat(app, upload_id: str, stop: threading.Event):
             logger.warning(f'Upload {upload_id}: heartbeat failed', exc_info=True)
 
 
+class _ProgressWriter:
+    """Records where an inspection has got to on the upload row (Upload page).
+
+    Called by the RDS conversion every couple of seconds; written at most once
+    per PROGRESS_WRITE_SECONDS unless the stage changes. Uses its own Session,
+    like progress_store, so it never commits the inspection's pending changes.
+    It also bumps updated_at, which is what the stale-inspection check reads.
+    """
+
+    def __init__(self, upload_id: str):
+        self.upload_id = upload_id
+        self.elapsed = 0.0
+        self._stage = None
+        self._written = 0.0
+
+    def __call__(self, stage: str, done: int, total: int, elapsed: float, force: bool = False):
+        self.elapsed = elapsed
+        now = time.monotonic()
+        if not force and stage == self._stage and now - self._written < PROGRESS_WRITE_SECONDS:
+            return
+        self._stage, self._written = stage, now
+        from sqlalchemy.orm import Session
+        try:
+            with Session(bind=MyDb.get_db().engine) as session:
+                session.execute(
+                    update(Upload)
+                    .where(Upload.id == self.upload_id, Upload.status == 'inspecting')
+                    .values(progress={'stage': stage, 'done': int(done), 'total': int(total),
+                                      'elapsed': round(elapsed, 1)},
+                            updated_at=_now()))
+                session.commit()
+        except Exception:
+            logger.warning('upload progress write failed', upload_id=self.upload_id, exc_info=True)
+
+
 def inspect(upload_id: str, app=None):
     """Convert, preview and fingerprint a received upload. Runs off the request path."""
     from app.utils.preview import build_preview
@@ -505,8 +543,10 @@ def inspect(upload_id: str, app=None):
         if not os.path.isfile(source):
             raise UploadError('The uploaded file is missing from storage')
 
-        stored = convert_for_ingestion(source)
+        progress = _ProgressWriter(upload_id)
+        stored = convert_for_ingestion(source, on_progress=progress)
         ext = _extension(stored)
+        progress('preview', 0, 0, progress.elapsed, force=True)
         preview = build_preview(stored, ext, use_cache=False)
 
         total_rows = None
@@ -514,8 +554,10 @@ def inspect(upload_id: str, app=None):
             import pyarrow.parquet as pq
             total_rows = pq.ParquetFile(stored).metadata.num_rows
 
+        progress('checksum', 0, 0, progress.elapsed, force=True)
         upload.stored_path = stored
         upload.sha256 = calculate_file_checksum(stored, logger)
+        upload.progress = None
         upload.preview = {**preview, 'total_rows': total_rows}
         upload.duplicate = describe_duplicate(stored, total_rows, checksum=upload.sha256)
         upload.column_map = suggest_column_map(preview['columns'])
@@ -527,6 +569,7 @@ def inspect(upload_id: str, app=None):
         session.rollback()
         upload = session.get(Upload, upload_id)
         upload.status = 'failed'
+        upload.progress = None
         # ConversionError already says, for the user, what went wrong.
         upload.error = _clip(str(e) if isinstance(e, ConversionError) else f'Could not read the file: {e}')
     finally:
@@ -634,6 +677,7 @@ def to_dict(upload: Upload) -> dict:
         'duplicate': upload.duplicate,
         'column_map': upload.column_map or {},
         'error': upload.error,
+        'progress': upload.progress if upload.status == 'inspecting' else None,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

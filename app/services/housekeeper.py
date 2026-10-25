@@ -314,6 +314,34 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
     )
 
 
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def report_conversion(rds_path: str, stage: str, done: int, total: int, elapsed: float, message: str = ''):
+    """Show a data-folder RDS -> Parquet conversion on the Jobs page.
+
+    It is a job of its own, under the RDS name: 'converting' while it runs
+    (the read cannot be measured, so it reports how long it has been reading;
+    the write reports rows), then 'completed' or 'error'. Scans used to
+    convert silently, so a long read looked like a hung scan and a failure was
+    only in the log. Called by batch_convert's on_file and the folder watcher.
+    """
+    with _get_app().app_context():
+        if stage == 'done':
+            _write_progress(rds_path, 'completed', total, total,
+                            f"{message} — {total:,} rows in {_duration(elapsed)}")
+        elif stage == 'failed':
+            _write_progress(rds_path, 'error', 0, total, message, error=message)
+        elif stage == 'reading':
+            _write_progress(rds_path, 'converting', 0, 0,
+                            f"Converting to Parquet: reading the R file ({_duration(elapsed)})")
+        else:
+            _write_progress(rds_path, 'converting', done, total,
+                            f"Converting to Parquet: writing {done:,} of {total:,} rows")
+
+
 # ── DB helpers ─────────────────────────────────────────────────
 
 def retry_db(fn, attempts: int = 3, base_delay: float = 1.0, session=None):
@@ -938,7 +966,8 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
     # Convert any RDS files in the data directory to Parquet for efficient streaming.
     # This matches the upload flow where RDS is converted at inspection time.
     from app.utils.rds_to_parquet import batch_convert
-    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True)
+    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True,
+                              on_file=None if dry_run else report_conversion)
     if converted:
         logger.info(f"Converted {len(converted)} RDS file(s) to Parquet")
 
@@ -1025,7 +1054,8 @@ def watch_directory(
 
     # Convert any existing RDS files to Parquet before starting the watcher.
     from app.utils.rds_to_parquet import batch_convert
-    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True)
+    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True,
+                              on_file=None if dry_run else report_conversion)
     if converted:
         logger.info(f"Converted {len(converted)} existing RDS file(s) to Parquet")
 

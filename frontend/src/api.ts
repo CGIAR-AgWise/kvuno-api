@@ -677,6 +677,17 @@ export interface UploadRecord {
   /** Source column -> DB column; seeded with the server's guesses. */
   column_map: Record<string, string>
   error: string | null
+  /**
+   * While inspecting: where it has got to. reading/writing are the RDS ->
+   * Parquet conversion (reading has no total; writing counts rows), then
+   * preview and checksum. elapsed is seconds since the conversion started.
+   */
+  progress: {
+    stage: 'reading' | 'writing' | 'preview' | 'checksum'
+    done: number
+    total: number
+    elapsed: number
+  } | null
   /** 'upload' from the Upload page; 'folder' a data-folder file held for mapping. */
   source: 'upload' | 'folder'
   created_at: string | null

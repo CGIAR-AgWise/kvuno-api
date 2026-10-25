@@ -18,6 +18,10 @@ interface StatusMeta {
 
 const STATUS: Record<string, StatusMeta> = {
   processing: { tone: 'info', bar: TONE_BAR.info, label: 'Processing' },
+  // A data-folder RDS being converted to Parquet before it is imported. Its
+  // read cannot be measured (no total), so the bar is indeterminate until
+  // the write reports rows. Listed under the Processing filter.
+  converting: { tone: 'info', bar: TONE_BAR.info, label: 'Converting' },
   completed: { tone: 'success', bar: TONE_BAR.success, label: 'Completed' },
   error: { tone: 'danger', bar: TONE_BAR.danger, label: 'Failed' },
   // Worker stopped reporting (crash, OOM kill, restart). Not running.
@@ -71,14 +75,18 @@ export default function Jobs() {
       stale: 0,
       unknown: 0,
     }
-    for (const job of jobs) acc[job.status] = (acc[job.status] ?? 0) + 1
+    for (const job of jobs) {
+      const key = job.status === 'converting' ? 'processing' : job.status
+      acc[key] = (acc[key] ?? 0) + 1
+    }
     return acc
   }, [jobs])
 
   const visible = useMemo(() => {
     const term = search.toLowerCase().trim()
     return jobs.filter((job) => {
-      if (filter !== 'all' && job.status !== filter) return false
+      const status = job.status === 'converting' ? 'processing' : job.status
+      if (filter !== 'all' && status !== filter) return false
       if (term) {
         const name = (job.original_name || job.file || '').toLowerCase()
         if (!name.includes(term)) return false
@@ -167,7 +175,14 @@ export default function Jobs() {
               <tbody>
                 {visible.map((job) => {
                   const total = job.total ?? 1
-                  const pct = total > 0 ? Math.round(((job.current ?? 0) / total) * 100) : 0
+                  const active = job.status === 'processing' || job.status === 'converting'
+                  // Converting with no total yet: still reading the RDS.
+                  const indeterminate = job.status === 'converting' && !total
+                  const pct = indeterminate
+                    ? 100
+                    : total > 0
+                      ? Math.round(((job.current ?? 0) / total) * 100)
+                      : 0
                   const meta = statusMeta(job.status)
                   const rate = rateInfo(job)
                   const retryable = job.status === 'error' || job.status === 'stale'
@@ -204,18 +219,17 @@ export default function Jobs() {
                           <div
                             className={
                               'progress-bar' +
-                              (job.status === 'processing'
-                                ? ' progress-bar-striped progress-bar-animated'
-                                : '')
+                              (active ? ' progress-bar-striped progress-bar-animated' : '')
                             }
                             role="progressbar"
                             aria-label="Progress"
                             aria-valuemin={0}
                             aria-valuemax={100}
-                            aria-valuenow={job.status === 'completed' ? 100 : pct}
+                            aria-valuenow={indeterminate ? undefined : job.status === 'completed' ? 100 : pct}
                             style={{
                               width: (job.status === 'completed' ? 100 : pct) + '%',
                               backgroundColor: meta.bar,
+                              opacity: indeterminate ? 0.45 : undefined,
                             }}
                           />
                         </div>

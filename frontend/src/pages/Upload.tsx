@@ -15,7 +15,7 @@ import {
 import type { UploadRecord } from '../api'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
-import StatusBadge from '../components/StatusBadge'
+import StatusBadge, { TONE_BAR } from '../components/StatusBadge'
 import type { Tone } from '../components/StatusBadge'
 
 /**
@@ -114,6 +114,58 @@ function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
       // this case the badge was undefined and the page crashed on reload.
       return { label: 'Processing', tone: 'info' }
   }
+}
+
+function formatDuration(seconds: number): string {
+  const s = Math.round(seconds)
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'
+}
+
+/**
+ * Where the server's inspection has got to. An RDS is converted first: the
+ * read cannot be measured (pyreadr reads the whole file in one call), so it
+ * shows how long it has been reading; the Parquet write counts rows.
+ */
+function InspectionProgress({ progress }: { progress: UploadRecord['progress'] }) {
+  if (progress?.stage === 'writing' && progress.total > 0) {
+    const pct = Math.min(100, Math.round((progress.done / progress.total) * 100))
+    return (
+      <>
+        <div
+          className="progress mb-1"
+          role="progressbar"
+          aria-label="Conversion progress"
+          aria-valuenow={pct}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div className="progress-bar" style={{ width: pct + '%', backgroundColor: TONE_BAR.info }} />
+        </div>
+        <p className="small text-muted mb-0">
+          Converting to Parquet: {progress.done.toLocaleString()} of {progress.total.toLocaleString()} rows
+          written ({formatDuration(progress.elapsed)}).
+        </p>
+      </>
+    )
+  }
+  const text =
+    progress?.stage === 'reading'
+      ? 'Converting to Parquet: reading the R file (' +
+        formatDuration(progress.elapsed) +
+        '). Large RDS files take a while; there is no way to measure this step.'
+      : progress?.stage === 'writing'
+        ? 'Converting to Parquet: writing…'
+        : progress?.stage === 'preview'
+        ? 'Building the preview…'
+        : progress?.stage === 'checksum'
+          ? 'Checking whether this file was imported before…'
+          : 'Reading the file…'
+  return (
+    <p className="small text-muted mb-0" role="status">
+      <span className="spinner-border spinner-border-sm me-2" aria-hidden="true" />
+      {text}
+    </p>
+  )
 }
 
 export default function Upload() {
@@ -486,10 +538,7 @@ export default function Upload() {
             )}
 
             {(item.status === 'received' || item.status === 'inspecting') && (
-              <p className="small text-muted mb-0">
-                <span className="spinner-border spinner-border-sm me-2" aria-hidden="true" />
-                Reading the file — large RDS files take a while to convert.
-              </p>
+              <InspectionProgress progress={record?.progress ?? null} />
             )}
 
             {item.error && item.status !== 'ready' && (

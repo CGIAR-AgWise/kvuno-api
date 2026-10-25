@@ -89,13 +89,14 @@ def _redis_client():
 
 
 def mark_stale(job: dict, now: float | None = None) -> dict:
-    """Downgrade an abandoned `processing` job to `stale`.
+    """Downgrade an abandoned `processing` (or `converting`) job to `stale`.
 
     Terminal statuses are left alone — a completed job from last week is
-    history, not a stuck job.
+    history, not a stuck job. A conversion reports every few seconds even
+    while pyreadr reads, so one that went quiet has died too.
     """
     now = now if now is not None else time.time()
-    if job.get('status') not in {'processing'}:
+    if job.get('status') not in {'processing', 'converting'}:
         return job
 
     last_seen = job.get('mtime') or 0

@@ -17,7 +17,7 @@ def fake_convert(monkeypatch):
     """Stand-in for pyreadr: writes the output, records what it converted."""
     seen = []
 
-    def convert(rds_path, parquet_path=None, compression='zstd'):
+    def convert(rds_path, parquet_path=None, on_progress=None):
         seen.append(os.path.basename(rds_path))
         with open(parquet_path, 'w') as f:
             f.write('parquet')
@@ -38,7 +38,7 @@ def test_original_removed_by_another_process_is_not_an_error(tmp_path, monkeypat
     rds = tmp_path / 'a.RDS'
     rds.write_text('rds')
 
-    def convert_while_the_other_worker_deletes_it(rds_path, parquet_path=None, compression='zstd'):
+    def convert_while_the_other_worker_deletes_it(rds_path, parquet_path=None, on_progress=None):
         with open(parquet_path, 'w') as f:
             f.write('parquet')
         os.remove(rds_path)  # the other gunicorn worker finished first
@@ -63,7 +63,7 @@ def test_one_bad_file_does_not_stop_the_rest(tmp_path, monkeypatch):
     (tmp_path / 'bad.RDS').write_text('rds')
     (tmp_path / 'good.RDS').write_text('rds')
 
-    def convert(rds_path, parquet_path=None, compression='zstd'):
+    def convert(rds_path, parquet_path=None, on_progress=None):
         with open(parquet_path, 'w') as f:
             f.write('partial')
         if os.path.basename(rds_path) == 'bad.RDS':

@@ -134,6 +134,10 @@ class Upload(Base):
     sha256: Mapped[Optional[str]] = mapped_column(String(64))
     preview: Mapped[Optional[dict]] = mapped_column(JSON)
     duplicate: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Where inspection has got to, for the Upload page while it reads the
+    # file: {stage, done, total, elapsed}. stage is reading|writing (RDS ->
+    # Parquet conversion), checksum or preview. Cleared once inspected.
+    progress: Mapped[Optional[dict]] = mapped_column(JSON)
     # Source column -> DB column. Seeded with the server's guesses during
     # inspection, replaced by the user's choice on submit, and re-used by Retry.
     column_map: Mapped[Optional[dict]] = mapped_column(JSON)

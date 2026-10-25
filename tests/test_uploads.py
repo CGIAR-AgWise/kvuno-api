@@ -13,6 +13,7 @@ Each test names the failure of the resumable.js flow it replaced:
   `{}` and wiped the mapping — the server now seeds and keeps the mapping.
 """
 import datetime
+import threading
 import types
 
 import pyarrow as pa
@@ -27,15 +28,24 @@ STRANGER = types.SimpleNamespace(id=2)
 TUS = {'Tus-Resumable': '1.0.0'}
 
 
+_RealThread = threading.Thread
+
+
 class _InlineThread:
-    """Run inspections synchronously; skip the heartbeat, which loops forever."""
+    """Run inspections synchronously; skip the heartbeat, which loops forever.
+
+    The patch replaces threading.Thread everywhere, so any other thread (the
+    RDS converter's stdout reader) is started for real.
+    """
 
     def __init__(self, target=None, args=(), name=None, daemon=None):
-        self.target, self.args, self.name = target, args, name
+        self.target, self.args, self.name, self.daemon = target, args, name, daemon
 
     def start(self):
         if self.name and self.name.startswith('inspect-'):
             self.target(*self.args)
+        elif self.name and not self.name.startswith('heartbeat'):
+            _RealThread(target=self.target, args=self.args, name=self.name, daemon=True).start()
 
 
 @pytest.fixture
@@ -379,3 +389,38 @@ class TestAwaitingMapping:
     def test_duplicate_check_can_be_turned_off(self, env, monkeypatch):
         monkeypatch.setenv('INGEST_DUPLICATE_CHECK', 'false')
         assert service.describe_duplicate('unused', checksum='abc') is None
+
+
+class TestInspectionProgress:
+    """The Upload page showed "Reading the file…" for the whole of a long RDS conversion."""
+
+    def _inspecting(self, env):
+        from app.models.kvuno import Upload
+        upload_id = _create(env.client, 10).headers['Location'].rsplit('/', 1)[1]
+        env.session.get(Upload, upload_id).status = 'inspecting'
+        env.session.commit()
+        return upload_id
+
+    def _progress(self, env, upload_id):
+        env.session.expire_all()
+        return env.client.get(f'/ui/uploads/{upload_id}').get_json()['progress']
+
+    def test_stages_are_recorded_and_throttled(self, env):
+        upload_id = self._inspecting(env)
+        write = service._ProgressWriter(upload_id)
+        write('reading', 0, 0, 4.04)
+        assert self._progress(env, upload_id) == {'stage': 'reading', 'done': 0, 'total': 0, 'elapsed': 4.0}
+        write('reading', 0, 0, 5.0)  # same stage within PROGRESS_WRITE_SECONDS: skipped
+        assert self._progress(env, upload_id)['elapsed'] == 4.0
+        write('writing', 50, 100, 6.0)  # a new stage is always written
+        assert self._progress(env, upload_id) == {'stage': 'writing', 'done': 50, 'total': 100, 'elapsed': 6.0}
+
+    def test_an_rds_upload_ends_ready_with_no_progress_left(self, env):
+        import pandas as pd
+        import pyreadr
+
+        path = env.tmp / 'src.RDS'
+        pyreadr.write_rds(str(path), pd.DataFrame({'lat': [1.0], 'lon': [2.0]}))
+        upload_id = _upload(env, path.read_bytes(), name='trial.RDS')
+        body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert (body['status'], body['progress'], body['file']) == ('ready', None, f'{upload_id}.parquet')
