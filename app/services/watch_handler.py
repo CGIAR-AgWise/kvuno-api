@@ -4,7 +4,7 @@ import time
 
 from watchdog.events import FileSystemEventHandler
 
-from app.services.housekeeper import logger, process_file
+from app.services.housekeeper import _get_app, hold_unmapped, logger, process_file
 from app.utils.rds_to_parquet import convert_for_ingestion
 
 
@@ -40,6 +40,9 @@ class RDSFileHandler(FileSystemEventHandler):
         try:
             # Convert RDS to Parquet if needed (returns original path for Parquet)
             parquet_path = convert_for_ingestion(path)
+            with _get_app().app_context():
+                if not hold_unmapped([parquet_path], dry_run=self.dry_run):
+                    return  # held for mapping on the Upload page
             process_file(
                 parquet_path,
                 batch_size=self.batch_size,

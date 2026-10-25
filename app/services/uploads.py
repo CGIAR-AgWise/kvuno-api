@@ -193,21 +193,73 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
     return upload
 
 
+def _visible_to(owner_id: int | None):
+    """The caller's own uploads, plus data-folder files held for mapping (no owner)."""
+    return or_(Upload.owner_id == owner_id, Upload.source == 'folder')
+
+
 def get_owned(upload_id: str, owner_id: int | None) -> Upload:
-    """Load an upload the caller owns. Anyone else's is reported as not found."""
+    """Load an upload the caller may see. Anyone else's is reported as not found.
+
+    Data-folder files held for mapping belong to nobody, so every signed-in
+    user can see and map them.
+    """
     if not valid_id(upload_id):
         raise UploadError('Upload not found', 404)
     upload = _session().get(Upload, upload_id)
-    if upload is None or upload.owner_id != owner_id:
+    if upload is None or (upload.owner_id != owner_id and upload.source != 'folder'):
         raise UploadError('Upload not found', 404)
     return upload
 
 
 def list_owned(owner_id: int | None, statuses=UNFINISHED) -> list[Upload]:
     return (_session().query(Upload)
-            .filter(Upload.owner_id == owner_id, Upload.status.in_(statuses))
+            .filter(_visible_to(owner_id), Upload.status.in_(statuses))
             .order_by(Upload.created_at.desc())
             .all())
+
+
+def count_awaiting_mapping(owner_id: int | None) -> int:
+    """Uploads the caller can see that are inspected and waiting for a mapping."""
+    return (_session().query(Upload)
+            .filter(_visible_to(owner_id), Upload.status == 'ready')
+            .count())
+
+
+def hold_from_folder(file_path: str) -> Upload:
+    """Take a data-folder file the default mapping cannot import, and hold it for mapping.
+
+    The file moves into ``uploads/<id>/`` (so the next scan no longer sees it
+    in the data folder root) and is inspected like an upload: preview,
+    checksum, duplicate check and suggested mapping. It then waits, as
+    status ``ready``, for someone to map it on the Upload page.
+    """
+    name = os.path.basename(file_path)
+    upload = Upload(
+        id=uuid.uuid4().hex,
+        owner_id=None,
+        source='folder',
+        original_name=_clip(name, 255),
+        size=os.path.getsize(file_path),
+        status='received',
+        created_at=_now(),
+        updated_at=_now(),
+    )
+    # Row first, then the move: if the move fails the row is removed and the
+    # file is still where the caller can import it the old way.
+    session = _session()
+    session.add(upload)
+    session.commit()
+    try:
+        os.makedirs(upload_dir(upload.id), exist_ok=True)
+        os.replace(file_path, received_path(upload))
+    except OSError:
+        session.delete(upload)
+        session.commit()
+        raise
+    logger.info("data-folder file held for mapping", upload_id=upload.id, file=name)
+    inspect(upload.id)
+    return session.get(Upload, upload.id)
 
 
 def current_offset(upload: Upload) -> int:
@@ -369,6 +421,8 @@ def describe_duplicate(file_path: str, total_rows: int | None = None, checksum: 
     past the file's row count is also 'processed': files completed before the
     worker started clearing the offset were left with offset == row count.
     """
+    if not get_settings().INGEST_DUPLICATE_CHECK:
+        return None
     try:
         from app.utils import calculate_file_checksum
         from app.repo.file_import import FileImportRepo
@@ -549,10 +603,15 @@ def discard(upload: Upload) -> None:
 
 
 def cleanup_abandoned(max_age_seconds: int) -> int:
-    """Delete uploads that never reached a worker and have been idle too long."""
+    """Delete uploads that never reached a worker and have been idle too long.
+
+    Never data-folder files held for mapping: they are the operator's files,
+    not an abandoned upload, and would otherwise vanish after a week.
+    """
     cutoff = _now() - datetime.timedelta(seconds=max_age_seconds)
     stale = (_session().query(Upload)
-             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff)
+             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff,
+                     Upload.source != 'folder')
              .all())
     for upload in stale:
         discard(upload)
@@ -564,6 +623,7 @@ def to_dict(upload: Upload) -> dict:
     return {
         'id': upload.id,
         'name': upload.original_name,
+        'source': upload.source or 'upload',
         'size': upload.size,
         'received': current_offset(upload),
         'status': upload.status,

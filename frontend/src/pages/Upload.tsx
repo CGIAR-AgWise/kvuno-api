@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { TusUpload } from '../lib/tus'
 import {
   ApiError,
   TUS_ENDPOINT,
+  UPLOADS_CHANGED,
   discardUpload,
   fetchDBColumns,
   fetchUpload,
@@ -12,6 +13,7 @@ import {
   processUpload,
 } from '../api'
 import type { UploadRecord } from '../api'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import StatusBadge from '../components/StatusBadge'
 import type { Tone } from '../components/StatusBadge'
@@ -32,7 +34,17 @@ import type { Tone } from '../components/StatusBadge'
  *    the selects is exactly what will be sent.
  * 4. Unfinished uploads are listed from the server on load, so a reload never
  *    loses a file that is waiting to be mapped.
+ * 5. Files waiting for a mapping are listed under "Awaiting mapping" — the
+ *    user's own uploads and data-folder files the default mapping could not
+ *    import (held by the scan, shared by everyone). A row opens its mapping
+ *    when clicked; `?map=<id>` opens one directly. Only opened files are
+ *    processed, so nothing is sent with a mapping nobody looked at.
  */
+
+/** Tell the sidebar badge the number of files awaiting mapping may have changed. */
+function uploadsChanged() {
+  window.dispatchEvent(new Event(UPLOADS_CHANGED))
+}
 
 const CHUNK_SIZE = 5 * 1024 * 1024
 const RETRY_DELAYS = [0, 1000, 3000, 5000, 10000, 20000, 30000]
@@ -107,6 +119,14 @@ function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
 export default function Upload() {
   const toast = useToast()
   const navigate = useNavigate()
+  const { isAdmin } = useAuth()
+  const [searchParams] = useSearchParams()
+  // Ready files whose mapping is open. A file uploaded on this visit opens by
+  // itself once read; ones listed from the server wait for a click.
+  const [open, setOpen] = useState<Set<string>>(() => {
+    const id = searchParams.get('map')
+    return new Set(id ? [id] : [])
+  })
   const [dbColumns, setDbColumns] = useState<ColumnOption[]>([SKIP])
   const [maxSize, setMaxSize] = useState<number | null>(null)
   const [items, setItems] = useState<Item[]>([])
@@ -120,6 +140,15 @@ export default function Upload() {
   const patch = useCallback((key: string, change: Partial<Item>) => {
     setItems((current) => current.map((item) => (item.key === key ? { ...item, ...change } : item)))
   }, [])
+
+  function toggle(id: string) {
+    setOpen((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   // Columns, the server's size limit, and anything left from a previous visit.
   useEffect(() => {
@@ -162,6 +191,11 @@ export default function Upload() {
       for (const id of waitingIds.split(',')) {
         fetchUpload(id, controller.signal)
           .then((record) => {
+            if (record.status === 'ready') {
+              // Uploaded on this visit (it was being polled): open its mapping.
+              setOpen((current) => new Set(current).add(id))
+              uploadsChanged()
+            }
             setItems((current) =>
               current.map((item) =>
                 item.id === id
@@ -291,12 +325,15 @@ export default function Upload() {
       }
     }
     setItems((current) => current.filter((i) => i.key !== item.key))
+    uploadsChanged()
   }
 
   const ready = items.filter((i) => i.status === 'ready' && i.id)
+  const active = items.filter((i) => !(i.status === 'ready' && i.id))
+  const opened = ready.filter((i) => open.has(i.id as string))
   // A fully ingested duplicate is a no-op for the worker, so it is not queued.
-  const queue = ready.filter((i) => i.record?.duplicate?.status !== 'processed')
-  const skipped = ready.length - queue.length
+  const queue = opened.filter((i) => i.record?.duplicate?.status !== 'processed')
+  const skipped = opened.length - queue.length
 
   async function processAll() {
     if (queue.length === 0) return
@@ -318,6 +355,7 @@ export default function Upload() {
       }
     }
     setSubmitting(false)
+    uploadsChanged()
     if (problems.length) setError(problems.join('\n'))
     if (queued > 0) {
       toast.push(queued + ' file(s) sent for processing.', 'success')
@@ -373,20 +411,49 @@ export default function Upload() {
         </div>
       )}
 
-      {items.map((item) => {
+      {[...active, ...ready].map((item, index) => {
         const badge = statusBadge(item)
         const percent = item.size ? Math.min(100, Math.round((item.sent / item.size) * 100)) : 0
         const record = item.record
+        const isReady = item.status === 'ready' && item.id !== null
+        const isOpen = isReady && open.has(item.id as string)
+        const fromFolder = record?.source === 'folder'
         return (
-          <div key={item.key} className="kvuno-card p-3 mb-3">
-            <div className="d-flex justify-content-between align-items-center gap-2 mb-2">
-              <h2 className="h6 mb-0 kvuno-truncate" title={item.name}>
-                {item.name}
-              </h2>
+          <Fragment key={item.key}>
+          {index === active.length && (
+            <h2 className="h6 mt-4 mb-2">
+              Awaiting mapping <span className="text-muted fw-normal">({ready.length})</span>
+            </h2>
+          )}
+          <div className="kvuno-card p-3 mb-3">
+            <div className={'d-flex justify-content-between align-items-center gap-2' + (isReady && !isOpen ? '' : ' mb-2')}>
+              {isReady ? (
+                <button
+                  type="button"
+                  className="btn btn-link p-0 text-reset text-decoration-none text-start d-flex align-items-center gap-2 kvuno-truncate"
+                  onClick={() => toggle(item.id as string)}
+                  aria-expanded={isOpen}
+                  title={item.name}
+                >
+                  <i className={'bi ' + (isOpen ? 'bi-chevron-down' : 'bi-chevron-right')} aria-hidden="true" />
+                  <span className="kvuno-truncate">
+                    <span className="h6 mb-0 d-block kvuno-truncate">{item.name}</span>
+                    <span className="small text-muted">
+                      {fromFolder ? 'Data folder' : 'Upload'}
+                      {record?.total_rows != null ? ' · ' + record.total_rows.toLocaleString() + ' rows' : ''}
+                    </span>
+                  </span>
+                </button>
+              ) : (
+                <h3 className="h6 mb-0 kvuno-truncate" title={item.name}>
+                  {item.name}
+                </h3>
+              )}
               <div className="d-flex align-items-center gap-2 flex-shrink-0">
                 <StatusBadge tone={badge.tone} label={badge.label} icon={badge.icon} />
-                {/* The server refuses to discard once submitted (409). */}
-                {item.status !== 'submitted' && item.status !== 'processing' && (
+                {/* The server refuses to discard once submitted (409), and a
+                    data-folder file is an administrator's to remove (403). */}
+                {item.status !== 'submitted' && item.status !== 'processing' && (!fromFolder || isAdmin) && (
                   <button
                     className="btn btn-sm btn-outline-secondary"
                     onClick={() => void discard(item)}
@@ -429,8 +496,14 @@ export default function Upload() {
               <p className="small text-danger mb-0 mt-1">{item.error}</p>
             )}
 
-            {item.status === 'ready' && record && (
+            {isOpen && record && (
               <>
+                {fromFolder && (
+                  <p className="small text-muted mb-2">
+                    Found in the data folder. The default mapping could not find its coordinates, so it
+                    was held here instead of being imported.
+                  </p>
+                )}
                 {record.duplicate && (
                   <div className="alert alert-secondary py-2 px-3 mb-2 small">
                     <div className="fw-semibold">
@@ -497,6 +570,7 @@ export default function Upload() {
               </>
             )}
           </div>
+          </Fragment>
         )
       })}
 
@@ -509,6 +583,9 @@ export default function Upload() {
           >
             {submitting ? 'Submitting…' : 'Process ' + queue.length + ' file(s)'}
           </button>
+          {opened.length === 0 && (
+            <span className="small text-muted">Open a file to check its mapping.</span>
+          )}
           <Link className="btn btn-outline-secondary" to="/jobs">
             Go to jobs
           </Link>

@@ -4,7 +4,9 @@ Upload endpoints: a tus 1.0 server (core + creation) and the upload lifecycle.
     POST   /ui/uploads/tus            create; returns 201 + Location
     HEAD   /ui/uploads/tus/<id>       current Upload-Offset, for resuming
     PATCH  /ui/uploads/tus/<id>       append bytes at Upload-Offset
-    GET    /ui/uploads                the caller's unfinished uploads
+    GET    /ui/uploads                the caller's unfinished uploads, plus
+                                      data-folder files held for mapping
+    GET    /ui/uploads/awaiting       how many of those wait for a mapping
     GET    /ui/uploads/<id>           status, preview, suggested mapping
     POST   /ui/uploads/<id>/process   save the mapping and start processing
     DELETE /ui/uploads/<id>           discard
@@ -24,7 +26,7 @@ import threading
 
 from flask import current_app, jsonify, request
 
-from app.api.user import get_current_user
+from app.api.user import get_current_user, is_admin
 from app.auth import require_auth
 from app.config import get_settings
 from app.rate_limit import limiter
@@ -202,6 +204,13 @@ def register_upload_routes(app):
         """Unfinished uploads, so a page reload does not lose files awaiting mapping."""
         return jsonify(uploads=[service.to_dict(u) for u in service.list_owned(_owner_id())])
 
+    @app.route('/ui/uploads/awaiting', methods=['GET'])
+    @limiter.exempt
+    @require_auth
+    def uploads_awaiting():
+        """How many files wait for a mapping: the sidebar badge, read on every page change."""
+        return jsonify(count=service.count_awaiting_mapping(_owner_id()))
+
     @app.route('/ui/uploads/<upload_id>', methods=['GET'])
     @limiter.exempt
     @require_auth
@@ -235,5 +244,9 @@ def register_upload_routes(app):
             return jsonify(error=str(e)), e.status
         if upload.status in ('submitted', 'processing'):
             return jsonify(error='Already submitted for processing'), 409
+        # A data-folder file is the operator's, shared by everyone: only an
+        # administrator may delete it.
+        if upload.source == 'folder' and not is_admin(get_current_user()):
+            return jsonify(error='Only an administrator can discard a data-folder file'), 403
         service.discard(upload)
         return '', 204

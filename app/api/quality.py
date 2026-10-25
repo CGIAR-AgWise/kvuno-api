@@ -3,7 +3,7 @@ from typing import Optional
 from flask_openapi3 import Tag, APIBlueprint
 
 from app.auth import require_auth
-from app.config import API_PREFIX, API_VERSION
+from app.config import API_PREFIX, API_VERSION, get_settings
 from app.dto.data_filters import QualityFilter
 from app.dto.import_conflict import ImportConflictRecord
 from app.dto.pagination import PaginatedResponse, get_pagination
@@ -34,6 +34,8 @@ class QualityStatsResponse(BaseModel):
     coverage_pct: int = Field(..., description="Percentage of records with valid coordinates")
     conflicts_by_country: list[dict] = Field(default=[], description="Conflicts grouped by country")
     conflicts_by_source: list[dict] = Field(default=[], description="Conflicts grouped by source")
+    conflict_logging: bool = Field(True, description="Whether new duplicate rows are recorded (INGEST_CONFLICT_LOGGING)")
+    duplicate_check: bool = Field(True, description="Whether already-imported files are skipped (INGEST_DUPLICATE_CHECK)")
 
 
 class ConflictListResponse(PaginatedResponse[ImportConflictRecord]):
@@ -62,6 +64,9 @@ class DuplicateListResponse(PaginatedResponse[DuplicateGroup]):
 def get_quality_stats():
     try:
         stats = repo.get_stats()
+        settings = get_settings()
+        stats['conflict_logging'] = settings.INGEST_CONFLICT_LOGGING
+        stats['duplicate_check'] = settings.INGEST_DUPLICATE_CHECK
         return stats, 200
     except Exception:
         # Exception text can carry SQL and connection details; log it, do not

@@ -301,3 +301,81 @@ class TestLifecycle:
         assert service.cleanup_abandoned(7 * 86400) == 1
         assert (env.tmp / 'uploads' / fresh).exists()
         assert not (env.tmp / 'uploads' / old).exists()
+
+
+def _folder_file(env, name='field.parquet', columns=None):
+    """A data-folder file whose columns the default mapping cannot use."""
+    path = env.tmp / name
+    pq.write_table(pa.table(columns or {'Longitude': [36.8], 'Latitude': [-1.3], 'Variety': ['a']}), path)
+    return str(path)
+
+
+class TestAwaitingMapping:
+    """Data-folder files without lat/lon used to be "imported" with nothing in them."""
+
+    def test_needs_mapping_only_when_defaults_find_no_coordinates(self, env):
+        from app.services.housekeeper import needs_mapping
+
+        assert needs_mapping(_folder_file(env))
+        ok = _folder_file(env, 'ok.parquet', {'lat': [1.0], 'lon': [2.0]})
+        assert not needs_mapping(ok)
+        # RDS would have to be read whole; process_file handles it as before.
+        rds = env.tmp / 'x.rds'
+        rds.write_bytes(b'not read')
+        assert not needs_mapping(str(rds))
+
+    def test_scan_holds_the_file_as_a_shared_upload(self, env):
+        from app.services.housekeeper import hold_unmapped
+
+        held = _folder_file(env)
+        ok = _folder_file(env, 'ok.parquet', {'lat': [1.0], 'lon': [2.0]})
+        assert hold_unmapped([held, ok]) == [ok]
+
+        import os
+        assert not os.path.exists(held)  # out of the data-folder root
+        env.current['user'] = STRANGER  # nobody owns it; everyone can map it
+        uploads = env.client.get('/ui/uploads').get_json()['uploads']
+        assert [(u['name'], u['source'], u['status']) for u in uploads] == [
+            ('field.parquet', 'folder', 'ready')]
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 1}
+        assert env.client.get(f"/ui/uploads/{uploads[0]['id']}").status_code == 200
+
+    def test_dry_run_and_disabled_hold_nothing(self, env, monkeypatch):
+        from app.models.kvuno import Upload
+        from app.services.housekeeper import hold_unmapped
+
+        path = _folder_file(env)
+        assert hold_unmapped([path], dry_run=True) == []
+        monkeypatch.setenv('INGEST_HOLD_UNMAPPED', 'false')
+        assert hold_unmapped([path]) == [path]
+        assert env.session.query(Upload).count() == 0
+
+    def test_awaiting_count_excludes_other_users_uploads(self, env):
+        _upload(env, _parquet_bytes(env.tmp))
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 1}
+        env.current['user'] = STRANGER
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 0}
+
+    def test_only_an_administrator_discards_a_folder_file(self, env, monkeypatch):
+        from app.services.housekeeper import hold_unmapped
+
+        hold_unmapped([_folder_file(env)])
+        upload_id = env.client.get('/ui/uploads').get_json()['uploads'][0]['id']
+        monkeypatch.setattr('app.routes.uploads.is_admin', lambda user: False)
+        assert env.client.delete(f'/ui/uploads/{upload_id}').status_code == 403
+        monkeypatch.setattr('app.routes.uploads.is_admin', lambda user: True)
+        assert env.client.delete(f'/ui/uploads/{upload_id}').status_code == 204
+
+    def test_cleanup_never_removes_folder_files(self, env):
+        from app.models.kvuno import Upload
+        from app.services.housekeeper import hold_unmapped
+
+        hold_unmapped([_folder_file(env)])
+        upload = env.session.query(Upload).one()
+        upload.updated_at = datetime.datetime(2000, 1, 1)
+        env.session.commit()
+        assert service.cleanup_abandoned(7 * 86400) == 0
+
+    def test_duplicate_check_can_be_turned_off(self, env, monkeypatch):
+        monkeypatch.setenv('INGEST_DUPLICATE_CHECK', 'false')
+        assert service.describe_duplicate('unused', checksum='abc') is None

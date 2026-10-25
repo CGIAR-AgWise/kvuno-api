@@ -194,6 +194,55 @@ def emit_event(event: str, **kwargs):
 
 # ── Column mapping ─────────────────────────────────────────────
 
+def needs_mapping(file_path: str) -> bool:
+    """Whether the default mapping cannot import this file: it finds no lat/lon in it.
+
+    The default mapping is the built-ins, overridden by RDS_COLUMN_MAP and a
+    per-file ``.map.json`` (load_column_map). Without both coordinates every
+    row is dropped (the coordinates column is NOT NULL), so such a file used
+    to be "imported" with nothing in it. Parquet only — its columns come from
+    the footer; an RDS would have to be read whole, so it is left to
+    process_file as before (scans convert RDS to Parquet first anyway).
+    """
+    if not file_path.lower().endswith('.parquet'):
+        return False
+    try:
+        import pyarrow.parquet as pq
+        columns = set(pq.ParquetFile(file_path).schema_arrow.names)
+    except Exception:
+        return False  # unreadable: process_file reports it
+    targets = {target for source, target in load_column_map(file_path).items() if source in columns}
+    return not {'lat', 'lon'} <= targets
+
+
+def hold_unmapped(file_paths: list[str], dry_run: bool = False) -> list[str]:
+    """Hold the files the default mapping cannot import; return the rest.
+
+    A held file becomes an upload awaiting mapping (source='folder'), shown on
+    the Upload page and counted in the sidebar. INGEST_HOLD_UNMAPPED=false
+    keeps the old behaviour. Needs an app context.
+    """
+    if not get_settings().INGEST_HOLD_UNMAPPED:
+        return list(file_paths)
+    remaining = []
+    for path in file_paths:
+        if not needs_mapping(path):
+            remaining.append(path)
+            continue
+        name = os.path.basename(path)
+        if dry_run:
+            logger.info("[DRY RUN] would hold for mapping: the default mapping finds no lat/lon", file=name)
+            continue
+        try:
+            from app.services import uploads as upload_service
+            upload_service.hold_from_folder(path)
+        except Exception:
+            logger.exception("could not hold the file for mapping; importing it with the default mapping",
+                             file=name)
+            remaining.append(path)
+    return remaining
+
+
 def load_column_map(file_path: str | None = None) -> dict[str, str]:
     """Load column name mapping from env var, overridden by a per-file .map.json if present."""
     default_map = {
@@ -597,6 +646,12 @@ def process_file(
             # (a stale connection used to leave it unusable for every retry).
             existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum), session=session)
             resume_offset = 0
+            if existing and existing.offset is None and not get_settings().INGEST_DUPLICATE_CHECK:
+                # Duplicate checking is off: import it again from the start.
+                # Rows already stored are still skipped by the unique constraint.
+                logger.info("file was imported before; importing again (INGEST_DUPLICATE_CHECK=false)",
+                            file=file_name)
+                existing = None
             if existing and existing.offset is None:
                 logger.warning(f"File {file_name} is already fully processed. Checksum: {checksum}")
                 # Report it, or a submitted duplicate shows nothing at all —
@@ -654,6 +709,10 @@ def process_file(
                        total_rows=num_rows, resume_offset=resume_offset)
             logger.info(f"Processing file {file_name} in chunks of size {chunk_size}")
 
+            # INGEST_CONFLICT_LOGGING=false still skips duplicates (the unique
+            # constraint does that) but stops recording each one in
+            # import_conflicts — an extra query per batch that had any.
+            log_conflicts = get_settings().INGEST_CONFLICT_LOGGING
             failed_batches = 0
             completed_batches = 0
             batches_since_checkpoint = 0
@@ -731,7 +790,7 @@ def process_file(
                                     # instead of being inserted on every replay.
                                     stmt = insert(PlantingRecommendation).values(mappings).on_conflict_do_nothing()
                                     result = session.execute(stmt)
-                                    if result.rowcount < len(mappings):
+                                    if result.rowcount < len(mappings) and log_conflicts:
                                         _log_batch_conflicts(session, mappings)
                             retry_db(lambda: _flush_batch(sub), attempts=2)
                             completed_batches += 1
@@ -894,6 +953,10 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
 
     failed_count = 0
     with _get_app().app_context():
+        # Files whose columns the default mapping cannot use wait for a person
+        # to map them on the Upload page, instead of importing nothing.
+        file_paths = hold_unmapped(file_paths, dry_run=dry_run)
+
         # ONE run for the whole scan, so its files are reported as a batch and
         # each gets its own history row instead of overwriting the last one.
         run_id = None

@@ -685,6 +685,9 @@ Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — t
 | `HOUSEKEEPING_CHECKPOINT_INTERVAL` | `50` | Batches between offset checkpoints. |
 | `HOUSEKEEPING_MAX_WORKERS` | `1` | Parallel files in a directory scan. |
 | `INGEST_LOCK_STALE_SECONDS` | `600` | Take over a per-file ingest lock silent this long. |
+| `INGEST_HOLD_UNMAPPED` | `true` | Hold data-folder files whose columns the default mapping does not cover (no lat/lon) for mapping on the Upload page, instead of importing them with a mapping that finds no coordinates. |
+| `INGEST_DUPLICATE_CHECK` | `true` | Recognise files already imported (by SHA-256): warn at upload and skip at import. Off: a re-sent file is imported again; rows already stored are still not duplicated (unique constraint). |
+| `INGEST_CONFLICT_LOGGING` | `true` | Record rows that clash with stored ones in import_conflicts (the Quality page). Off: faster imports; clashing rows are still skipped, just not recorded. |
 | `RDS_COLUMN_MAP` | — | JSON object overriding the default source→DB column map. |
 
 **Celery / Redis**

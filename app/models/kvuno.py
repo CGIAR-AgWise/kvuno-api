@@ -102,9 +102,10 @@ class Upload(Base):
     and a worker boot that wiped `.chunks` lost every upload in flight. Every
     step now moves this row forward instead:
 
-        receiving -> received -> inspecting -> ready | failed -> submitted
+        receiving -> received -> inspecting -> ready | failed -> submitted -> processing
 
     `id` is issued by the server (a uuid hex), never taken from the client.
+    A data-folder file held for mapping enters at `received` (source='folder').
     """
     __tablename__ = 'uploads'
     __table_args__ = (
@@ -121,6 +122,12 @@ class Upload(Base):
     # against MAX_FILE_SIZE before any bytes are accepted.
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default='receiving')
+    # 'upload' (the Upload page) or 'folder': a data-folder file whose columns
+    # the default mapping does not cover, held here for someone to map
+    # (housekeeper.hold_unmapped). Folder uploads have no owner, are visible
+    # to every signed-in user and are never deleted as abandoned.
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default='upload',
+                                        server_default='upload')
     # The file the worker will read. Differs from the received file after an
     # RDS is converted to Parquet during inspection.
     stored_path: Mapped[Optional[str]] = mapped_column(String(512))

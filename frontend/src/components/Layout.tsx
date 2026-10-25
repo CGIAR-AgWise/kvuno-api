@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useRef, useState } from 'react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
-import { fetchAdminUsers } from '../api'
+import { UPLOADS_CHANGED, fetchAdminUsers, fetchAwaitingCount } from '../api'
 import { useAuth } from '../context/AuthContext'
 import Loading from './Loading'
 
@@ -29,6 +29,31 @@ function usePendingCount(enabled: boolean, pathname: string): number {
   }, [enabled, pathname, nonce])
 
   return enabled ? count : 0
+}
+
+/**
+ * How many files wait for a mapping (uploads and held data-folder files), for
+ * the Upload badge. Same refresh rules as usePendingCount.
+ */
+function useAwaitingCount(pathname: string): number {
+  const [count, setCount] = useState(0)
+  const [nonce, setNonce] = useState(0)
+
+  useEffect(() => {
+    const bump = () => setNonce((n) => n + 1)
+    window.addEventListener(UPLOADS_CHANGED, bump)
+    return () => window.removeEventListener(UPLOADS_CHANGED, bump)
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetchAwaitingCount(controller.signal)
+      .then((res) => setCount(res.count))
+      .catch(() => undefined)
+    return () => controller.abort()
+  }, [pathname, nonce])
+
+  return count
 }
 
 interface Page {
@@ -119,6 +144,7 @@ export default function Layout() {
   const navigate = useNavigate()
   const location = useLocation()
   const pending = usePendingCount(isAdmin, location.pathname)
+  const awaiting = useAwaitingCount(location.pathname)
   // Phones and tablets: the sidebar is a drawer. Desktop: it can be narrowed
   // to icons, remembered per browser.
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -210,6 +236,12 @@ export default function Layout() {
                     <span className="kv-badge">
                       {pending}
                       <span className="visually-hidden"> awaiting approval</span>
+                    </span>
+                  )}
+                  {page.to === '/upload' && awaiting > 0 && (
+                    <span className="kv-badge">
+                      {awaiting}
+                      <span className="visually-hidden"> awaiting mapping</span>
                     </span>
                   )}
                 </NavLink>

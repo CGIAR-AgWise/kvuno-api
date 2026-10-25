@@ -226,6 +226,18 @@ class Settings(BaseSettings):
     HOUSEKEEPING_CHECKPOINT_INTERVAL: int = _f(50, 'ingest', "Batches between offset checkpoints.")
     HOUSEKEEPING_MAX_WORKERS: int = _f(1, 'ingest', "Parallel files in a directory scan.")
     INGEST_LOCK_STALE_SECONDS: float = _f(600, 'ingest', "Take over a per-file ingest lock silent this long.")
+    INGEST_HOLD_UNMAPPED: bool = _f(True, 'ingest',
+                                    "Hold data-folder files whose columns the default mapping does not cover "
+                                    "(no lat/lon) for mapping on the Upload page, instead of importing them "
+                                    "with a mapping that finds no coordinates.")
+    INGEST_DUPLICATE_CHECK: bool = _f(True, 'ingest',
+                                      "Recognise files already imported (by SHA-256): warn at upload and skip at "
+                                      "import. Off: a re-sent file is imported again; rows already stored are "
+                                      "still not duplicated (unique constraint).")
+    INGEST_CONFLICT_LOGGING: bool = _f(True, 'ingest',
+                                       "Record rows that clash with stored ones in import_conflicts (the Quality "
+                                       "page). Off: faster imports; clashing rows are still skipped, just not "
+                                       "recorded.")
     RDS_COLUMN_MAP: Optional[str] = _f(None, 'ingest', "JSON object overriding the default source→DB column map.",
                                        example='{"Variety": "variety"}')
 

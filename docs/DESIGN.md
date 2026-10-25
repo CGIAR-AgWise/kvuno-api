@@ -76,6 +76,7 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 - Size and type are refused up front: the SPA reads `max_file_size` from `/ui/columns` instead of hardcoding 20 MB, and the server rejects at tus creation before any bytes are sent
 - Per-file status badge following the server lifecycle (`receiving` → `inspecting` → `ready` / `failed` → `submitted` → `processing`), polled from `GET /ui/uploads/<id>`; inspection (RDS → Parquet, preview, checksum) runs server-side, so nothing waits on one long request
 - Unfinished uploads are listed from `GET /ui/uploads` on load, so a reload never loses a file waiting to be mapped; each can be discarded until it is submitted
+- **Awaiting mapping** list: every inspected file waiting for a mapping — the user's own uploads and data-folder files the scan held because the default mapping found no lat/lon (labelled "Data folder", shared by all users, discard admin-only). Rows are collapsed with name, source and row count; a click opens the mapping, `?map=<id>` opens one directly, and a file uploaded on this visit opens by itself once read. **Process** sends only opened files, so nothing goes out with a mapping nobody looked at. The sidebar's Upload item shows the count (`GET /ui/uploads/awaiting`), refreshed on navigation and on `kvuno:uploads-changed`
 - Column mapping UI seeded with the **server's** suggestion, so the selects show exactly what will be sent; *skip* removes a column. `lat`/`lon` are required and each DB column can be used once
 - Duplicate warning when the same content was already ingested (or partially ingested)
 - Processing trigger (`POST /ui/uploads/<id>/process`): saves the mapping and imports the file on a background thread in the API — no worker or Redis needed — with progress on the Jobs page
@@ -189,10 +190,11 @@ GET    /ui/jobs/events             → SSE: live updates (Redis pub/sub, 3s poll
 POST   /ui/uploads/tus             → tus create (size/type checked before any bytes; 413/415)
 HEAD   /ui/uploads/tus/<id>        → tus Upload-Offset, for resuming
 PATCH  /ui/uploads/tus/<id>        → tus append at offset (409 mismatch, 423 busy)
-GET    /ui/uploads                 → JSON: the caller's unfinished uploads
+GET    /ui/uploads                 → JSON: the caller's unfinished uploads + data-folder files held for mapping
+GET    /ui/uploads/awaiting        → JSON: {count} of those waiting for a mapping (sidebar badge)
 GET    /ui/uploads/<id>            → JSON: status, preview, duplicate, suggested mapping
 POST   /ui/uploads/<id>/process    → validate + save mapping, process it in the API (`processing`)
-DELETE /ui/uploads/<id>            → discard an upload not yet submitted or processing (409 otherwise)
+DELETE /ui/uploads/<id>            → discard an upload not yet submitted or processing (409 otherwise; a data-folder file is admin-only, 403)
 POST   /ui/process                 → re-process a stored file (Jobs Retry; re-uses the saved mapping)
 GET    /ui/progress/<file>         → JSON: one job record from progress_store (or status "unknown")
 

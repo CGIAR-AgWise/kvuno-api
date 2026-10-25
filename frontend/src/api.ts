@@ -279,6 +279,10 @@ export interface QualityStats {
   total_files: number
   coverage_pct: number
   conflicts_by_source: { source: string; count: number }[]
+  /** INGEST_CONFLICT_LOGGING: false means new duplicates are skipped without being recorded. */
+  conflict_logging?: boolean
+  /** INGEST_DUPLICATE_CHECK: false means already-imported files are imported again. */
+  duplicate_check?: boolean
 }
 
 export interface Job {
@@ -673,8 +677,18 @@ export interface UploadRecord {
   /** Source column -> DB column; seeded with the server's guesses. */
   column_map: Record<string, string>
   error: string | null
+  /** 'upload' from the Upload page; 'folder' a data-folder file held for mapping. */
+  source: 'upload' | 'folder'
   created_at: string | null
   updated_at: string | null
+}
+
+/** Dispatched after an upload is submitted or discarded, so the sidebar count refreshes. */
+export const UPLOADS_CHANGED = 'kvuno:uploads-changed'
+
+/** Files inspected and waiting for a mapping — the Upload nav badge. */
+export function fetchAwaitingCount(signal?: AbortSignal) {
+  return request<{ count: number }>('/ui/uploads/awaiting', { signal })
 }
 
 export function fetchUploads(signal?: AbortSignal) {

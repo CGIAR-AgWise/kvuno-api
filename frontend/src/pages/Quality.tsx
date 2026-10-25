@@ -78,6 +78,15 @@ export default function Quality() {
 
   return (
     <div className="pb-3">
+      {(stats?.conflict_logging === false || stats?.duplicate_check === false) && (
+        <p className="small text-muted mb-3">
+          <i className="bi bi-info-circle me-1" aria-hidden="true" />
+          {stats.conflict_logging === false &&
+            'Conflict logging is off (INGEST_CONFLICT_LOGGING): duplicate rows are still skipped, but new ones are not recorded here. '}
+          {stats.duplicate_check === false &&
+            'Duplicate file checking is off (INGEST_DUPLICATE_CHECK): files imported before are imported again.'}
+        </p>
+      )}
       <div className="row g-3 mb-3">
         {(
           [
