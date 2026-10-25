@@ -549,45 +549,110 @@ def _iter_parquet_chunks(parquet_file, columns, start: int, chunk_size: int):
         offset = end
 
 
-def _log_batch_conflicts(session, mappings):
-    from sqlalchemy import and_, or_
-    unique_cols = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date']
-    key_tuples = {
-        tuple(m.get(c) for c in unique_cols)
-        for m in mappings
-    }
-    # IS NOT DISTINCT FROM, not a tuple IN: `NULL = NULL` is never true, so a
-    # key with any NULL never matched and its conflict went unlogged — even
-    # though the constraint (NULLS NOT DISTINCT) does reject it.
-    existing = session.query(PlantingRecommendation).filter(or_(*[
-        and_(*[getattr(PlantingRecommendation, c).is_not_distinct_from(v)
-               for c, v in zip(unique_cols, key)])
-        for key in key_tuples
-    ])).all()
-    existing_keys = {
-        tuple(getattr(e, c) for c in unique_cols): e.check_sum
-        for e in existing
-    }
+# The columns of uq_planting_recommendation, in its order.
+KEY_COLUMNS = ('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date')
+
+
+def _insert_statement():
+    """INSERT … ON CONFLICT DO NOTHING RETURNING the key of each row inserted.
+
+    Executed with a list of rows (executemany), so SQLAlchemy compiles it once
+    and batches it itself. It used to be ``.values(rows)``: one statement with
+    ~24,000 bind parameters, compiled afresh for every batch (~250 ms each).
+
+    RETURNING is how the batch learns which rows went in. ``rowcount`` is -1
+    for this statement under psycopg 3, so the old ``rowcount < len(rows)``
+    check was always true: every batch ran the conflict lookup — a full table
+    scan that grew with the table — and, because that lookup ran after the
+    insert, recorded every row it had just inserted as a conflict.
+    """
+    return (insert(PlantingRecommendation)
+            .on_conflict_do_nothing()
+            .returning(*[getattr(PlantingRecommendation, c) for c in KEY_COLUMNS]))
+
+
+def _as_real(value):
+    """A coordinate as the float4 Postgres stores (lon/lat are REAL columns).
+
+    36.817223 is stored as 36.81722259521484375, so the value RETURNING gives
+    back is not the one sent, and a lookup with the float8 that was sent
+    neither matches nor uses the index. Both sides are compared as float4.
+    """
+    import numpy as np
+    return None if value is None else float(np.float32(value))
+
+
+def _key(row) -> tuple:
+    return tuple(_as_real(row.get(c)) if c in ('lon', 'lat') else row.get(c) for c in KEY_COLUMNS)
+
+
+def _not_inserted(mappings, inserted) -> list[dict]:
+    """The rows of a batch that ON CONFLICT skipped: those not RETURNed.
+
+    A multiset, not a set: a key twice in one batch inserts once, and the
+    second copy is a conflict.
+    """
+    from collections import Counter
+    remaining = Counter(_key(dict(zip(KEY_COLUMNS, r))) for r in inserted)
+    skipped = []
     for m in mappings:
-        key = tuple(m.get(c) for c in unique_cols)
-        if key in existing_keys:
-            record_data = {
-                k: str(v) if not isinstance(v, (str, int, float, bool, list, dict)) and v is not None else v
-                for k, v in m.items()
-            }
-            conflict = ImportConflict(
-                record_data=record_data,
-                country=m.get('country'),
-                province=m.get('province'),
-                lon=m.get('lon'),
-                lat=m.get('lat'),
-                variety=m.get('variety'),
-                season_type=m.get('season_type'),
-                opt_date=m.get('opt_date'),
-                check_sum=existing_keys[key],
-                source='housekeeper',
-            )
-            session.add(conflict)
+        key = _key(m)
+        if remaining[key]:
+            remaining[key] -= 1
+        else:
+            skipped.append(m)
+    return skipped
+
+
+def _existing_rows_query(keys):
+    """SELECT the key columns + check_sum of the rows already holding *keys*."""
+    from sqlalchemy import REAL, and_, cast, literal, or_, select, tuple_
+    columns = [getattr(PlantingRecommendation, c) for c in KEY_COLUMNS]
+
+    def values(key):
+        # lon/lat as REAL, or Postgres widens the column to float8 to compare
+        # and the unique index cannot be used.
+        return [cast(literal(v), REAL) if c in ('lon', 'lat') and v is not None else literal(v)
+                for c, v in zip(KEY_COLUMNS, key)]
+
+    conditions = []
+    plain = [k for k in keys if None not in k]
+    if plain:
+        conditions.append(tuple_(*columns).in_([tuple_(*values(k)) for k in plain]))
+    conditions.extend(
+        and_(*[col.is_not_distinct_from(v) for col, v in zip(columns, values(key))])
+        for key in keys if None in key)
+    return select(*columns, PlantingRecommendation.check_sum).where(or_(*conditions))
+
+
+def _log_batch_conflicts(session, skipped):
+    """Record the rows ON CONFLICT skipped, with the checksum of the row they clash with.
+
+    Only the skipped rows are looked up, and keys without NULLs go through a
+    tuple IN that uses the unique index. Keys with a NULL need IS NOT DISTINCT
+    FROM (`NULL = NULL` is never true, but the constraint is NULLS NOT
+    DISTINCT), which no index serves — so only those few take that path.
+    """
+    if not skipped:
+        return
+    existing = {
+        _key(dict(zip(KEY_COLUMNS, row[:-1]))): row[-1]
+        for row in session.execute(_existing_rows_query({_key(m) for m in skipped}))
+    }
+
+    conflicts = []
+    for m in skipped:
+        record_data = {
+            k: str(v) if not isinstance(v, (str, int, float, bool, list, dict)) and v is not None else v
+            for k, v in m.items()
+        }
+        conflicts.append({
+            'record_data': record_data,
+            **{c: m.get(c) for c in KEY_COLUMNS},
+            'check_sum': existing.get(_key(m)),
+            'source': 'housekeeper',
+        })
+    session.execute(insert(ImportConflict), conflicts)
 
 
 # ── File processing ─────────────────────────────────────────────
@@ -741,6 +806,7 @@ def process_file(
             # constraint does that) but stops recording each one in
             # import_conflicts — an extra query per batch that had any.
             log_conflicts = get_settings().INGEST_CONFLICT_LOGGING
+            insert_stmt = _insert_statement()
             failed_batches = 0
             completed_batches = 0
             batches_since_checkpoint = 0
@@ -816,10 +882,9 @@ def process_file(
                                     # migration f3a9c2d4e5b6), so a row with a
                                     # NULL key column now conflicts as well
                                     # instead of being inserted on every replay.
-                                    stmt = insert(PlantingRecommendation).values(mappings).on_conflict_do_nothing()
-                                    result = session.execute(stmt)
-                                    if result.rowcount < len(mappings) and log_conflicts:
-                                        _log_batch_conflicts(session, mappings)
+                                    inserted = session.execute(insert_stmt, mappings).all()
+                                    if log_conflicts and len(inserted) < len(mappings):
+                                        _log_batch_conflicts(session, _not_inserted(mappings, inserted))
                             retry_db(lambda: _flush_batch(sub), attempts=2)
                             completed_batches += 1
                             batches_since_checkpoint += 1
