@@ -376,6 +376,19 @@ receiving → received → inspecting → ready | failed → submitted → proce
 
 Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unfinished uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted when an API process starts. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
 
+#### Converting large RDS files locally
+
+Reading an RDS takes about 150× its size in memory (`pyreadr` reads the whole file), so the server can refuse a large one with *"Reading this R file needs more memory than the server allows"*. Convert it on a machine with more memory and upload the Parquet instead. `scripts/convert_rds.py` uses the same converter as the server, shows the read time and the rows written, keeps the RDS, never leaves a partial `.parquet`, and exits 1 if any file failed:
+
+```bash
+python scripts/convert_rds.py data/field.RDS                 # writes data/field.parquet
+python scripts/convert_rds.py data/ --out-dir converted/     # every .rds directly in data/
+python scripts/convert_rds.py data/field.RDS --overwrite     # replace an existing .parquet
+make convert-rds ARGS="data/ -o converted/"
+```
+
+From R, `arrow::write_parquet(df, "field.parquet")` does the same.
+
 ### Housekeeping (on-demand import)
 
 `housekeeping.py` imports the files in a folder directly, without Celery — for bulk loads or a manual re-scan. It is a Typer CLI over `housekeeper.run()`; `python housekeeping.py --help` lists the options.

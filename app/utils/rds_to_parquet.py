@@ -199,6 +199,32 @@ def rds_to_parquet(rds_path: str, parquet_path: str | None = None, compression: 
     return parquet_path
 
 
+def convert(rds_path: str, parquet_path: str | None = None,
+            on_progress: Optional[ProgressCallback] = None) -> str:
+    """Convert one RDS to Parquet in a child process, keeping the RDS.
+
+    The Parquet is written to ``<out>.tmp`` and renamed into place, so a
+    failed or interrupted run never leaves a partial file. Raises
+    ConversionError (with a message for a person) on any failure. Used by
+    ``scripts/convert_rds.py`` to convert files on a machine with more memory
+    than the server, before uploading them.
+    """
+    if parquet_path is None:
+        parquet_path = os.path.splitext(rds_path)[0] + ".parquet"
+    tmp = parquet_path + ".tmp"
+    try:
+        _convert_in_child(rds_path, tmp, on_progress=on_progress)
+        os.replace(tmp, parquet_path)
+    except _WriteFailed as e:
+        raise ConversionError(f"The file was read, but writing Parquet failed: {e}") from None
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return parquet_path
+
+
 CONVERT_LOCK_SUFFIX = '.convert.lock'
 
 

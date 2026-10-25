@@ -14,6 +14,7 @@ poetry run pip-audit --strict      # CI also runs this; deps are security-gated
 python run.py                      # dev server (dev console script: `poetry run dev`)
 python dev_worker.py               # Celery worker, auto-picks --pool solo on Windows
 python housekeeping.py [DIR] [--dry-run] [--watch/-w] [--batch-size N] [--chunk-size N] [--checkpoint-interval N]   # Typer CLI, no Celery
+python scripts/convert_rds.py PATH... [--out-dir DIR] [--overwrite]   # RDS -> Parquet locally (rds_to_parquet.convert), to upload the Parquet
 ```
 
 A root `Makefile` wraps these (`make help` lists targets; e.g. `make check`, `make dev`, `make migration MSG="..."`). Order that matters: `ruff check .` -> `pytest`. There is no typecheck step (pylint config in `.pylintrc` is not wired into CI).
