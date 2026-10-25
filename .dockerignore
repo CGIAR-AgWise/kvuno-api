@@ -16,6 +16,8 @@ model-generator.py
 .idea
 .vscode
 *.md
+# Old sample RDS files kept locally (untracked); not for any image.
+static/data_old
 
 # Exceptions: the `*.md` rule above would otherwise strip README.md from the
 # build context, but pyproject.toml declares `readme = "README.md"` and Poetry

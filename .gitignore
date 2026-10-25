@@ -6,6 +6,8 @@
 __pycache__/
 
 data-old
+# Old sample RDS files, kept locally only (they were tracked until 2026-10).
+/static/data_old/
 kvuno.db
 kvuno.db.journal
 /data/
