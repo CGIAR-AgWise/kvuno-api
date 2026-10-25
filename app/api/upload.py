@@ -8,23 +8,20 @@ from pydantic import BaseModel, Field
 
 from app.auth import require_auth
 from app.cache import invalidate_planting_data_cache
-from app.config import API_PREFIX, API_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED, RATE_LIMIT_UPLOAD
-from app.config import MAX_FILE_SIZE, ALLOWED_EXTENSIONS
+from app.config import API_PREFIX, API_VERSION, ALLOWED_EXTENSIONS, get_settings
 from app.dto.upload import UploadResponse
 from app.rate_limit import limiter
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 from app.utils.preview import read_columns
-from app.utils.rds_to_parquet import convert_for_ingestion
+from app.utils.rds_to_parquet import ConversionError, convert_for_ingestion
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 __bp__ = "/data"
 url_prefix = API_PREFIX + API_VERSION + __bp__
 
 tag = Tag(name="ingestion", description="File upload and data ingestion")
 api = APIBlueprint(__bp__, __name__, url_prefix=url_prefix, abp_tags=[tag], abp_security=[{"jwt": []}])
-
-DATA_DIR = HOUSEKEEPING_DATA_DIR
 
 
 class UploadBatchResponse(BaseModel):
@@ -42,19 +39,28 @@ def _process_uploaded_file(f):
     f.seek(0, os.SEEK_END)
     size = f.tell()
     f.seek(0)
-    if size > MAX_FILE_SIZE:
+    settings = get_settings()
+    if size > settings.max_file_size:
         return {
-            "error": f"File too large ({size / 1024 / 1024:.1f} MB). Maximum allowed: {MAX_FILE_SIZE / 1024 / 1024:.0f} MB"}, 413
+            "error": f"File too large ({size / 1024 / 1024:.1f} MB). Maximum allowed: {settings.MAX_FILE_SIZE_MB} MB"}, 413
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    data_dir = settings.HOUSEKEEPING_DATA_DIR
+    os.makedirs(data_dir, exist_ok=True)
 
     unique_name = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(DATA_DIR, unique_name)
+    dest = os.path.join(data_dir, unique_name)
     f.save(dest)
 
-    # Convert RDS -> Parquet once so the worker does not re-parse the whole file.
-    # Falls back to the RDS if conversion fails.
-    stored = convert_for_ingestion(dest)
+    # Convert RDS -> Parquet once (in a child process) so the worker does not
+    # re-parse the whole file. Keeps the RDS if only the Parquet write fails.
+    try:
+        stored = convert_for_ingestion(dest)
+    except ConversionError as e:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return {"error": str(e), "file": unique_name}, 400
     stored_ext = os.path.splitext(stored)[1].lower()
 
     try:
@@ -75,7 +81,7 @@ def _process_uploaded_file(f):
     invalidate_planting_data_cache()
 
     message = "File saved. Set HOUSEKEEPING_ENABLED=true and start a Celery worker for background processing."
-    if HOUSEKEEPING_ENABLED:
+    if settings.HOUSEKEEPING_ENABLED:
         from app.services.housekeeper import process_file_async
         # Say so when the broker refused it, rather than "accepted" regardless.
         # The file stays in the data directory, so the next startup scan or a
@@ -98,7 +104,7 @@ def _process_uploaded_file(f):
           summary="Upload RDS/Parquet files for ingestion",
           description="Upload one or more .rds or .parquet files. Each file is validated, saved, and processed in the background by a Celery worker.")
 @require_auth
-@limiter.limit(RATE_LIMIT_UPLOAD)
+@limiter.limit(lambda: get_settings().RATE_LIMIT_UPLOAD)
 def upload_file():
     """Upload one or more RDS or Parquet files for processing.
 

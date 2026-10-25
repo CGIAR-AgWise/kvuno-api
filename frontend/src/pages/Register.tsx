@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ApiError, register } from '../api'
+import AuthShell from '../components/AuthShell'
 import { useAuth } from '../context/AuthContext'
 
 export default function Register() {
@@ -9,6 +10,9 @@ export default function Register() {
   const [form, setForm] = useState({ username: '', email: '', password: '', confirm: '' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  // Set once a request is waiting for an administrator. Signing in straight
+  // away (as before approval existed) would just fail with "awaiting approval".
+  const [pending, setPending] = useState<string | null>(null)
 
   const set = (key: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm((f) => ({ ...f, [key]: e.target.value }))
@@ -22,8 +26,12 @@ export default function Register() {
     setBusy(true)
     setError('')
     try {
-      await register(form.username.trim(), form.email.trim(), form.password)
-      // The API does not auto-login on register, so sign in straight away.
+      const result = await register(form.username.trim(), form.email.trim(), form.password)
+      if (result.status === 'pending') {
+        setPending(form.email.trim())
+        return
+      }
+      // Approved at once (an administrator's own address): sign straight in.
       await adopt(form.username.trim(), form.password)
       navigate('/jobs', { replace: true })
     } catch (err) {
@@ -32,11 +40,32 @@ export default function Register() {
     }
   }
 
+  if (pending) {
+    return (
+      <AuthShell title="Request received">
+        <p>
+          An administrator needs to approve your account before you can sign in. You&rsquo;ll get
+          an email at <strong>{pending}</strong> once it&rsquo;s activated.
+        </p>
+        <Link className="btn btn-outline-primary" to="/login">
+          Back to sign in
+        </Link>
+      </AuthShell>
+    )
+  }
+
   return (
-    <div className="container py-5" style={{ maxWidth: '26rem' }}>
-      <h1 className="h4 mb-4 text-center">Create an account</h1>
+    <AuthShell
+      title="Request access"
+      after={
+        <>
+          Already have an account? <Link to="/login">Sign in</Link>
+        </>
+      }
+    >
+      <p className="text-muted small">An administrator approves new accounts before they can sign in.</p>
       {error && <div className="alert alert-danger">{error}</div>}
-      <form onSubmit={submit} className="kvuno-card p-4">
+      <form onSubmit={submit}>
         {(
           [
             ['username', 'Username', 'username'],
@@ -61,12 +90,9 @@ export default function Register() {
           </div>
         ))}
         <button className="btn btn-primary w-100" disabled={busy}>
-          {busy ? 'Creating…' : 'Register'}
+          {busy ? 'Sending request…' : 'Request access'}
         </button>
       </form>
-      <p className="text-center text-muted small mt-3">
-        Already registered? <Link to="/login">Sign in</Link>
-      </p>
-    </div>
+    </AuthShell>
   )
 }

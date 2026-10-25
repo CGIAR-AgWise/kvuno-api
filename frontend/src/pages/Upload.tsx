@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { TusUpload } from '../lib/tus'
 import {
   ApiError,
   TUS_ENDPOINT,
+  UPLOADS_CHANGED,
   discardUpload,
   fetchDBColumns,
   fetchUpload,
@@ -12,7 +13,10 @@ import {
   processUpload,
 } from '../api'
 import type { UploadRecord } from '../api'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
+import StatusBadge, { TONE_BAR } from '../components/StatusBadge'
+import type { Tone } from '../components/StatusBadge'
 
 /**
  * Upload page — tus resumable uploads, server-side inspection, column mapping.
@@ -30,7 +34,17 @@ import { useToast } from '../context/ToastContext'
  *    the selects is exactly what will be sent.
  * 4. Unfinished uploads are listed from the server on load, so a reload never
  *    loses a file that is waiting to be mapped.
+ * 5. Files waiting for a mapping are listed under "Awaiting mapping" — the
+ *    user's own uploads and data-folder files the default mapping could not
+ *    import (held by the scan, shared by everyone). A row opens its mapping
+ *    when clicked; `?map=<id>` opens one directly. Only opened files are
+ *    processed, so nothing is sent with a mapping nobody looked at.
  */
+
+/** Tell the sidebar badge the number of files awaiting mapping may have changed. */
+function uploadsChanged() {
+  window.dispatchEvent(new Event(UPLOADS_CHANGED))
+}
 
 const CHUNK_SIZE = 5 * 1024 * 1024
 const RETRY_DELAYS = [0, 1000, 3000, 5000, 10000, 20000, 30000]
@@ -79,28 +93,92 @@ function formatBytes(bytes: number): string {
   return (bytes / 1024 / 1024).toFixed(1) + ' MB'
 }
 
-function statusBadge(item: Item): { label: string; tone: string } {
+function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
   switch (item.status) {
     case 'sending':
-      return { label: 'Uploading', tone: 'primary' }
+      return { label: 'Uploading', tone: 'info' }
     case 'paused':
       return { label: 'Incomplete', tone: 'warning' }
     case 'receiving':
     case 'received':
     case 'inspecting':
-      return { label: 'Reading file…', tone: 'info' }
+      return { label: 'Reading file…', tone: 'info', icon: 'bi-hourglass-split' }
     case 'ready':
       return { label: 'Ready to map', tone: 'success' }
     case 'failed':
       return { label: 'Failed', tone: 'danger' }
     case 'submitted':
-      return { label: 'Submitted', tone: 'secondary' }
+      return { label: 'Submitted', tone: 'neutral', icon: 'bi-send-check' }
+    case 'processing':
+      // Listed by GET /ui/uploads since processing moved into the API; without
+      // this case the badge was undefined and the page crashed on reload.
+      return { label: 'Processing', tone: 'info' }
   }
+}
+
+function formatDuration(seconds: number): string {
+  const s = Math.round(seconds)
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + String(s % 60).padStart(2, '0') + 's'
+}
+
+/**
+ * Where the server's inspection has got to. An RDS is converted first: the
+ * read cannot be measured (pyreadr reads the whole file in one call), so it
+ * shows how long it has been reading; the Parquet write counts rows.
+ */
+function InspectionProgress({ progress }: { progress: UploadRecord['progress'] }) {
+  if (progress?.stage === 'writing' && progress.total > 0) {
+    const pct = Math.min(100, Math.round((progress.done / progress.total) * 100))
+    return (
+      <>
+        <div
+          className="progress mb-1"
+          role="progressbar"
+          aria-label="Conversion progress"
+          aria-valuenow={pct}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div className="progress-bar" style={{ width: pct + '%', backgroundColor: TONE_BAR.info }} />
+        </div>
+        <p className="small text-muted mb-0">
+          Converting to Parquet: {progress.done.toLocaleString()} of {progress.total.toLocaleString()} rows
+          written ({formatDuration(progress.elapsed)}).
+        </p>
+      </>
+    )
+  }
+  const text =
+    progress?.stage === 'reading'
+      ? 'Converting to Parquet: reading the R file (' +
+        formatDuration(progress.elapsed) +
+        '). Large RDS files take a while; there is no way to measure this step.'
+      : progress?.stage === 'writing'
+        ? 'Converting to Parquet: writing…'
+        : progress?.stage === 'preview'
+        ? 'Building the preview…'
+        : progress?.stage === 'checksum'
+          ? 'Checking whether this file was imported before…'
+          : 'Reading the file…'
+  return (
+    <p className="small text-muted mb-0" role="status">
+      <span className="spinner-border spinner-border-sm me-2" aria-hidden="true" />
+      {text}
+    </p>
+  )
 }
 
 export default function Upload() {
   const toast = useToast()
   const navigate = useNavigate()
+  const { isAdmin } = useAuth()
+  const [searchParams] = useSearchParams()
+  // Ready files whose mapping is open. A file uploaded on this visit opens by
+  // itself once read; ones listed from the server wait for a click.
+  const [open, setOpen] = useState<Set<string>>(() => {
+    const id = searchParams.get('map')
+    return new Set(id ? [id] : [])
+  })
   const [dbColumns, setDbColumns] = useState<ColumnOption[]>([SKIP])
   const [maxSize, setMaxSize] = useState<number | null>(null)
   const [items, setItems] = useState<Item[]>([])
@@ -114,6 +192,15 @@ export default function Upload() {
   const patch = useCallback((key: string, change: Partial<Item>) => {
     setItems((current) => current.map((item) => (item.key === key ? { ...item, ...change } : item)))
   }, [])
+
+  function toggle(id: string) {
+    setOpen((current) => {
+      const next = new Set(current)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   // Columns, the server's size limit, and anything left from a previous visit.
   useEffect(() => {
@@ -156,6 +243,11 @@ export default function Upload() {
       for (const id of waitingIds.split(',')) {
         fetchUpload(id, controller.signal)
           .then((record) => {
+            if (record.status === 'ready') {
+              // Uploaded on this visit (it was being polled): open its mapping.
+              setOpen((current) => new Set(current).add(id))
+              uploadsChanged()
+            }
             setItems((current) =>
               current.map((item) =>
                 item.id === id
@@ -285,12 +377,15 @@ export default function Upload() {
       }
     }
     setItems((current) => current.filter((i) => i.key !== item.key))
+    uploadsChanged()
   }
 
   const ready = items.filter((i) => i.status === 'ready' && i.id)
+  const active = items.filter((i) => !(i.status === 'ready' && i.id))
+  const opened = ready.filter((i) => open.has(i.id as string))
   // A fully ingested duplicate is a no-op for the worker, so it is not queued.
-  const queue = ready.filter((i) => i.record?.duplicate?.status !== 'processed')
-  const skipped = ready.length - queue.length
+  const queue = opened.filter((i) => i.record?.duplicate?.status !== 'processed')
+  const skipped = opened.length - queue.length
 
   async function processAll() {
     if (queue.length === 0) return
@@ -312,6 +407,7 @@ export default function Upload() {
       }
     }
     setSubmitting(false)
+    uploadsChanged()
     if (problems.length) setError(problems.join('\n'))
     if (queued > 0) {
       toast.push(queued + ' file(s) sent for processing.', 'success')
@@ -323,7 +419,7 @@ export default function Upload() {
   }
 
   return (
-    <div className="py-3" style={{ maxWidth: '60rem' }}>
+    <div className="pb-3">
       <div
         className={'kvuno-card p-5 text-center mb-3' + (dragging ? ' border-primary' : '')}
         style={{ borderStyle: 'dashed', cursor: 'pointer' }}
@@ -367,19 +463,49 @@ export default function Upload() {
         </div>
       )}
 
-      {items.map((item) => {
+      {[...active, ...ready].map((item, index) => {
         const badge = statusBadge(item)
         const percent = item.size ? Math.min(100, Math.round((item.sent / item.size) * 100)) : 0
         const record = item.record
+        const isReady = item.status === 'ready' && item.id !== null
+        const isOpen = isReady && open.has(item.id as string)
+        const fromFolder = record?.source === 'folder'
         return (
-          <div key={item.key} className="kvuno-card p-3 mb-3">
-            <div className="d-flex justify-content-between align-items-center gap-2 mb-2">
-              <h2 className="h6 mb-0 kvuno-truncate" title={item.name}>
-                {item.name}
-              </h2>
+          <Fragment key={item.key}>
+          {index === active.length && (
+            <h2 className="h6 mt-4 mb-2">
+              Awaiting mapping <span className="text-muted fw-normal">({ready.length})</span>
+            </h2>
+          )}
+          <div className="kvuno-card p-3 mb-3">
+            <div className={'d-flex justify-content-between align-items-center gap-2' + (isReady && !isOpen ? '' : ' mb-2')}>
+              {isReady ? (
+                <button
+                  type="button"
+                  className="btn btn-link p-0 text-reset text-decoration-none text-start d-flex align-items-center gap-2 kvuno-truncate"
+                  onClick={() => toggle(item.id as string)}
+                  aria-expanded={isOpen}
+                  title={item.name}
+                >
+                  <i className={'bi ' + (isOpen ? 'bi-chevron-down' : 'bi-chevron-right')} aria-hidden="true" />
+                  <span className="kvuno-truncate">
+                    <span className="h6 mb-0 d-block kvuno-truncate">{item.name}</span>
+                    <span className="small text-muted">
+                      {fromFolder ? 'Data folder' : 'Upload'}
+                      {record?.total_rows != null ? ' · ' + record.total_rows.toLocaleString() + ' rows' : ''}
+                    </span>
+                  </span>
+                </button>
+              ) : (
+                <h3 className="h6 mb-0 kvuno-truncate" title={item.name}>
+                  {item.name}
+                </h3>
+              )}
               <div className="d-flex align-items-center gap-2 flex-shrink-0">
-                <span className={'badge text-bg-' + badge.tone}>{badge.label}</span>
-                {item.status !== 'submitted' && (
+                <StatusBadge tone={badge.tone} label={badge.label} icon={badge.icon} />
+                {/* The server refuses to discard once submitted (409), and a
+                    data-folder file is an administrator's to remove (403). */}
+                {item.status !== 'submitted' && item.status !== 'processing' && (!fromFolder || isAdmin) && (
                   <button
                     className="btn btn-sm btn-outline-secondary"
                     onClick={() => void discard(item)}
@@ -412,18 +538,21 @@ export default function Upload() {
             )}
 
             {(item.status === 'received' || item.status === 'inspecting') && (
-              <p className="small text-muted mb-0">
-                <span className="spinner-border spinner-border-sm me-2" aria-hidden="true" />
-                Reading the file — large RDS files take a while to convert.
-              </p>
+              <InspectionProgress progress={record?.progress ?? null} />
             )}
 
             {item.error && item.status !== 'ready' && (
               <p className="small text-danger mb-0 mt-1">{item.error}</p>
             )}
 
-            {item.status === 'ready' && record && (
+            {isOpen && record && (
               <>
+                {fromFolder && (
+                  <p className="small text-muted mb-2">
+                    Found in the data folder. The default mapping could not find its coordinates, so it
+                    was held here instead of being imported.
+                  </p>
+                )}
                 {record.duplicate && (
                   <div className="alert alert-secondary py-2 px-3 mb-2 small">
                     <div className="fw-semibold">
@@ -490,6 +619,7 @@ export default function Upload() {
               </>
             )}
           </div>
+          </Fragment>
         )
       })}
 
@@ -502,6 +632,9 @@ export default function Upload() {
           >
             {submitting ? 'Submitting…' : 'Process ' + queue.length + ' file(s)'}
           </button>
+          {opened.length === 0 && (
+            <span className="small text-muted">Open a file to check its mapping.</span>
+          )}
           <Link className="btn btn-outline-secondary" to="/jobs">
             Go to jobs
           </Link>

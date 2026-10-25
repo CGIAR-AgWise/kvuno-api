@@ -150,7 +150,7 @@ class TestTokenExpiry:
 
     def test_created_tokens_get_naive_utc_expiry(self, client, monkeypatch):
         import bcrypt
-        monkeypatch.setattr("app.api.user.TOKEN_TTL_DAYS", 30)
+        monkeypatch.setenv("TOKEN_TTL_DAYS", "30")
         pw_hash = bcrypt.hashpw(b"correct-horse", bcrypt.gensalt(4)).decode()
         session = MagicMock()
         session.query.return_value.filter.return_value.first.return_value = User(
@@ -207,35 +207,28 @@ def _register(client, email, password="longenough1"):
     return resp, session
 
 
-class TestRegistrationAllowList:
-    def test_unset_disables_registration(self, client, monkeypatch):
-        monkeypatch.delenv("REGISTRATION_ALLOWED_DOMAINS", raising=False)
-        resp, session = _register(client, "a@cgiar.org")
-        assert resp.status_code == 403
-        assert "disabled" in resp.get_json()["msg"]
-        session.add.assert_not_called()
-
-    def test_empty_disables_registration(self, client, monkeypatch):
-        monkeypatch.setenv("REGISTRATION_ALLOWED_DOMAINS", " , ")
-        resp, _ = _register(client, "a@cgiar.org")
-        assert resp.status_code == 403
-
-    def test_allowed_domain_registers(self, client, monkeypatch):
-        monkeypatch.setenv("REGISTRATION_ALLOWED_DOMAINS", "cgiar.org, IITA.org")
-        resp, session = _register(client, "Someone@CGIAR.org")
-        assert resp.status_code == 201
-        session.add.assert_called_once()
-        resp, _ = _register(client, "x@iita.org")
-        assert resp.status_code == 201
-
-    def test_disallowed_domain_is_403(self, client, monkeypatch):
-        monkeypatch.setenv("REGISTRATION_ALLOWED_DOMAINS", "cgiar.org")
-        for email in ("a@gmail.com", "a@sub.cgiar.org", "a@cgiar.org.evil.com",
-                      "a@notcgiar.org", "cgiar.org", "@cgiar.org"):
+class TestRegistrationIsOpenButPending:
+    # Registration used to be gated by an email-domain allow-list
+    # (REGISTRATION_ALLOWED_DOMAINS). Administrator approval replaced it: any
+    # address may register, and the account starts pending.
+    # tests/test_user_approval.py covers the approval itself.
+    def test_any_domain_registers_as_pending(self, client):
+        for email in ("a@gmail.com", "Someone@CGIAR.org", "x@sub.iita.org"):
             resp, session = _register(client, email)
-            assert resp.status_code == 403, email
-            session.add.assert_not_called()
+            assert resp.status_code == 201, email
+            assert resp.get_json()["status"] == "pending"
+            assert session.add.call_args.args[0].status == "pending"
 
+    def test_old_allow_list_setting_is_ignored(self, client, monkeypatch):
+        monkeypatch.setenv("REGISTRATION_ALLOWED_DOMAINS", "cgiar.org")
+        resp, _ = _register(client, "a@gmail.com")
+        assert resp.status_code == 201
+
+    def test_not_an_email_address_is_400(self, client):
+        for email in ("cgiar.org", "@cgiar.org"):
+            resp, session = _register(client, email)
+            assert resp.status_code == 400, email
+            session.add.assert_not_called()
 
 # ── bcrypt 72-byte limit ───────────────────────────────────────
 
@@ -256,7 +249,6 @@ class TestPasswordByteLimit:
         assert RegisterRequest(username="abc", email="a@b.c", password="a" * 72)
 
     def test_register_endpoint_rejects_long_password(self, client, monkeypatch):
-        monkeypatch.setenv("REGISTRATION_ALLOWED_DOMAINS", "cgiar.org")
         resp, session = _register(client, "a@cgiar.org", password="a" * 100)
         assert 400 <= resp.status_code < 500
         session.add.assert_not_called()

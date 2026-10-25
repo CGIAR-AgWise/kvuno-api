@@ -66,8 +66,11 @@ class TestOverride:
             app = create_app()
         assert isinstance(app.wsgi_app, ProxyFix) is expected
 
-    def test_non_numeric_is_ignored_rather_than_crashing(self):
+    def test_non_numeric_is_a_configuration_error(self):
+        # It used to be ignored silently, leaving the app on a setting the
+        # operator did not choose. Every invalid setting now stops startup.
         from app import create_app
+        from app.config import ConfigurationError
         with patch.dict(os.environ, {'PROXY_FIX_HOPS': 'nonsense'}):
-            app = create_app()
-        assert not isinstance(app.wsgi_app, ProxyFix)
+            with pytest.raises(ConfigurationError, match='PROXY_FIX_HOPS'):
+                create_app()

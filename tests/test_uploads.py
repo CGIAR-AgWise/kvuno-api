@@ -13,6 +13,7 @@ Each test names the failure of the resumable.js flow it replaced:
   `{}` and wiped the mapping — the server now seeds and keeps the mapping.
 """
 import datetime
+import threading
 import types
 
 import pyarrow as pa
@@ -27,15 +28,24 @@ STRANGER = types.SimpleNamespace(id=2)
 TUS = {'Tus-Resumable': '1.0.0'}
 
 
+_RealThread = threading.Thread
+
+
 class _InlineThread:
-    """Run inspections synchronously; skip the heartbeat, which loops forever."""
+    """Run inspections synchronously; skip the heartbeat, which loops forever.
+
+    The patch replaces threading.Thread everywhere, so any other thread (the
+    RDS converter's stdout reader) is started for real.
+    """
 
     def __init__(self, target=None, args=(), name=None, daemon=None):
-        self.target, self.args, self.name = target, args, name
+        self.target, self.args, self.name, self.daemon = target, args, name, daemon
 
     def start(self):
         if self.name and self.name.startswith('inspect-'):
             self.target(*self.args)
+        elif self.name and not self.name.startswith('heartbeat'):
+            _RealThread(target=self.target, args=self.args, name=self.name, daemon=True).start()
 
 
 @pytest.fixture
@@ -44,9 +54,10 @@ def env(tmp_path, monkeypatch):
     from app.models.kvuno import Base, FileImport, Upload
     from app.routes.main import register_app_routes
 
-    monkeypatch.setattr(service, 'UPLOAD_ROOT', str(tmp_path / 'uploads'))
-    monkeypatch.setattr('app.routes.uploads.MAX_FILE_SIZE', 1024 * 1024)
-    monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', False)
+    # Settings are read per call, so the environment is all a test changes.
+    monkeypatch.setenv('HOUSEKEEPING_DATA_DIR', str(tmp_path))  # uploads in tmp/uploads
+    monkeypatch.setenv('MAX_FILE_SIZE_MB', '1')
+    monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'false')
     monkeypatch.setattr(service.threading, 'Thread', _InlineThread)
 
     current = {'user': OWNER}
@@ -148,6 +159,18 @@ class TestTusProtocol:
         assert _create(env.client, 10, name='notes.csv').status_code == 415
         assert _create(env.client, 0).status_code == 400
 
+    def test_unwritable_storage_is_a_clear_503_not_a_500(self, env, monkeypatch):
+        # Production: a root-owned data volume while the app runs as uid 1000
+        # raised PermissionError from makedirs and returned a bare 500.
+        def denied(*args, **kwargs):
+            raise PermissionError(13, 'Permission denied', 'static/data/uploads')
+
+        monkeypatch.setattr(service.os, 'makedirs', denied)
+        res = _create(env.client, 10)
+        assert res.status_code == 503
+        assert 'not writable' in res.get_json()['error']
+        assert env.session.query(service.Upload).count() == 0
+
     def test_ids_are_server_issued_and_strict(self, env):
         location = _create(env.client, 10).headers['Location']
         assert service.valid_id(location.rsplit('/', 1)[1])
@@ -172,6 +195,10 @@ class TestInspection:
 
     def test_unreadable_file_fails_with_a_reason(self, env):
         upload_id = _upload(env, b'not a parquet file')
+        # Inspection committed through its own session; requests here share the
+        # fixture's, which still holds the object as the PATCH left it. A real
+        # request starts with a fresh session.
+        env.session.expire_all()
         body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
         assert body['status'] == 'failed'
         assert body['error'].startswith('Could not read the file')
@@ -215,47 +242,38 @@ class TestSubmission:
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         body = resp.get_json()
-        assert body['queued'] is False
+        assert body['queued'] is True
         state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
-        assert state['status'] == 'ready'
+        assert state['status'] == 'processing'
         assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_enqueues_with_the_users_exact_mapping(self, env, monkeypatch):
-        calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
-        monkeypatch.setattr('app.services.housekeeper.process_file_async',
-                            lambda **kw: calls.append(kw) or True)
-
+    def test_enqueues_with_the_users_exact_mapping(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat', 'Variety': ''}})
         assert resp.get_json()['queued'] is True
-        # 'Variety' was set to skip, so it must not be sent at all.
-        assert calls[0]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
-        assert calls[0]['original_filename'] == 'trial.parquet'
+        state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert state['status'] == 'processing'
+        # 'Variety' was set to skip, so it must not be in the saved mapping.
+        assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_retry_reuses_the_saved_mapping(self, env, monkeypatch):
-        calls = []
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
-        monkeypatch.setattr('app.services.housekeeper.process_file_async',
-                            lambda **kw: calls.append(kw) or True)
-
+    def test_retry_reuses_the_saved_mapping(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         env.client.post(f'/ui/uploads/{upload_id}/process',
                         json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         # The Jobs page's Retry sends only the stored file name.
         resp = env.client.post('/ui/process', json={'file': f'{upload_id}.parquet'})
         assert resp.status_code == 200
-        assert calls[1]['column_map'] == {'lon': 'lon', 'lat': 'lat'}
+        state = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert state['status'] == 'processing'
+        assert state['column_map'] == {'lon': 'lon', 'lat': 'lat'}
 
-    def test_unreachable_queue_is_reported_not_hidden(self, env, monkeypatch):
-        monkeypatch.setattr('app.config.HOUSEKEEPING_ENABLED', True)
-        monkeypatch.setattr('app.services.housekeeper.process_file_async', lambda **kw: False)
+    def test_unreachable_queue_is_reported_not_hidden(self, env):
         upload_id = _upload(env, _parquet_bytes(env.tmp))
         resp = env.client.post(f'/ui/uploads/{upload_id}/process',
                                json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
-        assert resp.status_code == 503
-        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'
+        assert resp.status_code == 200
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'processing'
 
     @pytest.mark.parametrize('column_map, message', [
         ({'Variety': 'variety'}, 'coordinates are required'),
@@ -293,3 +311,116 @@ class TestLifecycle:
         assert service.cleanup_abandoned(7 * 86400) == 1
         assert (env.tmp / 'uploads' / fresh).exists()
         assert not (env.tmp / 'uploads' / old).exists()
+
+
+def _folder_file(env, name='field.parquet', columns=None):
+    """A data-folder file whose columns the default mapping cannot use."""
+    path = env.tmp / name
+    pq.write_table(pa.table(columns or {'Longitude': [36.8], 'Latitude': [-1.3], 'Variety': ['a']}), path)
+    return str(path)
+
+
+class TestAwaitingMapping:
+    """Data-folder files without lat/lon used to be "imported" with nothing in them."""
+
+    def test_needs_mapping_only_when_defaults_find_no_coordinates(self, env):
+        from app.services.housekeeper import needs_mapping
+
+        assert needs_mapping(_folder_file(env))
+        ok = _folder_file(env, 'ok.parquet', {'lat': [1.0], 'lon': [2.0]})
+        assert not needs_mapping(ok)
+        # RDS would have to be read whole; process_file handles it as before.
+        rds = env.tmp / 'x.rds'
+        rds.write_bytes(b'not read')
+        assert not needs_mapping(str(rds))
+
+    def test_scan_holds_the_file_as_a_shared_upload(self, env):
+        from app.services.housekeeper import hold_unmapped
+
+        held = _folder_file(env)
+        ok = _folder_file(env, 'ok.parquet', {'lat': [1.0], 'lon': [2.0]})
+        assert hold_unmapped([held, ok]) == [ok]
+
+        import os
+        assert not os.path.exists(held)  # out of the data-folder root
+        env.current['user'] = STRANGER  # nobody owns it; everyone can map it
+        uploads = env.client.get('/ui/uploads').get_json()['uploads']
+        assert [(u['name'], u['source'], u['status']) for u in uploads] == [
+            ('field.parquet', 'folder', 'ready')]
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 1}
+        assert env.client.get(f"/ui/uploads/{uploads[0]['id']}").status_code == 200
+
+    def test_dry_run_and_disabled_hold_nothing(self, env, monkeypatch):
+        from app.models.kvuno import Upload
+        from app.services.housekeeper import hold_unmapped
+
+        path = _folder_file(env)
+        assert hold_unmapped([path], dry_run=True) == []
+        monkeypatch.setenv('INGEST_HOLD_UNMAPPED', 'false')
+        assert hold_unmapped([path]) == [path]
+        assert env.session.query(Upload).count() == 0
+
+    def test_awaiting_count_excludes_other_users_uploads(self, env):
+        _upload(env, _parquet_bytes(env.tmp))
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 1}
+        env.current['user'] = STRANGER
+        assert env.client.get('/ui/uploads/awaiting').get_json() == {'count': 0}
+
+    def test_only_an_administrator_discards_a_folder_file(self, env, monkeypatch):
+        from app.services.housekeeper import hold_unmapped
+
+        hold_unmapped([_folder_file(env)])
+        upload_id = env.client.get('/ui/uploads').get_json()['uploads'][0]['id']
+        monkeypatch.setattr('app.routes.uploads.is_admin', lambda user: False)
+        assert env.client.delete(f'/ui/uploads/{upload_id}').status_code == 403
+        monkeypatch.setattr('app.routes.uploads.is_admin', lambda user: True)
+        assert env.client.delete(f'/ui/uploads/{upload_id}').status_code == 204
+
+    def test_cleanup_never_removes_folder_files(self, env):
+        from app.models.kvuno import Upload
+        from app.services.housekeeper import hold_unmapped
+
+        hold_unmapped([_folder_file(env)])
+        upload = env.session.query(Upload).one()
+        upload.updated_at = datetime.datetime(2000, 1, 1)
+        env.session.commit()
+        assert service.cleanup_abandoned(7 * 86400) == 0
+
+    def test_duplicate_check_can_be_turned_off(self, env, monkeypatch):
+        monkeypatch.setenv('INGEST_DUPLICATE_CHECK', 'false')
+        assert service.describe_duplicate('unused', checksum='abc') is None
+
+
+class TestInspectionProgress:
+    """The Upload page showed "Reading the file…" for the whole of a long RDS conversion."""
+
+    def _inspecting(self, env):
+        from app.models.kvuno import Upload
+        upload_id = _create(env.client, 10).headers['Location'].rsplit('/', 1)[1]
+        env.session.get(Upload, upload_id).status = 'inspecting'
+        env.session.commit()
+        return upload_id
+
+    def _progress(self, env, upload_id):
+        env.session.expire_all()
+        return env.client.get(f'/ui/uploads/{upload_id}').get_json()['progress']
+
+    def test_stages_are_recorded_and_throttled(self, env):
+        upload_id = self._inspecting(env)
+        write = service._ProgressWriter(upload_id)
+        write('reading', 0, 0, 4.04)
+        assert self._progress(env, upload_id) == {'stage': 'reading', 'done': 0, 'total': 0, 'elapsed': 4.0}
+        write('reading', 0, 0, 5.0)  # same stage within PROGRESS_WRITE_SECONDS: skipped
+        assert self._progress(env, upload_id)['elapsed'] == 4.0
+        write('writing', 50, 100, 6.0)  # a new stage is always written
+        assert self._progress(env, upload_id) == {'stage': 'writing', 'done': 50, 'total': 100, 'elapsed': 6.0}
+
+    def test_an_rds_upload_ends_ready_with_no_progress_left(self, env):
+        import pandas as pd
+        import pyreadr
+
+        path = env.tmp / 'src.RDS'
+        pyreadr.write_rds(str(path), pd.DataFrame({'lat': [1.0], 'lon': [2.0]}))
+        upload_id = _upload(env, path.read_bytes(), name='trial.RDS')
+        body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert (body['status'], body['progress'], body['file']) == ('ready', None, f'{upload_id}.parquet')

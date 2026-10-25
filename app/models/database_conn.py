@@ -1,12 +1,7 @@
-import os
-
-from dotenv import load_dotenv
 from flask import Flask
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
-
-load_dotenv(verbose=True)
 
 
 class MyDb:
@@ -23,11 +18,20 @@ class MyDb:
     # init_app()'d to several apps, each getting its own engine and session
     # scope keyed by app context.
     db = SQLAlchemy()
-    db_url: str = os.getenv("DB_URL")
-    debug_db = os.getenv('DEBUG_DB', 'false').lower() == 'true'
+
+    # Every app (the API and the worker's own) gets these. Without
+    # pool_pre_ping a pooled connection that died while idle — database
+    # restart, idle timeout, network blip — was handed out as live; the first
+    # query failed, and reusing that session gave "Can't reconnect until
+    # invalid transaction is rolled back". pool_recycle retires connections
+    # before typical server/proxy idle timeouts close them.
+    ENGINE_OPTIONS = {'pool_pre_ping': True, 'pool_recycle': 1800}
 
     @classmethod
     def init_app(cls, app: Flask):
+        options = app.config.setdefault('SQLALCHEMY_ENGINE_OPTIONS', {})
+        for key, value in cls.ENGINE_OPTIONS.items():
+            options.setdefault(key, value)
         cls.db.init_app(app)
 
     @classmethod

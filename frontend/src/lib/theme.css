@@ -1,17 +1,773 @@
-/* A thin layer over Bootstrap 5. The old Jinja UI used a hand-rolled
-   "material"-ish look; these tokens keep the new app visually familiar
-   without carrying over the old stylesheets wholesale. */
+/* KVuno's look: Bootstrap 5 (CSS only; no Bootstrap JS) with AKILIMO's brand.
+
+   Colours and type are taken from akilimo.org: AKILIMO red #CE1A2B (its
+   headings and buttons), its dark slate #303744, its light background
+   #F3F5F7, Montserrat for the wordmark and titles, Open Sans for text. The
+   red square mark is AKILIMO's own loading mark. Otherwise deliberately
+   plain — a working tool for loading and checking data: hairline borders,
+   no textures, taglines or decorative icons. */
+
 :root {
-  --kvuno-bg: #f6f7f9;
-  --kvuno-border: #e3e6ea;
+  --kv-accent: #ce1a2b; /* AKILIMO red */
+  --kv-accent-dark: #a91523;
+  --kv-accent-rgb: 206, 26, 43;
+  --kv-slate: #303744; /* AKILIMO dark slate */
+  --kv-bg: #f3f5f7;
+  --kv-surface: #ffffff;
+  --kv-border: #dfe3e8;
+  --kv-ink: #262c37;
+  --kv-muted: #636a75; /* AKILIMO's #727883, darkened to pass AA on white */
+  --kv-hover: #eef1f4;
+
+  --kv-font-brand: 'Montserrat', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --kv-font-body: 'Open Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  --kv-sidebar-w: 14.5rem;
+  --kv-sidebar-w-collapsed: 3.75rem;
+
+  --bs-body-font-family: var(--kv-font-body);
+  --bs-body-color: var(--kv-ink);
+  --bs-body-bg: var(--kv-bg);
+  --bs-secondary-color: var(--kv-muted);
+  --bs-border-color: var(--kv-border);
+  --bs-border-radius: 0.375rem;
+  --bs-border-radius-sm: 0.25rem;
+  --bs-border-radius-lg: 0.5rem;
+  --bs-primary: var(--kv-accent);
+  --bs-primary-rgb: var(--kv-accent-rgb);
+  --bs-link-color: var(--kv-accent);
+  --bs-link-color-rgb: var(--kv-accent-rgb);
+  --bs-link-hover-color: var(--kv-accent-dark);
+  --bs-link-hover-color-rgb: 9, 74, 140;
+  --bs-focus-ring-color: rgba(var(--kv-accent-rgb), 0.3);
 }
 
 body {
-  background: var(--kvuno-bg);
+  background: var(--kv-bg);
   /* Last-resort guard against a sideways page scrollbar. `clip`, not
      `hidden`: it creates no scroll container, so position: sticky (the map,
-     table headers) keeps working. Layouts below are built to fit anyway. */
+     table headers, the sidebar) keeps working. Layouts below fit anyway. */
   overflow-x: clip;
+}
+
+/* ── Bootstrap components in the accent ──────────────────────── */
+
+.btn-primary {
+  --bs-btn-bg: var(--kv-accent);
+  --bs-btn-border-color: var(--kv-accent);
+  --bs-btn-hover-bg: var(--kv-accent-dark);
+  --bs-btn-hover-border-color: var(--kv-accent-dark);
+  --bs-btn-active-bg: var(--kv-accent-dark);
+  --bs-btn-active-border-color: var(--kv-accent-dark);
+  --bs-btn-disabled-bg: var(--kv-accent);
+  --bs-btn-disabled-border-color: var(--kv-accent);
+  --bs-btn-focus-shadow-rgb: var(--kv-accent-rgb);
+}
+
+.btn-outline-primary {
+  --bs-btn-color: var(--kv-accent);
+  --bs-btn-border-color: var(--kv-accent);
+  --bs-btn-hover-bg: var(--kv-accent);
+  --bs-btn-hover-border-color: var(--kv-accent);
+  --bs-btn-active-bg: var(--kv-accent-dark);
+  --bs-btn-active-border-color: var(--kv-accent-dark);
+  --bs-btn-disabled-color: var(--kv-accent);
+  --bs-btn-disabled-border-color: var(--kv-accent);
+  --bs-btn-focus-shadow-rgb: var(--kv-accent-rgb);
+}
+
+.btn-outline-secondary {
+  --bs-btn-color: var(--kv-ink);
+  --bs-btn-border-color: var(--kv-border);
+  --bs-btn-hover-color: var(--kv-ink);
+  --bs-btn-hover-bg: var(--kv-hover);
+  --bs-btn-hover-border-color: #cdd2d8;
+  --bs-btn-active-color: var(--kv-ink);
+  --bs-btn-active-bg: #e4e7eb;
+  --bs-btn-active-border-color: #cdd2d8;
+  background: var(--kv-surface);
+}
+
+/* Bootstrap fills inputs with --bs-body-bg, which is the page grey here. */
+.form-control,
+.form-select {
+  background-color: var(--kv-surface);
+}
+
+.form-control:focus,
+.form-select:focus,
+.form-check-input:focus {
+  border-color: rgba(var(--kv-accent-rgb), 0.6);
+  box-shadow: 0 0 0 0.2rem rgba(var(--kv-accent-rgb), 0.18);
+}
+
+.form-check-input:checked {
+  background-color: var(--kv-accent);
+  border-color: var(--kv-accent);
+}
+
+.nav-pills {
+  --bs-nav-pills-link-active-bg: var(--kv-accent);
+}
+
+.pagination {
+  --bs-pagination-color: var(--kv-accent);
+  --bs-pagination-hover-color: var(--kv-accent-dark);
+  --bs-pagination-focus-color: var(--kv-accent-dark);
+  --bs-pagination-focus-box-shadow: 0 0 0 0.2rem rgba(var(--kv-accent-rgb), 0.18);
+  --bs-pagination-active-bg: var(--kv-accent);
+  --bs-pagination-active-border-color: var(--kv-accent);
+}
+
+.progress {
+  --bs-progress-bar-bg: var(--kv-accent);
+}
+
+.table {
+  --bs-table-hover-bg: #f3f5f8;
+}
+
+.table > thead.table-light th {
+  --bs-table-bg: #f8f9fa;
+  --bs-table-color: var(--kv-muted);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+/* ── The shell: sidebar + main ───────────────────────────────── */
+
+.kv-shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.kv-skip {
+  position: absolute;
+  left: 0.5rem;
+  top: -3rem;
+  z-index: 1100;
+  padding: 0.5rem 0.75rem;
+  background: var(--kv-surface);
+  border: 1px solid var(--kv-border);
+  color: var(--kv-accent);
+}
+
+.kv-skip:focus {
+  top: 0.5rem;
+}
+
+/* The sidebar is AKILIMO slate; the current page carries the red. */
+.kv-sidebar {
+  position: sticky;
+  top: 0;
+  flex: 0 0 var(--kv-sidebar-w);
+  width: var(--kv-sidebar-w);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0.85rem 0.5rem 0.75rem;
+  background: var(--kv-slate);
+  color: rgba(255, 255, 255, 0.8);
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 1040;
+}
+
+/* Wordmark: AKILIMO's red square mark and the name in Montserrat. */
+.kv-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.2rem 0.6rem 1rem;
+  color: #fff;
+  font-family: var(--kv-font-brand);
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+
+.kv-brand:hover {
+  color: #fff;
+}
+
+.kv-mark {
+  flex: none;
+  width: 0.8rem;
+  height: 0.8rem;
+  border-radius: 2px;
+  background: var(--kv-accent);
+}
+
+.kv-nav {
+  flex: 1 1 auto;
+}
+
+.kv-nav-group + .kv-nav-group {
+  margin-top: 0.85rem;
+}
+
+.kv-nav-heading {
+  padding: 0 0.6rem 0.3rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.kv-nav-link {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.42rem 0.6rem;
+  margin-bottom: 1px;
+  border: 0;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 0.9rem;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.kv-nav-link > .bi:first-child {
+  flex: none;
+  width: 1.1rem;
+  color: rgba(255, 255, 255, 0.6);
+  text-align: center;
+}
+
+.kv-nav-link:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.kv-nav-link.active {
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-weight: 600;
+}
+
+.kv-nav-link.active::before {
+  content: '';
+  position: absolute;
+  left: -0.5rem;
+  top: 0.35rem;
+  bottom: 0.35rem;
+  width: 3px;
+  background: var(--kv-accent);
+}
+
+.kv-nav-link.active > .bi:first-child {
+  color: #fff;
+}
+
+.kv-nav-link:focus-visible,
+.kv-collapse:focus-visible,
+.kv-menu:focus-visible,
+.kv-brand:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 1px;
+}
+
+.kv-badge {
+  margin-left: auto;
+  padding: 0 0.4rem;
+  border-radius: 0.25rem;
+  background: var(--kv-accent);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.kv-ext {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.kv-sidebar-foot {
+  padding-top: 0.5rem;
+  margin-top: 0.5rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.kv-user {
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0.6rem 0.4rem;
+  line-height: 1.25;
+  min-width: 0;
+}
+
+.kv-user-name {
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kv-user-role {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.75rem;
+}
+
+/* Sign out: an outlined button, plainly visible on the slate. */
+.kv-signout {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 0.375rem;
+  background: transparent;
+  color: #fff;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.kv-signout:hover {
+  background: #fff;
+  border-color: #fff;
+  color: var(--kv-slate);
+}
+
+.kv-signout:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+/* Wordmark row: the collapse toggle sits at its right. */
+.kv-brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.kv-brand-row .kv-brand {
+  padding-bottom: 0.2rem;
+  min-width: 0;
+}
+
+.kv-collapse {
+  display: none;
+  flex: none;
+  place-items: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 0.375rem;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 1rem;
+}
+
+.kv-collapse:hover {
+  color: var(--kv-slate);
+  background: #fff;
+  border-color: #fff;
+}
+
+.kv-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.kv-topbar {
+  display: none;
+}
+
+.kv-content {
+  flex: 1 1 auto;
+  padding: 1.5rem clamp(1rem, 3vw, 2.5rem) 1rem;
+  outline: none;
+}
+
+/* Content is a centred column; the width suits the page (set per route in
+   Layout.tsx): forms read best narrow, tables and the map need room. */
+.kv-container {
+  width: 100%;
+  margin-inline: auto;
+}
+
+.kv-container-narrow {
+  max-width: 60rem;
+}
+
+.kv-container-medium {
+  max-width: 72rem;
+}
+
+.kv-container-wide {
+  max-width: 96rem;
+}
+
+.kv-page-head {
+  margin-bottom: 1rem;
+}
+
+.kv-title {
+  font-family: var(--kv-font-brand);
+  font-size: 1.375rem;
+  font-weight: 700;
+  color: var(--kv-slate);
+  margin: 0;
+}
+
+.kv-note {
+  margin: 0.25rem 0 0;
+  max-width: 48rem;
+  color: var(--kv-muted);
+  font-size: 0.9rem;
+}
+
+.kv-footer {
+  padding: 1rem clamp(1rem, 3vw, 2.5rem) 1.25rem;
+  color: var(--kv-muted);
+  font-size: 0.8rem;
+}
+
+/* Desktop: the sidebar can be narrowed to icons. */
+@media (min-width: 992px) {
+  .kv-collapse {
+    display: grid;
+  }
+
+  /* Collapsed: the mark, and the toggle under it. */
+  .kv-shell.is-collapsed .kv-brand-row {
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .kv-shell.is-collapsed .kv-signout {
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .kv-shell.is-collapsed .kv-sidebar {
+    flex-basis: var(--kv-sidebar-w-collapsed);
+    width: var(--kv-sidebar-w-collapsed);
+  }
+
+  .kv-shell.is-collapsed .kv-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .kv-shell.is-collapsed .kv-brand,
+  .kv-shell.is-collapsed .kv-nav-link {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+
+  .kv-shell.is-collapsed .kv-nav-heading {
+    height: 1px;
+    padding: 0;
+    margin: 0 0.5rem 0.5rem;
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  .kv-shell.is-collapsed .kv-badge {
+    position: absolute;
+    margin-left: 1.1rem;
+    margin-top: -0.9rem;
+    padding: 0 0.25rem;
+    font-size: 0.65rem;
+  }
+}
+
+/* Phones and tablets: the sidebar becomes a drawer behind a top bar. */
+@media (max-width: 991.98px) {
+  .kv-sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    transform: translateX(-100%);
+    transition: transform 0.15s ease;
+  }
+
+  .kv-sidebar.is-open {
+    transform: translateX(0);
+    box-shadow: 0 0 1.5rem rgba(0, 0, 0, 0.15);
+  }
+
+  .kv-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 1030;
+    background: rgba(28, 32, 36, 0.35);
+  }
+
+  .kv-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 1020;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 1rem;
+    background: var(--kv-slate);
+    color: #fff;
+  }
+
+  .kv-topbar-brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--kv-font-brand);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .kv-menu {
+    display: grid;
+    place-items: center;
+    width: 2.25rem;
+    height: 2.25rem;
+    border: 0;
+    border-radius: 0.375rem;
+    background: rgba(255, 255, 255, 0.1);
+    color: #fff;
+    font-size: 1.25rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kv-sidebar {
+    transition: none;
+  }
+}
+
+/* ── Sign-in and registration ────────────────────────────────── */
+
+.kv-auth {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.kv-auth-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem clamp(1rem, 3vw, 2rem);
+  background: var(--kv-surface);
+  border-bottom: 3px solid var(--kv-accent);
+}
+
+.kv-auth-bar .kv-brand {
+  padding: 0;
+  color: var(--kv-slate);
+}
+
+.kv-auth-bar a:not(.kv-brand) {
+  font-size: 0.875rem;
+}
+
+.kv-auth-main {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: clamp(2rem, 8vh, 5rem) 1rem 2rem;
+}
+
+.kv-auth-box {
+  width: 100%;
+  max-width: 24rem;
+  padding: 1.75rem;
+  background: var(--kv-surface);
+  border: 1px solid var(--kv-border);
+  border-radius: 0.5rem;
+}
+
+.kv-auth-title {
+  font-family: var(--kv-font-brand);
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--kv-slate);
+  margin-bottom: 1.25rem;
+}
+
+.kv-auth-after {
+  max-width: 24rem;
+  margin: 1rem auto 0;
+  font-size: 0.875rem;
+  color: var(--kv-muted);
+  text-align: center;
+}
+
+.kv-auth-foot {
+  padding: 1rem;
+  color: var(--kv-muted);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+/* ── Shared pieces used by the pages ─────────────────────────── */
+
+/* Segmented filter: one choice of several, wraps on narrow screens rather
+   than running off the edge as a .btn-group did. */
+.kv-segment {
+  display: inline-flex;
+  flex-wrap: wrap;
+  border: 1px solid var(--kv-border);
+  border-radius: 0.375rem;
+  background: var(--kv-surface);
+  overflow: hidden;
+}
+
+.kv-segment > button {
+  padding: 0.25rem 0.65rem;
+  border: 0;
+  border-right: 1px solid var(--kv-border);
+  background: transparent;
+  color: var(--kv-ink);
+  font-size: 0.85rem;
+}
+
+.kv-segment > button:last-child {
+  border-right: 0;
+}
+
+.kv-segment > button:hover {
+  background: var(--kv-hover);
+}
+
+.kv-segment > button.active {
+  background: var(--kv-accent);
+  color: #fff;
+}
+
+.kv-segment > button:focus-visible {
+  outline: 2px solid var(--kv-accent);
+  outline-offset: -2px;
+}
+
+.kv-count {
+  margin-left: 0.3rem;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+/* Status badges (StatusBadge.tsx): a distinct hue and icon per tone, tinted
+   background, strong text. None uses the brand red — Processing used to
+   render red like Failed because Bootstrap's "primary" became AKILIMO red. */
+.kv-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.12rem 0.55rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.kv-status .bi {
+  font-size: 0.8em;
+}
+
+.kv-status-info {
+  color: #1d4ed8;
+  background: #eaf1ff;
+  border-color: #bcd0fb;
+}
+
+.kv-status-success {
+  color: #146c2e;
+  background: #e7f6ec;
+  border-color: #b5dfc3;
+}
+
+.kv-status-danger {
+  color: #b42318;
+  background: #fdecea;
+  border-color: #f4c0ba;
+}
+
+.kv-status-warning {
+  color: #8a4b00;
+  background: #fff4dc;
+  border-color: #f2d08a;
+}
+
+.kv-status-neutral {
+  color: #4b5563;
+  background: #f1f3f5;
+  border-color: #d6dae0;
+}
+
+/* Per-status counts in run summaries, in the badge colours. */
+.kv-count-info { color: #1d4ed8; }
+.kv-count-success { color: #146c2e; }
+.kv-count-danger { color: #b42318; }
+.kv-count-warning { color: #8a4b00; }
+
+/* Connection state of a live list: a dot and a word. */
+.kv-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--kv-muted);
+  white-space: nowrap;
+}
+
+.kv-live::before {
+  content: '';
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: #adb5bd;
+}
+
+.kv-live.is-live::before {
+  background: #198754;
+}
+
+/* Empty states: one line, and a way forward when there is one. */
+.kv-empty {
+  padding: 2.5rem 1rem;
+  text-align: center;
+  color: var(--kv-muted);
+}
+
+.kv-empty p {
+  margin-bottom: 0.75rem;
+}
+
+.kv-empty p:last-child {
+  margin-bottom: 0;
+}
+
+.kv-loading {
+  padding: 3rem 1rem;
+  text-align: center;
+  color: var(--kv-muted);
 }
 
 /* Tables fit their container instead of scrolling sideways.
@@ -55,8 +811,8 @@ body {
 }
 
 .kvuno-card {
-  background: #fff;
-  border: 1px solid var(--kvuno-border);
+  background: var(--kv-surface);
+  border: 1px solid var(--kv-border);
   border-radius: 0.5rem;
 }
 
@@ -83,6 +839,7 @@ body {
   height: min(60vh, 34rem);
   min-height: 18rem;
   border-radius: 0.375rem;
+  border: 1px solid var(--kv-border);
   overflow: hidden;
   background: #e9ecef;
 }
@@ -91,7 +848,7 @@ body {
   /* Sticky so the map stays visible while working down a long table. */
   .kvuno-map {
     position: sticky;
-    top: 0.5rem;
+    top: 1rem;
   }
 }
 
@@ -101,6 +858,7 @@ body {
   overflow-y: auto;
 }
 
+/* Counts and figures line up. */
 .kvuno-status {
   font-variant-numeric: tabular-nums;
 }

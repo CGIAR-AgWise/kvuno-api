@@ -1,13 +1,15 @@
+from typing import Optional
+
 from flask_openapi3 import Tag, APIBlueprint
 
 from app.auth import require_auth
-from app.config import API_PREFIX, API_VERSION
+from app.config import API_PREFIX, API_VERSION, get_settings
 from app.dto.data_filters import QualityFilter
 from app.dto.import_conflict import ImportConflictRecord
 from app.dto.pagination import PaginatedResponse, get_pagination
 from app.dto.planting_recommendation import Unauthorized
 from app.repo.import_conflict import ImportConflictRepo
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 from pydantic import BaseModel, Field
 
 __bp__ = "/quality"
@@ -20,8 +22,7 @@ tag = Tag(name="quality", description="Data quality endpoints")
 # blueprint used to rely on the label alone, so these were public.
 api = APIBlueprint(__bp__, __name__, url_prefix=url_prefix, abp_tags=[tag], abp_security=[{"jwt": []}])
 
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 repo = ImportConflictRepo()
 
@@ -33,9 +34,25 @@ class QualityStatsResponse(BaseModel):
     coverage_pct: int = Field(..., description="Percentage of records with valid coordinates")
     conflicts_by_country: list[dict] = Field(default=[], description="Conflicts grouped by country")
     conflicts_by_source: list[dict] = Field(default=[], description="Conflicts grouped by source")
+    conflict_logging: bool = Field(True, description="Whether new duplicate rows are recorded (INGEST_CONFLICT_LOGGING)")
+    duplicate_check: bool = Field(True, description="Whether already-imported files are skipped (INGEST_DUPLICATE_CHECK)")
 
 
 class ConflictListResponse(PaginatedResponse[ImportConflictRecord]):
+    pass
+
+
+class DuplicateGroup(BaseModel):
+    country: Optional[str] = None
+    province: Optional[str] = None
+    variety: Optional[str] = None
+    season_type: Optional[str] = None
+    opt_date: Optional[str] = None
+    count: int = Field(..., description="Conflicts with this country/province/variety/season/date")
+    sources: dict[str, int] = Field(default={}, description="Conflicts per source file")
+
+
+class DuplicateListResponse(PaginatedResponse[DuplicateGroup]):
     pass
 
 
@@ -47,6 +64,9 @@ class ConflictListResponse(PaginatedResponse[ImportConflictRecord]):
 def get_quality_stats():
     try:
         stats = repo.get_stats()
+        settings = get_settings()
+        stats['conflict_logging'] = settings.INGEST_CONFLICT_LOGGING
+        stats['duplicate_check'] = settings.INGEST_DUPLICATE_CHECK
         return stats, 200
     except Exception:
         # Exception text can carry SQL and connection details; log it, do not
@@ -92,3 +112,23 @@ def get_conflicts(query: QualityFilter):
     except Exception:
         logger.exception("Error fetching conflicts")
         return {'error': 'Failed to fetch import conflicts'}, 500
+
+
+@api.get('/duplicates',
+         responses={200: DuplicateListResponse, 401: Unauthorized},
+         summary="List import conflicts grouped as duplicates",
+         description="Conflicts grouped by country, province, variety, season and date, most repeated first, "
+                     "with a count per source. Paginated by group (default 100, max 500); takes the same "
+                     "country/source/search filters as /conflicts.")
+@require_auth
+def get_duplicates(query: QualityFilter):
+    pagination = get_pagination()
+    try:
+        total, groups = repo.get_duplicate_groups(query, pagination.offset, pagination.per_page)
+        return {
+            "data": [DuplicateGroup(**g).model_dump(mode='json') for g in groups],
+            **pagination.envelope(total),
+        }, 200
+    except Exception:
+        logger.exception("Error fetching duplicate groups")
+        return {'error': 'Failed to fetch duplicates'}, 500

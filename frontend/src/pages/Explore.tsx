@@ -149,7 +149,7 @@ export default function Explore() {
   const sortIndicator = (col: string) => (sort?.col === col ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '')
 
   return (
-    <div className="py-3">
+    <div className="pb-3">
       <div className="kvuno-card p-3 mb-3">
         <div className="row g-2">
           {(

@@ -220,10 +220,16 @@ export interface PlantingRecord {
   lat: number | null
   variety: string | null
   season_type: string | null
+  /** Day-month as in the source data ('30-Nov'); there is no year. */
   opt_date: string | null
+  /** The same day as ISO 8601 month-day, '--11-30'. */
+  opt_month_day: string | null
   planting_option: string | null
   check_sum: string | null
-  coordinates: string | null
+  /** GeoJSON Point (RFC 7946): coordinates are [lon, lat]. */
+  coordinates: { type: 'Point'; coordinates: number[] } | null
+  created_at: string | null
+  updated_at: string | null
 }
 
 export interface LatLon {
@@ -273,6 +279,10 @@ export interface QualityStats {
   total_files: number
   coverage_pct: number
   conflicts_by_source: { source: string; count: number }[]
+  /** INGEST_CONFLICT_LOGGING: false means new duplicates are skipped without being recorded. */
+  conflict_logging?: boolean
+  /** INGEST_DUPLICATE_CHECK: false means already-imported files are imported again. */
+  duplicate_check?: boolean
 }
 
 export interface Job {
@@ -449,9 +459,23 @@ export const fetchConflicts = (
 export const fetchStats = (signal?: AbortSignal) =>
   request<QualityStats>('/api/v1/quality/stats', { signal })
 
-export async function fetchAllConflicts(signal?: AbortSignal): Promise<AllPages<Conflict>> {
-  return fetchAllPages<Conflict>('/api/v1/quality/conflicts', 'data', undefined, signal)
+/** Conflicts grouped by country/province/variety/season/date, most repeated first. */
+export interface DuplicateGroup {
+  country: string | null
+  province: string | null
+  variety: string | null
+  season_type: string | null
+  opt_date: string | null
+  count: number
+  sources: Record<string, number>
 }
+
+/**
+ * One page of duplicate groups. The server does the grouping; the tab used to
+ * fetch every page of /conflicts and group them here, one request per page.
+ */
+export const fetchDuplicates = (params: URLSearchParams, page: number, signal?: AbortSignal) =>
+  fetchPage<DuplicateGroup>('/api/v1/quality/duplicates', 'data', page, DEFAULT_PER_PAGE, params, signal)
 
 export async function fetchTokens(signal?: AbortSignal): Promise<TokenInfo[]> {
   const out: TokenInfo[] = []
@@ -475,8 +499,78 @@ export async function login(username: string, password: string): Promise<string>
   return data.access_token
 }
 
-export async function register(username: string, email: string, password: string): Promise<void> {
-  await request('/api/v1/users/register', { method: 'POST', body: { username, email, password } })
+/** 'pending' until an administrator approves the account; admins are 'approved' at once. */
+export type AccountStatus = 'pending' | 'approved' | 'rejected' | 'disabled'
+
+export async function register(
+  username: string,
+  email: string,
+  password: string,
+): Promise<{ msg: string; status: AccountStatus }> {
+  return request('/api/v1/users/register', { method: 'POST', body: { username, email, password } })
+}
+
+/** The signed-in account, from GET /api/v1/users/me. */
+export interface Me {
+  id: number
+  username: string
+  email: string
+  status: AccountStatus
+  role: Role
+  /** May use the Accounts screens: role 'admin', or an owner (ADMIN_EMAILS). */
+  is_admin: boolean
+}
+
+export type Role = 'user' | 'admin'
+
+export function fetchMe(signal?: AbortSignal): Promise<Me> {
+  return request('/api/v1/users/me', { signal })
+}
+
+/* ── Account approval (administrators) ───────────────────────── */
+
+export interface AdminUser {
+  id: number
+  username: string
+  email: string
+  status: AccountStatus
+  role: Role
+  is_admin: boolean
+  /** Listed in ADMIN_EMAILS: always an admin; cannot be changed from the UI. */
+  is_owner: boolean
+  created_at: string | null
+  reviewed_at: string | null
+  reviewed_by: number | null
+}
+
+export interface AdminUserList extends PageMeta {
+  users: AdminUser[]
+  /** Accounts per status, for the tab badges. */
+  counts: Record<AccountStatus, number>
+}
+
+export function fetchAdminUsers(
+  params: { status?: AccountStatus; q?: string; page?: number },
+  signal?: AbortSignal,
+): Promise<AdminUserList> {
+  return request('/api/v1/admin/users', {
+    params: { status: params.status, q: params.q, page: params.page, per_page: 50 },
+    signal,
+  })
+}
+
+export type ReviewAction = 'approve' | 'reject' | 'disable'
+
+export function reviewUser(
+  id: number,
+  action: ReviewAction,
+  body: { notify?: boolean; reason?: string } = {},
+): Promise<{ user: AdminUser; emailed: boolean }> {
+  return request(`/api/v1/admin/users/${id}/${action}`, { method: 'POST', body })
+}
+
+export function setUserRole(id: number, role: Role): Promise<{ user: AdminUser }> {
+  return request(`/api/v1/admin/users/${id}/role`, { method: 'POST', body: { role } })
 }
 
 export async function logout(): Promise<void> {
@@ -557,7 +651,7 @@ export interface DuplicateInfo {
 /** tus endpoint. Files are sent here by lib/tus.ts, not by `request()`. */
 export const TUS_ENDPOINT = '/ui/uploads/tus'
 
-/** receiving -> received -> inspecting -> ready | failed -> submitted */
+/** receiving -> received -> inspecting -> ready | failed -> submitted -> processing */
 export type UploadStatus =
   | 'receiving'
   | 'received'
@@ -565,6 +659,7 @@ export type UploadStatus =
   | 'ready'
   | 'failed'
   | 'submitted'
+  | 'processing'
 
 /** One upload as the server tracks it (app/services/uploads.py `to_dict`). */
 export interface UploadRecord {
@@ -582,8 +677,29 @@ export interface UploadRecord {
   /** Source column -> DB column; seeded with the server's guesses. */
   column_map: Record<string, string>
   error: string | null
+  /**
+   * While inspecting: where it has got to. reading/writing are the RDS ->
+   * Parquet conversion (reading has no total; writing counts rows), then
+   * preview and checksum. elapsed is seconds since the conversion started.
+   */
+  progress: {
+    stage: 'reading' | 'writing' | 'preview' | 'checksum'
+    done: number
+    total: number
+    elapsed: number
+  } | null
+  /** 'upload' from the Upload page; 'folder' a data-folder file held for mapping. */
+  source: 'upload' | 'folder'
   created_at: string | null
   updated_at: string | null
+}
+
+/** Dispatched after an upload is submitted or discarded, so the sidebar count refreshes. */
+export const UPLOADS_CHANGED = 'kvuno:uploads-changed'
+
+/** Files inspected and waiting for a mapping — the Upload nav badge. */
+export function fetchAwaitingCount(signal?: AbortSignal) {
+  return request<{ count: number }>('/ui/uploads/awaiting', { signal })
 }
 
 export function fetchUploads(signal?: AbortSignal) {

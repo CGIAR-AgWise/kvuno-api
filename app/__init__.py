@@ -1,6 +1,3 @@
-import os
-
-from dotenv import load_dotenv
 from flask_cors import CORS
 from flask_openapi3 import OpenAPI, Server, Contact, License, Info
 
@@ -12,20 +9,7 @@ import shutil
 
 from app.models.database_conn import MyDb
 from app.routes.main import register_app_routes
-from app.config import build_db_url, APP_NAME, APP_VERSION, HOUSEKEEPING_DATA_DIR, HOUSEKEEPING_ENABLED
-
-# Load environment variables from .env file
-load_dotenv()
-
-
-def _age_seconds(env_name: str, default: str) -> int:
-    """Parse an age like '30m', '12h', '1d', '2w' from the environment."""
-    raw = os.getenv(env_name, default).strip()
-    multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    try:
-        return int(raw[:-1]) * multipliers[raw[-1]]
-    except (KeyError, ValueError, IndexError):
-        return int(default[:-1]) * multipliers[default[-1]]
+from app.config import APP_NAME, Settings, build_db_url, get_settings
 
 
 def _cleanup_temp_files():
@@ -36,7 +20,8 @@ def _cleanup_temp_files():
     recycle and timeout — so uploads in progress lost their chunks at random.
     Uploads are now only removed once idle for UPLOAD_ABANDON_AGE.
     """
-    data_dir = Path(HOUSEKEEPING_DATA_DIR)
+    settings = get_settings()
+    data_dir = Path(settings.HOUSEKEEPING_DATA_DIR)
     if not data_dir.is_dir():
         return
 
@@ -51,7 +36,7 @@ def _cleanup_temp_files():
 
     from app.services import uploads as upload_service
     try:
-        removed = upload_service.cleanup_abandoned(_age_seconds('UPLOAD_ABANDON_AGE', '7d'))
+        removed = upload_service.cleanup_abandoned(Settings.age_seconds(settings.UPLOAD_ABANDON_AGE))
         if removed:
             log.info("Removed %d abandoned upload(s)", removed)
     except Exception as e:
@@ -60,7 +45,7 @@ def _cleanup_temp_files():
         MyDb.get_db().session.rollback()
         log.warning("Upload cleanup skipped: %s", e.__class__.__name__)
 
-    cutoff = time.time() - _age_seconds('CLEANUP_AGE', '1d')
+    cutoff = time.time() - Settings.age_seconds(settings.CLEANUP_AGE)
 
     from app.services.progress_store import load_all_jobs, delete_job
     try:
@@ -110,21 +95,22 @@ api_license = License(
     identifier="Apache-2.0"
 )
 
-# API information
-info = Info(
-    title=APP_NAME,
-    version=APP_VERSION,
-    contact=contact,
-    license=api_license,
-    termsOfService="https://agwise.org/terms-of-service"
-)
+def _info(settings: Settings) -> Info:
+    return Info(
+        title=APP_NAME,
+        version=settings.app_version,
+        contact=contact,
+        license=api_license,
+        termsOfService="https://agwise.org/terms-of-service"
+    )
 
-# API servers
-servers = [
-    Server(url="http://127.0.0.1:5000"),
-    Server(url=os.getenv("SERVER_URL_PROD", "https://kvuno.agwise.org")),
-    Server(url=os.getenv("SERVER_URL_PROD_2", "https://kvuno.akilimo.org")),
-]
+
+def _servers(settings: Settings) -> list[Server]:
+    return [
+        Server(url="http://127.0.0.1:5000"),
+        Server(url=settings.SERVER_URL_PROD),
+        Server(url=settings.SERVER_URL_PROD_2),
+    ]
 
 
 def init_db(app):
@@ -171,8 +157,8 @@ def run_migrations():
     database that is still booting will not block the app from starting.
     """
     if not _db_available():
-        from app.utils.logging import SharedLogger
-        _log = SharedLogger().get_logger()
+        from app.utils.logging import get_logger
+        _log = get_logger(__name__)
         _log.warning(
             f"Database at {_sanitize_db_url(build_db_url())} is not reachable — skipping migrations. "
             f"The app will start, but requests will fail until the database is available. "
@@ -191,20 +177,30 @@ def register_apis(app: OpenAPI):
     from app.api.planting_data import protected_api as pd_protected_api
     from app.api.upload import api as upload_api
     from app.api.quality import api as quality_api
+    from app.api.admin import api as admin_api
 
     app.register_api(user_api)
     app.register_api(pd_public_api)
     app.register_api(pd_protected_api)
     app.register_api(upload_api)
     app.register_api(quality_api)
+    app.register_api(admin_api)
 
 
 def create_app():
     """Create and configure the Flask app."""
+    # First, so everything below — Flask, SQLAlchemy, our own modules — logs
+    # through the one configured handler (app/utils/logging.py).
+    from app.utils.logging import setup_logging
+    setup_logging()
+    # Then the configuration: an invalid value stops here, every problem
+    # listed, instead of surfacing later as an odd failure.
+    settings = get_settings()
+
     app = OpenAPI(
         __name__,
-        servers=servers,
-        info=info,
+        servers=_servers(settings),
+        info=_info(settings),
         doc_prefix="/api-docs",
         security_schemes={
             "jwt": {
@@ -226,23 +222,18 @@ def create_app():
     # In production nginx proxies /api and /ui to this app, so the browser sees
     # one origin and CORS is unused. These defaults only matter when the SPA
     # runs on its own dev server (`vite dev`, port 5173).
-    cors_origins = os.getenv(
-        'CORS_ORIGINS',
-        'http://127.0.0.1:5000,http://localhost:5173,http://127.0.0.1:5173',
-    )
-    origins = [o.strip() for o in cors_origins.split(',') if o.strip()]
+    origins = settings.cors_origins
     # The tus upload protocol is driven by response headers, which a
     # cross-origin client cannot read unless they are exposed.
     CORS(app, origins=origins, supports_credentials=True,
-         expose_headers=['Location', 'Upload-Offset', 'Upload-Length', 'Tus-Resumable'])
+         expose_headers=['Location', 'Upload-Offset', 'Upload-Length', 'Tus-Resumable', 'X-Request-ID'])
 
     # Rate limiting
-    from app.rate_limit import limiter
-    limiter.init_app(app)
+    from app.rate_limit import configure_limiter, limiter
+    configure_limiter(app)
     # Static assets must never be rate limited: browsers request several per
     # page view, so counting them against the default limit makes a handful of
-    # page loads look like abuse. `storage_uri` is already applied by the
-    # Limiter constructor, so RATE_LIMIT_STORAGE needs nothing here.
+    # page loads look like abuse.
     limiter.exempt(app.send_static_file)
 
     @app.errorhandler(429)
@@ -263,9 +254,45 @@ def create_app():
 
     @app.errorhandler(500)
     def server_error(e):
-        return {"error": "Internal server error"}, 500
+        # The request_id lets a user's report be matched to the logged traceback.
+        from flask import g
+        return {"error": "Internal server error", "request_id": getattr(g, 'request_id', None)}, 500
 
     # Security headers for all responses
+    # ── Request context for logs ──────────────────────────────
+    # Every line logged while handling a request carries its request_id,
+    # method and path (structlog contextvars). The id comes from X-Request-ID
+    # when a proxy set one — kvuno-web's nginx does — so one id follows a
+    # request from nginx through the API; otherwise one is generated. It is
+    # returned in the response header, so a user or the SPA can quote it.
+    import re
+    import uuid
+
+    import structlog
+    from flask import g, request
+
+    _request_id_ok = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+    @app.before_request
+    def bind_request_context():
+        incoming = request.headers.get('X-Request-ID', '')
+        # Only accept a sane id from outside: it lands in every log line.
+        g.request_id = incoming if _request_id_ok.match(incoming) else uuid.uuid4().hex
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=g.request_id, method=request.method,
+                                               path=request.path)
+
+    @app.after_request
+    def return_request_id(response):
+        request_id = getattr(g, 'request_id', None)
+        if request_id:
+            response.headers['X-Request-ID'] = request_id
+        return response
+
+    @app.teardown_request
+    def clear_request_context(_exc=None):
+        structlog.contextvars.clear_contextvars()
+
     @app.after_request
     def add_security_headers(response):
         response.headers.setdefault('X-Content-Type-Options', 'nosniff')
@@ -297,8 +324,14 @@ def create_app():
 
     # Configure the database URI
     app.config['SQLALCHEMY_DATABASE_URI'] = build_db_url()
-    app.config['SQLALCHEMY_ECHO'] = os.getenv('DEBUG_DB', 'false').lower() == 'true'
-    app.json.sort_keys = os.getenv('SORT_JSON') == '1'
+    # DEBUG_DB is handled by app/utils/logging.py (through the shared handler);
+    # echo would add SQLAlchemy's own stdout handler and bypass LOG_LEVEL.
+    app.config['SQLALCHEMY_ECHO'] = False
+    # Dates as ISO 8601 UTC ("2026-10-22T07:59:49Z"), not Flask's default HTTP
+    # date ("Thu, 22 Oct 2026 07:59:49 GMT"), so clients can parse and sort them.
+    from app.utils.json_encoding import IsoJSONProvider
+    app.json = IsoJSONProvider(app)
+    app.json.sort_keys = settings.SORT_JSON
 
     # Initialize the database
     init_db(app)
@@ -311,10 +344,12 @@ def create_app():
     with app.app_context():
         _cleanup_temp_files()
 
-    # Enqueue background processing of any unprocessed files via Celery
-    if HOUSEKEEPING_ENABLED:
-        from app.services.housekeeper import process_pending
-        process_pending()
+    # Scan the data folder for files not yet imported — once per deployment,
+    # not once per gunicorn worker: on the Celery worker when there is one,
+    # otherwise in a single API process (see housekeeper.start_startup_scan).
+    from app.services.housekeeper import set_app, start_startup_scan
+    set_app(app)
+    start_startup_scan(app)
 
     # Behind a reverse proxy (Dokploy, nginx) request.remote_addr is the
     # proxy's address, so every client shares one rate-limit bucket and the
@@ -334,12 +369,11 @@ def create_app():
     # its own X-Forwarded-For and evade every rate limit. Set PROXY_FIX_HOPS=0
     # in that case — running `python run.py` straight onto a public port is
     # the scenario to watch for.
-    _hops = os.getenv('PROXY_FIX_HOPS', '1')
-    if _hops.isdigit() and int(_hops) > 0:
+    hops = settings.PROXY_FIX_HOPS
+    if hops > 0:
         from werkzeug.middleware.proxy_fix import ProxyFix
-        hops = int(_hops)
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops)
-        from app.utils.logging import SharedLogger
-        SharedLogger().get_logger().info(f"ProxyFix enabled for {hops} proxy hop(s)")
+        from app.utils.logging import get_logger
+        get_logger(__name__).info(f"ProxyFix enabled for {hops} proxy hop(s)")
 
     return app

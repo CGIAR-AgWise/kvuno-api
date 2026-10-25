@@ -33,6 +33,49 @@ class RegisterRequest(BaseModel):
 
 class RegisterResponse(BaseModel):
     msg: str = Field(..., description="Registration result message", examples=["registration success"])
+    status: Optional[str] = Field(None, description="Account status: 'pending' until an administrator approves it",
+                                  examples=["pending"])
+
+
+class AdminUser(BaseModel):
+    id: int
+    username: str
+    email: str
+    status: str = Field(..., description="pending | approved | rejected | disabled")
+    role: str = Field('user', description="user | admin")
+    is_admin: bool = False
+    is_owner: bool = Field(False, description="Listed in ADMIN_EMAILS: always an admin, cannot be changed here")
+    created_at: Optional[str] = None
+    reviewed_at: Optional[str] = None
+    reviewed_by: Optional[int] = None
+
+
+class AdminUserList(BaseModel):
+    users: list[AdminUser] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict, description="Accounts per status, for the tab badges")
+    total: int = 0
+    pages: int = 0
+    current_page: int = 1
+    per_page: int = 100
+
+
+class AdminUserQuery(BaseModel):
+    status: Optional[str] = Field(None, pattern='^(pending|approved|rejected|disabled)$',
+                                  description="Only accounts with this status")
+    q: Optional[str] = Field(None, max_length=100, description="Search username or email")
+
+
+class AdminUserPath(BaseModel):
+    user_id: int = Field(..., description="Account id")
+
+
+class AdminRoleRequest(BaseModel):
+    role: str = Field(..., pattern='^(user|admin)$', description="user | admin")
+
+
+class AdminReviewRequest(BaseModel):
+    reason: Optional[str] = Field(None, max_length=500, description="Optional note sent to the user on rejection")
+    notify: bool = Field(True, description="Email the user about the decision (when email is configured)")
 
 
 class LoginRequest(BaseModel):

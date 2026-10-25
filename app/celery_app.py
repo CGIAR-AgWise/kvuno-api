@@ -1,19 +1,17 @@
-import os
-
 from celery import Celery
 
-from dotenv import load_dotenv
+from app.config import get_settings
 
-from app.config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, CELERY_TASK_DEFAULT_QUEUE
-
-load_dotenv()
+# Validated here: the worker stops at once, every problem listed, on an
+# invalid setting.
+_settings = get_settings()
 
 celery_app = Celery('kvuno')
 
 celery_app.config_from_object({
-    'broker_url': CELERY_BROKER_URL,
-    'result_backend': CELERY_RESULT_BACKEND,
-    'task_default_queue': CELERY_TASK_DEFAULT_QUEUE,
+    'broker_url': _settings.CELERY_BROKER_URL,
+    'result_backend': _settings.CELERY_RESULT_BACKEND,
+    'task_default_queue': _settings.CELERY_TASK_DEFAULT_QUEUE,
     'task_serializer': 'json',
     'accept_content': ['json'],
     'result_serializer': 'json',
@@ -29,7 +27,7 @@ celery_app.config_from_object({
     # acks_late, a long ingest therefore got a second, concurrent copy. Set
     # this above the longest expected single-file ingest.
     'broker_transport_options': {
-        'visibility_timeout': int(os.getenv('CELERY_VISIBILITY_TIMEOUT', '21600')),
+        'visibility_timeout': _settings.CELERY_VISIBILITY_TIMEOUT,
     },
     'worker_prefetch_multiplier': 1,
     'broker_connection_retry_on_startup': False,
@@ -39,8 +37,91 @@ celery_app.config_from_object({
     # tasks, so without this a single large ingest permanently inflates the
     # worker. The child is replaced cleanly, so set it above the expected peak
     # of one file, not below it.
-    'worker_max_memory_per_child': int(os.getenv('WORKER_MAX_MEMORY_PER_CHILD', '2048')),
-    'worker_max_tasks_per_child': int(os.getenv('WORKER_MAX_TASKS_PER_CHILD', '50')),
+    'worker_max_memory_per_child': _settings.WORKER_MAX_MEMORY_PER_CHILD,
+    'worker_max_tasks_per_child': _settings.WORKER_MAX_TASKS_PER_CHILD,
 })
 
 celery_app.autodiscover_tasks(['app'])
+
+
+# ── Logging ────────────────────────────────────────────────────
+# As in budget-assist: a receiver on Celery's setup_logging signal stops it
+# from configuring (hijacking) the root logger, so worker and task records go
+# through app.utils.logging like everything else — same format, same level
+# (LOG_LEVEL), JSON in production. The worker's --loglevel no longer matters.
+
+from celery.signals import setup_logging as _celery_setup_logging  # noqa: E402
+from celery.signals import task_postrun, task_prerun  # noqa: E402
+
+
+@_celery_setup_logging.connect
+def _configure_logging(**_kwargs):
+    from app.utils.logging import setup_logging
+    setup_logging(force=True)
+
+
+@task_prerun.connect
+def _bind_task_context(task_id=None, task=None, **_kwargs):
+    # Every line logged while a task runs carries its id and name, so one
+    # file's ingest can be followed through the worker log.
+    import structlog
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(task_id=task_id, task=getattr(task, 'name', None))
+
+
+@task_postrun.connect
+def _clear_task_context(**_kwargs):
+    import structlog
+    structlog.contextvars.clear_contextvars()
+
+
+# ── Restarts ───────────────────────────────────────────────────
+# Restarting the worker container mid-ingest used to leave the job
+# "processing" for hours: Docker's SIGTERM reaches only the main process, the
+# warm shutdown waited for the whole file, Docker killed it after its grace
+# period, the message stayed unacked until CELERY_VISIBILITY_TIMEOUT (6 h),
+# and the dead ingest lock made a manual Retry skip the file. Now:
+#   - shutting down tells running ingests to stop at the next chunk boundary
+#     (rows + offset committed together, job marked "Paused");
+#   - starting clears this host's dead locks, then re-enqueues the jobs this
+#     host left processing, in their own runs, from their stored offsets.
+
+from celery.signals import worker_init, worker_ready, worker_shutting_down  # noqa: E402
+
+
+@worker_init.connect
+def _on_worker_init(**_kwargs):
+    # Before the pool starts: nothing on this host can hold a lock yet.
+    import socket
+
+    from app.services.housekeeper import clear_worker_stop, release_dead_locks
+    clear_worker_stop()  # a restarted container keeps its /tmp
+    try:
+        release_dead_locks(_settings.HOUSEKEEPING_DATA_DIR, socket.gethostname())
+    except Exception:
+        from app.utils.logging import get_logger
+        get_logger(__name__).exception("could not release dead ingest locks")
+
+
+@worker_ready.connect
+def _on_worker_ready(**_kwargs):
+    from app.services.housekeeper import resume_interrupted_jobs, set_app, worker_name
+    from app.tasks import _get_worker_app
+    from app.utils.logging import get_logger
+
+    app = _get_worker_app()
+    set_app(app)
+    try:
+        with app.app_context():
+            resumed = resume_interrupted_jobs(worker_name())
+        if resumed:
+            get_logger(__name__).info("re-enqueued interrupted jobs", count=resumed)
+    except Exception:
+        # Never stop the worker over this: the jobs go stale and can be retried.
+        get_logger(__name__).exception("could not resume interrupted jobs")
+
+
+@worker_shutting_down.connect
+def _on_worker_shutting_down(**_kwargs):
+    from app.services.housekeeper import request_worker_stop
+    request_worker_stop()

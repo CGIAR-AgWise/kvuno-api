@@ -3,3 +3,8 @@
 # out to; without this, `pnpm install` fails with ERR_PNPM_IGNORED_BUILDS.
 allowBuilds:
   esbuild: true
+
+# Same for overrides: pnpm 12 ignores the "pnpm" field in package.json.
+# Keeps react-router's @remix-run/router on a patched release.
+overrides:
+  '@remix-run/router': ^1.23.3

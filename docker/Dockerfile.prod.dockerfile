@@ -23,13 +23,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     HOME=/app
 
-RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
+# A FIXED uid/gid, the same in every image (dev, prod, worker): the API and
+# the worker share the data volume, so they must agree on who owns it. `-r`
+# used to pick whatever system id was free.
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g ${GID} app && useradd -u ${UID} -g app -d /app -s /sbin/nologin --no-log-init app
 
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 COPY --chown=app:app . .
-RUN chown app:app /app && chmod +x /app/docker/entrypoint.sh
+# The data directory exists in the image, owned by app, so a NEW volume mounted
+# here starts out writable (Docker copies the ownership into it). An existing
+# root-owned volume is not touched by this — the compose data-init service
+# fixes that one.
+RUN chown app:app /app && chmod +x /app/docker/entrypoint.sh \
+    && install -d -o app -g app /app/static/data /app/static/data/uploads
 
 USER app
 

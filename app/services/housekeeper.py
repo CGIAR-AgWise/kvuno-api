@@ -3,6 +3,10 @@ Housekeeping — RDS/Parquet file ingestion service.
 
 Used as the primary processing module by both the Flask app (upload API,
 startup background job) and the standalone CLI (``python housekeeping.py``).
+
+The Celery worker imports this module for ``process_file`` and
+``load_rds_to_db``; the API imports it for background-thread processing
+and the standalone CLI.
 """
 import concurrent.futures
 import gc
@@ -10,12 +14,13 @@ import json
 import os
 import signal
 import socket
+import sys
+import tempfile
 import threading
 import time
 
 import pandas as pd
 import pyreadr
-from dotenv import load_dotenv
 from geoalchemy2 import WKTElement
 from sqlalchemy import text as db_text
 from sqlalchemy.dialects.postgresql import insert
@@ -31,45 +36,34 @@ from sqlalchemy.exc import (
 from tqdm import tqdm
 
 from app import create_app
-from app.config import (
-    CELERY_BROKER_URL,
-    HOUSEKEEPING_BATCH_SIZE,
-    HOUSEKEEPING_CHECKPOINT_INTERVAL,
-    HOUSEKEEPING_CHUNK_SIZE,
-    HOUSEKEEPING_DATA_DIR,
-    HOUSEKEEPING_MAX_WORKERS,
-    celery_broker_available,
-)
+from app.config import celery_broker_available, get_settings
 from app.dto.planting_recommendation import PlantingRecommendationCreate
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, ImportConflict
 from app.repo.planting_recommendation import PlantingRecommendationRepo
 from app.repo.file_import import FileImportRepo
+from app.services.progress_store import save_progress
 from app.utils import calculate_file_checksum
 from app.utils.downloader import RDSDownloader
 from app.utils.file_lock import FileLock
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-load_dotenv()
-
-shared_logger = SharedLogger()
-logger = shared_logger.get_logger()
+logger = get_logger(__name__)
 
 _app = None
-DATA_DIR = HOUSEKEEPING_DATA_DIR
 
 # Per-file ingest lock, next to the data file. Two workers could ingest the
 # same file at once (a double-click enqueues twice; a Redis redelivery after
 # the visibility timeout runs a task that is still running), interleaving
 # commits and offsets. The holder refreshes it every chunk, so it only goes
-# stale when the holder is dead; set this well above the slowest chunk.
+# stale when the holder is dead; set INGEST_LOCK_STALE_SECONDS well above the
+# slowest chunk.
 INGEST_LOCK_SUFFIX = '.ingest.lock'
-INGEST_LOCK_STALE_SECONDS = float(os.getenv('INGEST_LOCK_STALE_SECONDS', '600'))
 
-# How long process_pending()'s de-dupe key lives. create_app() calls it once
-# per gunicorn worker, so without this N workers enqueued N identical scans.
+# process_pending()'s de-dupe key. create_app() runs once per gunicorn worker,
+# so without it N workers enqueued N identical scans. It lives for
+# STARTUP_SCAN_COOLDOWN_SECONDS.
 PROCESS_PENDING_DEDUPE_KEY = 'kvuno:process_pending'
-PROCESS_PENDING_DEDUPE_SECONDS = 300
 
 
 # ── App management ─────────────────────────────────────────────
@@ -100,10 +94,11 @@ def housekeeping_settings() -> dict:
     'max_workers'`` and failed every Celery ingest. Pass it explicitly at the
     ``load_rds_to_db`` call sites instead.
     """
+    settings = get_settings()
     return {
-        'batch_size': HOUSEKEEPING_BATCH_SIZE,
-        'chunk_size': HOUSEKEEPING_CHUNK_SIZE,
-        'checkpoint_interval': HOUSEKEEPING_CHECKPOINT_INTERVAL,
+        'batch_size': settings.HOUSEKEEPING_BATCH_SIZE,
+        'chunk_size': settings.HOUSEKEEPING_CHUNK_SIZE,
+        'checkpoint_interval': settings.HOUSEKEEPING_CHECKPOINT_INTERVAL,
     }
 
 
@@ -116,6 +111,37 @@ planting_recommendation_repo = PlantingRecommendationRepo()
 # ── Graceful shutdown ──────────────────────────────────────────
 
 shutdown_requested = False
+
+# Set by the Celery worker's main process when it is told to stop (see
+# app/celery_app.py). The ingest runs in a pool CHILD, which never sees the
+# SIGTERM Docker sends to PID 1 — and Celery's warm shutdown would otherwise
+# wait for the whole file while Docker kills the container after its grace
+# period, leaving the job "processing" with an unacked message Redis only
+# redelivers after CELERY_VISIBILITY_TIMEOUT (6 h). A file in the container's
+# temp directory is visible to parent and children alike.
+WORKER_STOP_FILE = os.path.join(tempfile.gettempdir(), 'kvuno-worker-stopping')
+
+
+def request_worker_stop():
+    try:
+        with open(WORKER_STOP_FILE, 'w'):
+            pass
+    except OSError:
+        logger.warning("Could not signal running ingests to stop", exc_info=True)
+
+
+def clear_worker_stop():
+    try:
+        os.remove(WORKER_STOP_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("Could not clear the worker stop flag", exc_info=True)
+
+
+def stop_requested() -> bool:
+    """The CLI got SIGINT/SIGTERM, or the Celery worker is shutting down."""
+    return shutdown_requested or os.path.exists(WORKER_STOP_FILE)
 
 
 def _handle_sigterm(signum, frame):
@@ -156,13 +182,66 @@ def install_signal_handlers():
 # ── Telemetry ──────────────────────────────────────────────────
 
 def emit_event(event: str, **kwargs):
-    """Write a structured JSON event line to stderr for monitoring ingestion."""
-    record = {"event": event, "timestamp": time.time()}
-    record.update(kwargs)
-    print(json.dumps(record), file=__import__('sys').stderr, flush=True)
+    """Log a structured ingestion event (file.processing_start, …).
+
+    These used to be hand-built JSON printed to stderr — a second stream in a
+    second format. They now go through the shared logger, so they carry the
+    task id and timestamp like every other line and render as JSON fields in
+    production.
+    """
+    logger.info(event, **kwargs)
 
 
 # ── Column mapping ─────────────────────────────────────────────
+
+def needs_mapping(file_path: str) -> bool:
+    """Whether the default mapping cannot import this file: it finds no lat/lon in it.
+
+    The default mapping is the built-ins, overridden by RDS_COLUMN_MAP and a
+    per-file ``.map.json`` (load_column_map). Without both coordinates every
+    row is dropped (the coordinates column is NOT NULL), so such a file used
+    to be "imported" with nothing in it. Parquet only — its columns come from
+    the footer; an RDS would have to be read whole, so it is left to
+    process_file as before (scans convert RDS to Parquet first anyway).
+    """
+    if not file_path.lower().endswith('.parquet'):
+        return False
+    try:
+        import pyarrow.parquet as pq
+        columns = set(pq.ParquetFile(file_path).schema_arrow.names)
+    except Exception:
+        return False  # unreadable: process_file reports it
+    targets = {target for source, target in load_column_map(file_path).items() if source in columns}
+    return not {'lat', 'lon'} <= targets
+
+
+def hold_unmapped(file_paths: list[str], dry_run: bool = False) -> list[str]:
+    """Hold the files the default mapping cannot import; return the rest.
+
+    A held file becomes an upload awaiting mapping (source='folder'), shown on
+    the Upload page and counted in the sidebar. INGEST_HOLD_UNMAPPED=false
+    keeps the old behaviour. Needs an app context.
+    """
+    if not get_settings().INGEST_HOLD_UNMAPPED:
+        return list(file_paths)
+    remaining = []
+    for path in file_paths:
+        if not needs_mapping(path):
+            remaining.append(path)
+            continue
+        name = os.path.basename(path)
+        if dry_run:
+            logger.info("[DRY RUN] would hold for mapping: the default mapping finds no lat/lon", file=name)
+            continue
+        try:
+            from app.services import uploads as upload_service
+            upload_service.hold_from_folder(path)
+        except Exception:
+            logger.exception("could not hold the file for mapping; importing it with the default mapping",
+                             file=name)
+            remaining.append(path)
+    return remaining
+
 
 def load_column_map(file_path: str | None = None) -> dict[str, str]:
     """Load column name mapping from env var, overridden by a per-file .map.json if present."""
@@ -176,13 +255,10 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
         'Opt_date': 'opt_date',
         'Planting_Option': 'planting_option',
     }
-    raw = os.getenv('RDS_COLUMN_MAP')
+    raw = get_settings().RDS_COLUMN_MAP
     if raw:
-        try:
-            overrides = json.loads(raw)
-            default_map.update(overrides)
-        except (json.JSONDecodeError, TypeError) as e:
-            logger.warning(f"Invalid RDS_COLUMN_MAP JSON, using defaults: {e}")
+        # Validated as a JSON object when the settings were loaded.
+        default_map.update(json.loads(raw))
 
     if file_path:
         mapping_path = file_path + '.map.json'
@@ -198,6 +274,29 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
     return default_map
 
 
+def _already_reported_complete(file_name: str, run_id: int | None) -> bool:
+    try:
+        from app.services.progress_store import get_job
+        job = get_job(file_name)
+    except Exception:
+        return False
+    return bool(job and job.get('status') == 'completed' and job.get('run_id') == run_id
+                and (job.get('total') or 0) > 0)
+
+
+def worker_name() -> str:
+    """This worker's name on its jobs.
+
+    Returns the container hostname for Celery workers, or 'api-background'
+    when called from the API's background processing thread.
+    """
+    # If called from API background thread, HOSTNAME won't be set meaningfully.
+    # Check if we're in a Celery worker context.
+    if os.getenv('CELERY_WORKER'):
+        return os.getenv('HOSTNAME') or socket.gethostname()
+    return os.getenv('HOSTNAME') or socket.gethostname() or 'api-background'
+
+
 def _write_progress(file_path: str, status: str, current: int, total: int, message: str = "",
                     run_id: int | None = None, error: str | None = None,
                     original_filename: str | None = None):
@@ -207,19 +306,56 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
     progress; ``error`` is stored separately from ``message`` so routine
     progress updates cannot erase why a job failed.
     """
-    from app.services.progress_store import save_progress
     save_progress(
         file_path, status, current, total, message,
         run_id=run_id, error=error,
-        worker=os.getenv('HOSTNAME') or socket.gethostname(),
+        worker=worker_name(),
         original_filename=original_filename or os.path.basename(file_path),
     )
 
 
+def _duration(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}m {seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+
+
+def report_conversion(rds_path: str, stage: str, done: int, total: int, elapsed: float, message: str = ''):
+    """Show a data-folder RDS -> Parquet conversion on the Jobs page.
+
+    It is a job of its own, under the RDS name: 'converting' while it runs
+    (the read cannot be measured, so it reports how long it has been reading;
+    the write reports rows), then 'completed' or 'error'. Scans used to
+    convert silently, so a long read looked like a hung scan and a failure was
+    only in the log. Called by batch_convert's on_file and the folder watcher.
+    """
+    with _get_app().app_context():
+        if stage == 'done':
+            _write_progress(rds_path, 'completed', total, total,
+                            f"{message} — {total:,} rows in {_duration(elapsed)}")
+        elif stage == 'failed':
+            _write_progress(rds_path, 'error', 0, total, message, error=message)
+        elif stage == 'reading':
+            _write_progress(rds_path, 'converting', 0, 0,
+                            f"Converting to Parquet: reading the R file ({_duration(elapsed)})")
+        else:
+            _write_progress(rds_path, 'converting', done, total,
+                            f"Converting to Parquet: writing {done:,} of {total:,} rows")
+
+
 # ── DB helpers ─────────────────────────────────────────────────
 
-def retry_db(fn, attempts: int = 3, base_delay: float = 1.0):
-    """Call *fn* with retries on SQLAlchemyError using exponential backoff."""
+def retry_db(fn, attempts: int = 3, base_delay: float = 1.0, session=None):
+    """Call *fn* with retries on SQLAlchemyError using exponential backoff.
+
+    Pass ``session`` only where nothing uncommitted is at stake (e.g. before
+    an ingest starts): it is rolled back before each retry. A failed query —
+    a dropped connection above all — leaves the session's transaction
+    invalid, and retrying on it without a rollback could never succeed
+    ("Can't reconnect until invalid transaction is rolled back"). Mid-ingest
+    it must NOT be rolled back here: that would discard the rows written
+    since the last checkpoint while the offset carried on past them; there
+    the error propagates and the file resumes from its checkpoint instead.
+    """
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
@@ -227,6 +363,11 @@ def retry_db(fn, attempts: int = 3, base_delay: float = 1.0):
         except SQLAlchemyError as e:
             last_exc = e
             if attempt < attempts:
+                if session is not None:
+                    try:
+                        session.rollback()
+                    except Exception:
+                        logger.warning("rollback before retry failed", exc_info=True)
                 delay = base_delay * (2 ** (attempt - 1))
                 logger.warning(f"DB error (attempt {attempt}/{attempts}): {e}. Retrying in {delay}s")
                 time.sleep(delay)
@@ -300,7 +441,7 @@ def db_health_check():
         logger.info("Database health check passed")
 
 
-# ── Remote download ────────────────────────────────────────────
+# ── Remote download ─────────────────────────────────────────────
 
 def download_remote_files(data_folder: str) -> list[str]:
     """
@@ -321,12 +462,12 @@ def download_remote_files(data_folder: str) -> list[str]:
     """
     from app.utils.downloader import configure_ssrf
 
-    allowed_domains_raw = os.getenv("REMOTE_RDS_ALLOWED_DOMAINS", "").strip()
-    allowed_domains = [d.strip() for d in allowed_domains_raw.split(",") if d.strip()] or None
-    require_https = os.getenv("REMOTE_RDS_ALLOW_HTTP", "").lower() != "true"
+    settings = get_settings()
+    allowed_domains = [d.strip() for d in settings.REMOTE_RDS_ALLOWED_DOMAINS.split(",") if d.strip()] or None
+    require_https = not settings.REMOTE_RDS_ALLOW_HTTP
     configure_ssrf(allowed_domains=allowed_domains, require_https=require_https)
 
-    urls_raw = os.getenv("REMOTE_RDS_URLS", "").strip()
+    urls_raw = settings.REMOTE_RDS_URLS.strip()
     if not urls_raw:
         logger.info("No REMOTE_RDS_URLS defined, skipping remote download")
         return []
@@ -334,9 +475,9 @@ def download_remote_files(data_folder: str) -> list[str]:
     urls = [u.strip() for u in urls_raw.split(";") if u.strip()]
     logger.info(f"Found {len(urls)} remote RDS URL(s) to download")
 
-    token = os.getenv("REMOTE_RDS_TOKEN")
-    cookies_raw = os.getenv("REMOTE_RDS_COOKIES")
-    headers_raw = os.getenv("REMOTE_RDS_HEADERS")
+    token = settings.REMOTE_RDS_TOKEN.get_secret_value() or None
+    cookies_raw = settings.REMOTE_RDS_COOKIES.get_secret_value()
+    headers_raw = settings.REMOTE_RDS_HEADERS.get_secret_value()
 
     cookies = {}
     if cookies_raw:
@@ -374,7 +515,7 @@ def download_remote_files(data_folder: str) -> list[str]:
     return downloaded
 
 
-# ── Conflict logging ───────────────────────────────────────────
+# ── Conflict logging ─────────────────────────────────────────────
 
 def _iter_frame_chunks(data, start: int, chunk_size: int):
     """Yield (offset, DataFrame) slices from an in-memory frame (RDS path)."""
@@ -449,7 +590,7 @@ def _log_batch_conflicts(session, mappings):
             session.add(conflict)
 
 
-# ── File processing ────────────────────────────────────────────
+# ── File processing ─────────────────────────────────────────────
 
 def process_file(
     file_path: str,
@@ -500,7 +641,7 @@ def process_file(
         _write_progress(file_path, status, current, total, message, run_id=run_id,
                         original_filename=original_filename or None, **kw)
 
-    lock = FileLock(file_path + INGEST_LOCK_SUFFIX, INGEST_LOCK_STALE_SECONDS)
+    lock = FileLock(file_path + INGEST_LOCK_SUFFIX, get_settings().INGEST_LOCK_STALE_SECONDS)
     # Initialised before the try so every error path can report the last
     # known position. Reporting 0/0 used to wipe it from the Jobs page.
     num_rows = 0
@@ -529,12 +670,24 @@ def process_file(
                     logger.info(f"[DRY RUN] {file_name} — would process {os.path.getsize(file_path)} bytes")
                 return
 
-            existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum))
+            # Nothing is uncommitted yet, so a retry may roll the session back
+            # (a stale connection used to leave it unusable for every retry).
+            existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum), session=session)
             resume_offset = 0
+            if existing and existing.offset is None and not get_settings().INGEST_DUPLICATE_CHECK:
+                # Duplicate checking is off: import it again from the start.
+                # Rows already stored are still skipped by the unique constraint.
+                logger.info("file was imported before; importing again (INGEST_DUPLICATE_CHECK=false)",
+                            file=file_name)
+                existing = None
             if existing and existing.offset is None:
                 logger.warning(f"File {file_name} is already fully processed. Checksum: {checksum}")
-                # Report it, or a submitted duplicate shows nothing at all.
-                progress('completed', 0, 0, 'Already ingested — nothing to do')
+                # Report it, or a submitted duplicate shows nothing at all —
+                # unless this file's job already says completed: then this is
+                # a late redelivery of a task a resumed job already finished,
+                # and writing 0/0 over it would erase the real result.
+                if not _already_reported_complete(file_name, run_id):
+                    progress('completed', 0, 0, 'Already ingested — nothing to do')
                 return
             if existing and existing.offset is not None:
                 resume_offset = existing.offset
@@ -567,7 +720,8 @@ def process_file(
                 column_map, _ = _select_columns(
                     column_map, list(data.columns), file_name, explicit_map)
                 chunk_source = _iter_frame_chunks(data, resume_offset, chunk_size)
-            lock.touch()  # a large RDS can take minutes to deserialise
+
+            # Lock is held for the entire ingestion; no need to touch during deserialisation.
 
             if resume_offset >= num_rows:
                 # Completed before the offset was cleared on success; finish
@@ -583,24 +737,32 @@ def process_file(
                        total_rows=num_rows, resume_offset=resume_offset)
             logger.info(f"Processing file {file_name} in chunks of size {chunk_size}")
 
+            # INGEST_CONFLICT_LOGGING=false still skips duplicates (the unique
+            # constraint does that) but stops recording each one in
+            # import_conflicts — an extra query per batch that had any.
+            log_conflicts = get_settings().INGEST_CONFLICT_LOGGING
             failed_batches = 0
             completed_batches = 0
             batches_since_checkpoint = 0
             last_committed_row = resume_offset
 
             remaining = num_rows - resume_offset
+            # Disable tqdm in background threads (no TTY); enable only for CLI runs.
             pbar = tqdm(
                 total=remaining,
                 unit="rows",
                 desc=f"{file_name} (resumed at row {resume_offset})" if resume_offset else file_name,
                 leave=False,
-                file=__import__('sys').stderr,
+                disable=not sys.stdout.isatty(),
             )
 
+            # Stops only between chunks: a chunk's rows and the offset after
+            # it are committed together, so a resume never re-inserts rows.
+            stopped = False
             try:
                 for chunk_start, chunk in chunk_source:
-                    if shutdown_requested:
-                        logger.warning("Shutdown requested — breaking after current chunk")
+                    if stop_requested():
+                        stopped = True
                         break
 
                     lock.touch()
@@ -631,10 +793,6 @@ def process_file(
                         batch.append(PlantingRecommendationCreate(**kwargs))
 
                     for i in range(0, len(batch), batch_size):
-                        if shutdown_requested:
-                            logger.warning("Shutdown requested — breaking after current batch")
-                            break
-
                         sub = batch[i:i + batch_size]
                         try:
                             def _flush_batch(rows):
@@ -660,7 +818,7 @@ def process_file(
                                     # instead of being inserted on every replay.
                                     stmt = insert(PlantingRecommendation).values(mappings).on_conflict_do_nothing()
                                     result = session.execute(stmt)
-                                    if result.rowcount < len(mappings):
+                                    if result.rowcount < len(mappings) and log_conflicts:
                                         _log_batch_conflicts(session, mappings)
                             retry_db(lambda: _flush_batch(sub), attempts=2)
                             completed_batches += 1
@@ -673,13 +831,12 @@ def process_file(
                             if is_transient_db_error(e):
                                 raise
                             failed_batches += 1
-                            logger.error(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
+                            logger.exception(f"Batch {i // batch_size + 1} failed in {file_name}, skipping")
 
-                    if not shutdown_requested:
-                        last_committed_row = chunk_end
-                        progress('processing', last_committed_row, num_rows)
+                    last_committed_row = chunk_end
+                    progress('processing', last_committed_row, num_rows)
 
-                    if batches_since_checkpoint >= checkpoint_interval and not shutdown_requested:
+                    if batches_since_checkpoint >= checkpoint_interval:
                         # Rows and offset in ONE transaction. Committing the
                         # rows first left a window where a crash kept rows
                         # past the stored offset, which a resume re-inserted.
@@ -689,7 +846,8 @@ def process_file(
                         checkpoint_row = chunk_end
                         batches_since_checkpoint = 0
                         logger.debug(f"Checkpoint committed at row {chunk_end}")
-                    if shutdown_requested:
+                    if stop_requested():
+                        stopped = True
                         break
 
             except BaseException as exc:
@@ -716,12 +874,17 @@ def process_file(
             chunk_source = None
             gc.collect()
 
-            if shutdown_requested:
+            if stopped:
                 file_import_repo.upsert_offset(checksum, file_name, last_committed_row,
                                                original_filename, commit=False)
                 session.commit()
+                # Still 'processing' — it is not done and not failed. The
+                # worker re-enqueues it on start (resume_interrupted_jobs); if
+                # none starts, it goes stale and gets a Retry button.
+                progress('processing', last_committed_row, num_rows,
+                         f"Paused for a worker restart; resumes from row {last_committed_row:,}")
                 logger.warning(
-                    f"Graceful shutdown — committed {completed_batches} batches from {file_name}, "
+                    f"Stopping — committed {completed_batches} batches from {file_name}, "
                     f"offset {last_committed_row} persisted"
                 )
             else:
@@ -750,7 +913,7 @@ def process_file(
             elapsed = time.time() - start_time
             emit_event("file.processing_end", file=file_name, checksum=checksum,
                        elapsed=round(elapsed, 2), completed_batches=completed_batches,
-                       failed_batches=failed_batches, shutdown=shutdown_requested)
+                       failed_batches=failed_batches, shutdown=stopped)
 
             if failed_batches:
                 logger.warning(f"File {file_name} processed with {failed_batches} failed batch(es)")
@@ -771,9 +934,9 @@ def process_file(
                 raise
             progress('error', checkpoint_row, num_rows, str(e), error=str(e))
             if isinstance(e, FileNotFoundError):
-                logger.error(f"Failed to process file {file_name}: {e}")
+                logger.exception(f"Failed to process file {file_name}: {e}")
             else:
-                logger.error(f"Unexpected error processing file {file_name}: {e}")
+                logger.exception(f"Unexpected error processing file {file_name}: {e}")
         finally:
             lock.release()
             elapsed_time = time.time() - start_time
@@ -792,12 +955,21 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
     Loads and processes all RDS/Parquet files from *data_folder* using a thread pool.
 
     Remote RDS files defined in the ``REMOTE_RDS_URLS`` env var are downloaded first.
+    RDS files in the data directory are converted to Parquet for efficient streaming.
     """
     os.makedirs(data_folder, exist_ok=True)
     global_start_time = time.time()
 
     db_health_check()
     download_remote_files(data_folder)
+
+    # Convert any RDS files in the data directory to Parquet for efficient streaming.
+    # This matches the upload flow where RDS is converted at inspection time.
+    from app.utils.rds_to_parquet import batch_convert
+    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True,
+                              on_file=None if dry_run else report_conversion)
+    if converted:
+        logger.info(f"Converted {len(converted)} RDS file(s) to Parquet")
 
     file_paths = [
         os.path.join(data_folder, f)
@@ -810,6 +982,10 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
 
     failed_count = 0
     with _get_app().app_context():
+        # Files whose columns the default mapping cannot use wait for a person
+        # to map them on the Upload page, instead of importing nothing.
+        file_paths = hold_unmapped(file_paths, dry_run=dry_run)
+
         # ONE run for the whole scan, so its files are reported as a batch and
         # each gets its own history row instead of overwriting the last one.
         run_id = None
@@ -836,7 +1012,7 @@ def load_rds_to_db(data_folder: str, batch_size: int = 1000, chunk_size: int = 5
                 except Exception as e:
                     failed_files.append((fp, e))
                     failed_count += 1
-                    logger.error(f"Failed to process {os.path.basename(fp)}: {e}")
+                    logger.exception(f"Failed to process {os.path.basename(fp)}: {e}")
 
         if failed_files:
             logger.error(
@@ -864,7 +1040,10 @@ def watch_directory(
     checkpoint_interval: int = 50,
     dry_run: bool = False,
 ):
-    """Watch *data_folder* for new files and process them as they arrive."""
+    """Watch *data_folder* for new files and process them as they arrive.
+
+    RDS files are converted to Parquet on startup and when new ones appear.
+    """
     try:
         from watchdog.observers.polling import PollingObserver as Observer
     except ImportError:
@@ -872,6 +1051,13 @@ def watch_directory(
         raise
 
     os.makedirs(data_folder, exist_ok=True)
+
+    # Convert any existing RDS files to Parquet before starting the watcher.
+    from app.utils.rds_to_parquet import batch_convert
+    converted = batch_convert(data_folder, pattern=".rds", delete_originals=True,
+                              on_file=None if dry_run else report_conversion)
+    if converted:
+        logger.info(f"Converted {len(converted)} existing RDS file(s) to Parquet")
 
     from app.services.watch_handler import RDSFileHandler
 
@@ -900,7 +1086,76 @@ def watch_directory(
         observer.join()
 
 
-# ── Celery helpers ─────────────────────────────────────────────
+# ── Celery restart helpers (used by worker) ─────────────────────
+
+def release_dead_locks(data_folder: str, hostname: str) -> int:
+    """Remove ingest locks this host left behind. Call before any task runs.
+
+    A worker killed mid-ingest (container restart past its grace period, OOM)
+    cannot release its lock, and a lock looks live for
+    INGEST_LOCK_STALE_SECONDS — so the resumed job found it "held by another
+    worker" and silently did nothing. When this host's worker is only just
+    starting, nothing on it can be holding one.
+    """
+    removed = 0
+    for root, _dirs, files in os.walk(data_folder):
+        for name in files:
+            if not name.endswith(INGEST_LOCK_SUFFIX):
+                continue
+            path = os.path.join(root, name)
+            if FileLock.holder_host(path) == hostname:
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    logger.warning(f"Could not remove dead ingest lock {path}", exc_info=True)
+    if removed:
+        logger.info("released dead ingest locks", count=removed, host=hostname)
+    return removed
+
+
+def resume_interrupted_jobs(hostname: str) -> int:
+    """Re-enqueue the jobs this host was running when its worker stopped.
+
+    Called once the worker is up. A job still 'processing' (or gone 'stale')
+    with worker == this host cannot be running: this worker has just started.
+    It continues in its own run, from its stored offset, with the mapping
+    saved with its upload — what the Jobs page's Retry does, done for you.
+    Covers both a cooperative stop ("Paused for a worker restart") and a hard
+    kill, whose unacked message Redis would only redeliver hours later.
+    """
+    from app.services import uploads as upload_service
+    from app.services.progress_store import load_all_jobs
+
+    resumed = 0
+    for job in load_all_jobs():
+        if job.get('worker') != hostname or job.get('status') not in ('processing', 'stale'):
+            continue
+        name = job.get('file') or ''
+        try:
+            upload = upload_service.find_by_stored_name(name)
+            if upload is not None and upload.stored_path and os.path.isfile(upload.stored_path):
+                from app.services.housekeeper import process_file_async
+                queued = process_file_async(upload.stored_path, column_map=upload.column_map,
+                                            original_filename=upload.original_name, run_id=job.get('run_id'))
+            else:
+                path = os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, name)
+                if not os.path.isfile(path):
+                    logger.warning("interrupted job's file is gone; not resuming", file=name)
+                    continue
+                from app.services.housekeeper import process_file_async
+                queued = process_file_async(path, original_filename=job.get('original_name'),
+                                            run_id=job.get('run_id'))
+        except Exception:
+            logger.exception("could not resume interrupted job", file=name)
+            continue
+        if queued:
+            resumed += 1
+            logger.info("resumed interrupted job", file=name, run_id=job.get('run_id'), row=job.get('current'))
+    return resumed
+
+
+# ── Celery helpers (used by worker) ─────────────────────────────
 
 def _enqueue_or_warn(task, **kwargs) -> bool:
     """Enqueue a Celery task, or log a warning if the broker is unreachable.
@@ -911,7 +1166,7 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
     if not celery_broker_available():
         logger.warning(
             f"Cannot enqueue {task.__name__} — Redis at "
-            f"{CELERY_BROKER_URL} "
+            f"{get_settings().CELERY_BROKER_URL} "
             f"is not reachable. Start Redis or disable HOUSEKEEPING_ENABLED."
         )
         return False
@@ -933,7 +1188,7 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
         logger.warning(
             f"Timed out enqueuing {task.__name__} — "
             f"Kombu/Celery cannot connect to Redis at "
-            f"{CELERY_BROKER_URL}. "
+            f"{get_settings().CELERY_BROKER_URL}. "
             f"Run the worker in Docker for housekeeping, or set HOUSEKEEPING_ENABLED=false."
         )
         return False
@@ -944,13 +1199,13 @@ def _enqueue_or_warn(task, **kwargs) -> bool:
     return True
 
 
-# ── Async wrappers (Flask integration) ─────────────────────────
+# ── Async wrappers (Flask integration, Celery only) ──────────────
 
 def process_file_async(file_path: str, app=None, column_map: dict | None = None,
-                       original_filename: str | None = None) -> bool:
+                       original_filename: str | None = None, run_id: int | None = None) -> bool:
     """Enqueue a single file for processing via Celery (non-blocking).
 
-    Used by the upload API endpoint.
+    Used by the upload API endpoint and worker restart recovery.
 
     ``file_path`` is coerced to ``str`` here, at the Celery boundary, rather
     than trusted from callers. Both call sites build a ``pathlib.Path`` (and
@@ -970,19 +1225,21 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
 
     # A run per submission. Without a run_id every attempt at a file matched
     # the same progress row, so each one overwrote the previous attempt's
-    # history. Best effort: no run is better than no ingest.
-    run_id = None
-    try:
-        from app.services.progress_store import start_run
-        run_id = start_run(label=original_filename or os.path.basename(str(file_path)),
-                           source='upload', total_files=1)
-    except Exception as e:
-        logger.warning(f"Could not open a processing run for {file_path}: {e}")
+    # history. Best effort: no run is better than no ingest. A given run_id
+    # continues that run (resuming an interrupted job), so it is not discarded.
+    resuming = run_id is not None
+    if not resuming:
+        try:
+            from app.services.progress_store import start_run
+            run_id = start_run(label=original_filename or os.path.basename(str(file_path)),
+                               source='upload', total_files=1)
+        except Exception as e:
+            logger.warning(f"Could not open a processing run for {file_path}: {e}")
     if run_id is not None:
         kwargs['run_id'] = int(run_id)
 
     queued = bool(_enqueue_or_warn(process_file_task, **kwargs))
-    if not queued and run_id is not None:
+    if not queued and run_id is not None and not resuming:
         # Nothing will ever report into it, and an empty run reads as
         # 'pending' forever.
         try:
@@ -992,6 +1249,8 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
             logger.warning(f"Could not discard unused run {run_id}: {e}")
     return queued
 
+
+# ── Celery startup scan (used when HOUSEKEEPING_ENABLED=true) ───
 
 def _claim_process_pending() -> bool:
     """Whether this process should enqueue the startup scan.
@@ -1004,9 +1263,9 @@ def _claim_process_pending() -> bool:
     """
     try:
         from redis import Redis
-        client = Redis.from_url(CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
+        client = Redis.from_url(get_settings().CELERY_BROKER_URL, socket_connect_timeout=2, socket_timeout=2)
         return bool(client.set(PROCESS_PENDING_DEDUPE_KEY, str(os.getpid()),
-                               nx=True, ex=PROCESS_PENDING_DEDUPE_SECONDS))
+                               nx=True, ex=get_settings().STARTUP_SCAN_COOLDOWN_SECONDS))
     except Exception as e:
         logger.debug(f"process_pending de-dupe unavailable, not de-duplicating: {e}")
         return True
@@ -1016,7 +1275,7 @@ def process_pending(app=None):
     """Enqueue background processing of unprocessed files via Celery.
 
     Called once at Flask app startup — once per gunicorn worker, hence the
-    de-dupe guard.
+    de-dupe guard. Only runs when HOUSEKEEPING_ENABLED=true.
     """
     from app.tasks import process_pending_task
     if not _claim_process_pending():
@@ -1025,34 +1284,136 @@ def process_pending(app=None):
     _enqueue_or_warn(process_pending_task)
 
 
-# ── CLI dispatcher ─────────────────────────────────────────────
+STARTUP_SCAN_MARKER = '.startup-scan'
+_STARTUP_SCAN_HEARTBEAT_SECONDS = 30
 
-def cli_run(args):
-    """Entry point for the ``python housekeeping.py`` CLI.
 
-    Merges CLI args (which take precedence) over env-var sourced defaults.
+def start_startup_scan(app) -> str:
+    """Scan the data folder once per deployment, from one place.
+
+    Called by create_app(), i.e. in every gunicorn worker and again whenever
+    one is recycled (MAX_REQUESTS). Each of them used to run its own scan on a
+    thread: concurrent RDS conversions collided, every recycle re-listed and
+    re-checksummed the folder, and large files were read whole inside the
+    memory-capped API container.
+
+    - HOUSEKEEPING_ENABLED: the scan is queued for the Celery worker instead
+      (process_pending, de-duplicated across processes through Redis), so the
+      API never imports files itself.
+    - Otherwise one API process runs it on a thread (run_startup_scan).
+
+    Returns what happened, for logs and tests: 'disabled', 'queued' or 'thread'.
+    """
+    settings = get_settings()
+    if not settings.STARTUP_SCAN:
+        return 'disabled'
+    if settings.HOUSEKEEPING_ENABLED:
+        process_pending()
+        return 'queued'
+    threading.Thread(target=run_startup_scan, args=(app,), name='startup-scan', daemon=True).start()
+    return 'thread'
+
+
+def run_startup_scan(app) -> bool:
+    """Run the startup scan here unless another process ran or runs it.
+
+    The claim is ``<data dir>/.startup-scan``, an O_EXCL FileLock whose staleness
+    is STARTUP_SCAN_COOLDOWN_SECONDS. A heartbeat keeps it fresh while the scan
+    runs, so no other process starts one meanwhile; afterwards the file is left
+    in place on purpose, so a process booting within the cooldown — a sibling
+    gunicorn worker, a recycled one — skips its scan. After the cooldown the
+    marker counts as stale and the next boot scans again.
+    """
+    settings = get_settings()
+    folder = settings.HOUSEKEEPING_DATA_DIR
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        logger.exception("startup scan skipped: data folder unavailable", folder=folder)
+        return False
+    claim = FileLock(os.path.join(folder, STARTUP_SCAN_MARKER), settings.STARTUP_SCAN_COOLDOWN_SECONDS)
+    if not claim.acquire():
+        logger.info("startup scan skipped: another process ran it recently or is running it")
+        return False
+
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(_STARTUP_SCAN_HEARTBEAT_SECONDS):
+            claim.touch()
+
+    threading.Thread(target=heartbeat, name='startup-scan-heartbeat', daemon=True).start()
+    try:
+        set_app(app)
+        with app.app_context():
+            load_rds_to_db(
+                data_folder=folder,
+                max_workers=settings.HOUSEKEEPING_MAX_WORKERS,
+                **housekeeping_settings(),
+            )
+    except Exception:
+        logger.exception("startup scan failed")
+    finally:
+        stop.set()
+        claim.touch()  # the cooldown starts when the scan ends; the file stays
+    return True
+
+
+# ── Housekeeping runner ──────────────────────────────────────────
+
+def run(
+    data_folder: str | None = None,
+    *,
+    watch: bool = False,
+    dry_run: bool = False,
+    batch_size: int | None = None,
+    chunk_size: int | None = None,
+    checkpoint_interval: int | None = None,
+) -> None:
+    """Run housekeeping using the supplied configuration.
+
+    ``None`` values fall back to the corresponding housekeeping settings.
+    Explicit values always take precedence over environment configuration.
+
+    This function is intentionally independent of any CLI framework so it can
+    be called directly by the CLI, tests, scheduled jobs, or other application
+    entry points.
     """
     settings = housekeeping_settings()
-    for key in ('batch_size', 'chunk_size', 'checkpoint_interval'):
-        cli_val = getattr(args, key, None)
-        if cli_val is not None:
-            settings[key] = cli_val
 
-    # Only here: the CLI is the one entry point that owns its process. See
-    # install_signal_handlers() for why this is not done at import time.
+    if batch_size is not None:
+        settings['batch_size'] = batch_size
+
+    if chunk_size is not None:
+        settings['chunk_size'] = chunk_size
+
+    if checkpoint_interval is not None:
+        settings['checkpoint_interval'] = checkpoint_interval
+
+    if data_folder is None:
+        data_folder = get_settings().HOUSEKEEPING_DATA_DIR
+
+    os.makedirs(data_folder, exist_ok=True)
+
+    # The housekeeping runner owns this process only when called directly.
+    # Do not install handlers at module import time because this module is also
+    # imported by Flask and Celery.
     install_signal_handlers()
 
-    data_folder = args.data_folder or DATA_DIR
-    os.makedirs(data_folder, exist_ok=True)
     set_app(_get_app())
 
-    if args.watch:
-        watch_directory(data_folder, dry_run=args.dry_run, **settings)
-    else:
-        with _get_app().app_context():
-            load_rds_to_db(
-                data_folder=data_folder,
-                dry_run=args.dry_run,
-                max_workers=HOUSEKEEPING_MAX_WORKERS,
-                **settings,
-            )
+    if watch:
+        watch_directory(
+            data_folder,
+            dry_run=dry_run,
+            **settings,
+        )
+        return
+
+    with _get_app().app_context():
+        load_rds_to_db(
+            data_folder=data_folder,
+            dry_run=dry_run,
+            max_workers=get_settings().HOUSEKEEPING_MAX_WORKERS,
+            **settings,
+        )

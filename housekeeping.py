@@ -1,23 +1,69 @@
+"""Housekeeping CLI for processing RDS/Parquet files into the database.
+
+This module contains only CLI wiring. All processing logic lives in
+:mod:`app.services.housekeeper`.
 """
-Housekeeping script — processes RDS/Parquet files into the database.
 
-Thin CLI wrapper; all processing logic lives in app/services/housekeeper.py.
-"""
-import argparse
+import typer
 
-from app.config import HOUSEKEEPING_DATA_DIR
-from app.services.housekeeper import cli_run
+from app.config import get_settings
+from app.services.housekeeper import run as run_housekeeping
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="KVuno housekeeping — process RDS/Parquet files")
-    parser.add_argument('--watch', action='store_true', help="Watch directory for new files")
-    parser.add_argument('--dry-run', action='store_true', help="Scan and report what would be processed without touching DB")
-    parser.add_argument('--batch-size', type=int, default=None, help="Batch insert size")
-    parser.add_argument('--chunk-size', type=int, default=None, help="Rows per chunk")
-    parser.add_argument('--checkpoint-interval', type=int, default=None, help="Batches per checkpoint")
-    # Same directory the API and worker use. The old default, static/data, was
-    # a different folder, so the CLI scanned somewhere uploads never land.
-    parser.add_argument('data_folder', nargs='?', default=HOUSEKEEPING_DATA_DIR,
-                        help=f"Data directory (default: HOUSEKEEPING_DATA_DIR = {HOUSEKEEPING_DATA_DIR})")
 
-    cli_run(parser.parse_args())
+app = typer.Typer(
+    name="kvuno-housekeeping",
+    help="Process RDS/Parquet agricultural files into the database.",
+    add_completion=False,
+)
+
+
+@app.command()
+def main(
+    data_folder: str = typer.Argument(
+        default_factory=lambda: get_settings().HOUSEKEEPING_DATA_DIR,
+        help="Data directory to scan.",
+    ),
+    watch: bool = typer.Option(
+        False,
+        "--watch",
+        "-w",
+        help="Continuously watch the directory for new files.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Scan and report what would be processed without modifying the database.",
+    ),
+    batch_size: int | None = typer.Option(
+        None,
+        "--batch-size",
+        help="Batch insert size. Defaults to HOUSEKEEPING_BATCH_SIZE.",
+    ),
+    chunk_size: int | None = typer.Option(
+        None,
+        "--chunk-size",
+        help="Rows per processing chunk. Defaults to HOUSEKEEPING_CHUNK_SIZE.",
+    ),
+    checkpoint_interval: int | None = typer.Option(
+        None,
+        "--checkpoint-interval",
+        help=(
+            "Number of batches between checkpoints. "
+            "Defaults to HOUSEKEEPING_CHECKPOINT_INTERVAL."
+        ),
+    ),
+) -> None:
+    """Process RDS/Parquet files in the configured data directory."""
+
+    run_housekeeping(
+        data_folder=data_folder,
+        watch=watch,
+        dry_run=dry_run,
+        batch_size=batch_size,
+        chunk_size=chunk_size,
+        checkpoint_interval=checkpoint_interval,
+    )
+
+
+if __name__ == "__main__":
+    app()

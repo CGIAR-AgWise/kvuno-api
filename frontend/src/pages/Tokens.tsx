@@ -71,7 +71,7 @@ export default function Tokens() {
   }
 
   return (
-    <div className="py-3" style={{ maxWidth: '60rem' }}>
+    <div className="pb-3">
       <div className="d-flex flex-wrap gap-2 align-items-end mb-3">
         <div>
           <label htmlFor="expiry-select" className="form-label small text-muted mb-1">
@@ -125,7 +125,9 @@ export default function Tokens() {
         {loading ? (
           <p className="text-muted text-center py-4 mb-0">Loading…</p>
         ) : tokens.length === 0 ? (
-          <p className="text-muted text-center py-4 mb-0">No active tokens found.</p>
+          <div className="kv-empty">
+            <p>No tokens. Create one above for scripts that call the API.</p>
+          </div>
         ) : (
           <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">

@@ -77,9 +77,9 @@ def upgrade() -> None:
         op.execute(dedupe)  # offline: emit the SQL, there is no count to report
     else:
         deleted = bind.execute(dedupe).rowcount or 0
-        message = f"Deleted {deleted} duplicate row(s) from {TABLE_NAME} (NULL-aware key match)"
-        log.info(message)
-        print(message)
+        # Logged at WARNING so the count shows at any LOG_LEVEL: it reports
+        # deleted rows. (env.py routes Alembic logging through the app's.)
+        log.warning(f"Deleted {deleted} duplicate row(s) from {TABLE_NAME} (NULL-aware key match)")
 
     op.drop_constraint(CONSTRAINT, TABLE_NAME, type_='unique')
     op.create_unique_constraint(CONSTRAINT, TABLE_NAME, KEY_COLUMNS,

@@ -1,25 +1,32 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
+import { Link } from 'react-router-dom'
 import { fetchJobProgress, startProcessing } from '../api'
 import type { Job } from '../api'
 import { STATUSES, useJobStream } from '../hooks/useJobStream'
 import type { StatusFilter } from '../hooks/useJobStream'
 import { useToast } from '../context/ToastContext'
 import RunPanel from '../components/RunPanel'
+import StatusBadge, { TONE_BAR } from '../components/StatusBadge'
+import type { Tone } from '../components/StatusBadge'
 
 interface StatusMeta {
-  color: string
+  tone: Tone
   bar: string
   label: string
 }
 
 const STATUS: Record<string, StatusMeta> = {
-  processing: { color: 'primary', bar: '#0d6efd', label: 'Processing' },
-  completed: { color: 'success', bar: '#198754', label: 'Completed' },
-  error: { color: 'danger', bar: '#dc3545', label: 'Failed' },
+  processing: { tone: 'info', bar: TONE_BAR.info, label: 'Processing' },
+  // A data-folder RDS being converted to Parquet before it is imported. Its
+  // read cannot be measured (no total), so the bar is indeterminate until
+  // the write reports rows. Listed under the Processing filter.
+  converting: { tone: 'info', bar: TONE_BAR.info, label: 'Converting' },
+  completed: { tone: 'success', bar: TONE_BAR.success, label: 'Completed' },
+  error: { tone: 'danger', bar: TONE_BAR.danger, label: 'Failed' },
   // Worker stopped reporting (crash, OOM kill, restart). Not running.
-  stale: { color: 'warning', bar: '#fd7e14', label: 'Stalled' },
-  unknown: { color: 'secondary', bar: '#6c757d', label: 'Pending' },
+  stale: { tone: 'warning', bar: TONE_BAR.warning, label: 'Stalled' },
+  unknown: { tone: 'neutral', bar: TONE_BAR.neutral, label: 'Pending' },
 }
 
 const statusMeta = (status?: string): StatusMeta => (status && STATUS[status]) || STATUS.unknown
@@ -68,14 +75,18 @@ export default function Jobs() {
       stale: 0,
       unknown: 0,
     }
-    for (const job of jobs) acc[job.status] = (acc[job.status] ?? 0) + 1
+    for (const job of jobs) {
+      const key = job.status === 'converting' ? 'processing' : job.status
+      acc[key] = (acc[key] ?? 0) + 1
+    }
     return acc
   }, [jobs])
 
   const visible = useMemo(() => {
     const term = search.toLowerCase().trim()
     return jobs.filter((job) => {
-      if (filter !== 'all' && job.status !== filter) return false
+      const status = job.status === 'converting' ? 'processing' : job.status
+      if (filter !== 'all' && status !== filter) return false
       if (term) {
         const name = (job.original_name || job.file || '').toLowerCase()
         if (!name.includes(term)) return false
@@ -98,31 +109,33 @@ export default function Jobs() {
   }
 
   return (
-    <div className="py-3">
+    <div className="pb-3">
       <div className="d-flex flex-wrap gap-2 align-items-center mb-3">
-        <div className="btn-group btn-group-sm" role="group" aria-label="Filter by status">
+        <div className="kv-segment" role="group" aria-label="Filter by status">
           {STATUSES.map((status) => (
             <button
               key={status}
-              className={'btn ' + (filter === status ? 'btn-primary' : 'btn-outline-secondary')}
+              type="button"
+              className={filter === status ? 'active' : ''}
+              aria-pressed={filter === status}
               onClick={() => setFilter(status)}
             >
               {status === 'all' ? 'All' : statusMeta(status).label}
-              {status !== 'all' && counts[status] ? ' (' + counts[status] + ')' : ''}
+              {status !== 'all' && counts[status] ? <span className="kv-count">{counts[status]}</span> : null}
             </button>
           ))}
         </div>
         <input
           type="search"
           aria-label="Search files"
-          className="form-control form-control-sm ms-auto"
+          className="form-control form-control-sm ms-md-auto"
           style={{ maxWidth: '18rem' }}
           placeholder="Search files…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
-        <span className={'badge ' + (connected ? 'text-bg-success' : 'text-bg-secondary')}>
-          {connected ? 'live' : 'reconnecting…'}
+        <span className={'kv-live' + (connected ? ' is-live' : '')} role="status">
+          {connected ? 'Live' : 'Reconnecting…'}
         </span>
       </div>
 
@@ -135,8 +148,16 @@ export default function Jobs() {
         </div>
         <div className="col-lg-8 order-lg-1">
       <div className="kvuno-card p-3">
-        {visible.length === 0 ? (
-          <p className="text-muted text-center py-5 mb-0">No matching jobs.</p>
+        {jobs.length === 0 ? (
+          <div className="kv-empty">
+            <p>
+              No imports yet. <Link to="/upload">Upload a file</Link> to start one.
+            </p>
+          </div>
+        ) : visible.length === 0 ? (
+          <div className="kv-empty">
+            <p>No jobs match this status or search.</p>
+          </div>
         ) : (
           <div className="kvuno-table-fit">
             <table className="table table-hover align-middle mb-0">
@@ -154,7 +175,14 @@ export default function Jobs() {
               <tbody>
                 {visible.map((job) => {
                   const total = job.total ?? 1
-                  const pct = total > 0 ? Math.round(((job.current ?? 0) / total) * 100) : 0
+                  const active = job.status === 'processing' || job.status === 'converting'
+                  // Converting with no total yet: still reading the RDS.
+                  const indeterminate = job.status === 'converting' && !total
+                  const pct = indeterminate
+                    ? 100
+                    : total > 0
+                      ? Math.round(((job.current ?? 0) / total) * 100)
+                      : 0
                   const meta = statusMeta(job.status)
                   const rate = rateInfo(job)
                   const retryable = job.status === 'error' || job.status === 'stale'
@@ -181,7 +209,7 @@ export default function Jobs() {
                         </span>
                       </td>
                       <td>
-                        <span className={'badge rounded-pill text-bg-' + meta.color}>{meta.label}</span>
+                        <StatusBadge tone={meta.tone} label={meta.label} />
                       </td>
                       <td className="d-none d-md-table-cell text-nowrap small text-muted kvuno-status">
                         {(job.current ?? 0).toLocaleString()} / {total.toLocaleString()}
@@ -191,18 +219,17 @@ export default function Jobs() {
                           <div
                             className={
                               'progress-bar' +
-                              (job.status === 'processing'
-                                ? ' progress-bar-striped progress-bar-animated'
-                                : '')
+                              (active ? ' progress-bar-striped progress-bar-animated' : '')
                             }
                             role="progressbar"
                             aria-label="Progress"
                             aria-valuemin={0}
                             aria-valuemax={100}
-                            aria-valuenow={job.status === 'completed' ? 100 : pct}
+                            aria-valuenow={indeterminate ? undefined : job.status === 'completed' ? 100 : pct}
                             style={{
                               width: (job.status === 'completed' ? 100 : pct) + '%',
                               backgroundColor: meta.bar,
+                              opacity: indeterminate ? 0.45 : undefined,
                             }}
                           />
                         </div>
@@ -233,7 +260,7 @@ export default function Jobs() {
                           <button
                             className={
                               'btn btn-outline-' +
-                              (job.status === 'stale' ? 'warning' : 'danger') +
+                              (job.status === 'stale' ? 'secondary' : 'danger') +
                               ' btn-sm'
                             }
                             disabled={retrying === job.file}
@@ -338,7 +365,7 @@ function JobDetail({
               <dl className="row mb-0">
                 <dt className="col-sm-4">Status</dt>
                 <dd className="col-sm-8">
-                  <span className={'badge rounded-pill text-bg-' + meta.color}>{meta.label}</span>
+                  <StatusBadge tone={meta.tone} label={meta.label} />
                 </dd>
                 <dt className="col-sm-4">Rows processed</dt>
                 <dd className="col-sm-8">
@@ -377,7 +404,7 @@ function JobDetail({
                 <button
                   type="button"
                   className={
-                    'btn btn-sm btn-outline-' + (shown.status === 'stale' ? 'warning' : 'danger')
+                    'btn btn-sm btn-outline-' + (shown.status === 'stale' ? 'secondary' : 'danger')
                   }
                   disabled={busy}
                   onClick={async () => {

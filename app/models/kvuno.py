@@ -2,7 +2,7 @@ from typing import Any, Optional
 import datetime
 
 from geoalchemy2.types import Geometry
-from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
@@ -102,9 +102,10 @@ class Upload(Base):
     and a worker boot that wiped `.chunks` lost every upload in flight. Every
     step now moves this row forward instead:
 
-        receiving -> received -> inspecting -> ready | failed -> submitted
+        receiving -> received -> inspecting -> ready | failed -> submitted -> processing
 
     `id` is issued by the server (a uuid hex), never taken from the client.
+    A data-folder file held for mapping enters at `received` (source='folder').
     """
     __tablename__ = 'uploads'
     __table_args__ = (
@@ -121,12 +122,22 @@ class Upload(Base):
     # against MAX_FILE_SIZE before any bytes are accepted.
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default='receiving')
+    # 'upload' (the Upload page) or 'folder': a data-folder file whose columns
+    # the default mapping does not cover, held here for someone to map
+    # (housekeeper.hold_unmapped). Folder uploads have no owner, are visible
+    # to every signed-in user and are never deleted as abandoned.
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default='upload',
+                                        server_default='upload')
     # The file the worker will read. Differs from the received file after an
     # RDS is converted to Parquet during inspection.
     stored_path: Mapped[Optional[str]] = mapped_column(String(512))
     sha256: Mapped[Optional[str]] = mapped_column(String(64))
     preview: Mapped[Optional[dict]] = mapped_column(JSON)
     duplicate: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Where inspection has got to, for the Upload page while it reads the
+    # file: {stage, done, total, elapsed}. stage is reading|writing (RDS ->
+    # Parquet conversion), checksum or preview. Cleared once inspected.
+    progress: Mapped[Optional[dict]] = mapped_column(JSON)
     # Source column -> DB column. Seeded with the server's guesses during
     # inspection, replaced by the user's choice on submit, and re-used by Retry.
     column_map: Mapped[Optional[dict]] = mapped_column(JSON)
@@ -208,8 +219,8 @@ class PlantingRecommendation(Base):
     season_type: Mapped[Optional[str]] = mapped_column(String(20))
     opt_date: Mapped[Optional[str]] = mapped_column(String(8))
     planting_option: Mapped[Optional[int]] = mapped_column(Integer)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
-    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
 
 
 class User(Base):
@@ -217,14 +228,29 @@ class User(Base):
     __table_args__ = (
         PrimaryKeyConstraint('id', name='users_pkey'),
         UniqueConstraint('email', name='users_email_key'),
-        UniqueConstraint('username', name='users_username_key')
+        UniqueConstraint('username', name='users_username_key'),
+        Index('ix_users_status', 'status'),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # with_variant: SQLite only auto-increments an INTEGER PRIMARY KEY.
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, 'sqlite'), primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(100), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
+    # pending -> approved | rejected; approved -> disabled -> approved.
+    # Only `approved` accounts (and administrators) can sign in or use a token.
+    # The column's server default is 'approved' so the migration keeps every
+    # existing account working; registration sets 'pending' explicitly.
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default='pending',
+                                        server_default='approved')
+    # 'user' or 'admin'. Admins see the Accounts screens and approve, reject,
+    # disable and promote. Addresses in ADMIN_EMAILS are admins whatever this
+    # says (the "owners"), so access can always be recovered.
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default='user', server_default='user')
+    # Who changed the status last, and when — naive UTC like every timestamp here.
+    reviewed_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    reviewed_by: Mapped[Optional[int]] = mapped_column(BigInteger)
 
     user_tokens: Mapped[list['UserToken']] = relationship('UserToken', back_populates='user')
 
@@ -237,10 +263,11 @@ class UserToken(Base):
         Index('idx_user_tokens_token', 'token')
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # with_variant: SQLite only auto-increments an INTEGER PRIMARY KEY.
+    id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, 'sqlite'), primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     token: Mapped[str] = mapped_column(String(128), nullable=False)
-    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
+    created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
     expires_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
     last_used_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
 

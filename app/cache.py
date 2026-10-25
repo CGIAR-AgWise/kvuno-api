@@ -5,7 +5,8 @@ import json
 from redis import Redis
 from redis.exceptions import RedisError
 
-from app.config import CELERY_BROKER_URL
+from app.config import get_settings
+from app.utils.json_encoding import json_default
 
 _client = None
 
@@ -13,7 +14,7 @@ _client = None
 def _get_client() -> Redis:
     global _client
     if _client is None:
-        _client = Redis.from_url(CELERY_BROKER_URL, socket_connect_timeout=1, socket_timeout=1)
+        _client = Redis.from_url(get_settings().CELERY_BROKER_URL, socket_connect_timeout=1, socket_timeout=1)
     return _client
 
 
@@ -54,7 +55,9 @@ def api_cache(prefix: str, ttl: int = 300):
                 return result
             try:
                 client = _get_client()
-                client.setex(key, ttl, json.dumps(body, default=str))
+                # Same encoder as the live response: default=str wrote
+                # "2026-10-22 07:59:49", so a cache hit differed from a miss.
+                client.setex(key, ttl, json.dumps(body, default=json_default))
             except RedisError:
                 pass
             return result

@@ -39,20 +39,23 @@ import uuid
 
 from sqlalchemy import or_, update
 
-from app.config import ALLOWED_EXTENSIONS, HOUSEKEEPING_DATA_DIR
+from app.config import ALLOWED_EXTENSIONS, get_settings
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, Upload
-from app.utils.logging import SharedLogger
+from app.utils.logging import get_logger
 
-logger = SharedLogger().get_logger()
+logger = get_logger(__name__)
 
 TUS_VERSION = '1.0.0'
 
-# Under the data directory but in a subdirectory on purpose: the startup scan
-# (`load_rds_to_db`) ingests every .rds/.parquet in the data directory's root
-# with the default mapping, which used to pick up uploads still waiting for the
-# user to map their columns.
-UPLOAD_ROOT = os.path.join(HOUSEKEEPING_DATA_DIR, 'uploads')
+
+def upload_root() -> str:
+    # Under the data directory but in a subdirectory on purpose: the startup
+    # scan (`load_rds_to_db`) ingests every .rds/.parquet in the data
+    # directory's root with the default mapping, which used to pick up uploads
+    # still waiting for the user to map their columns.
+    return os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, 'uploads')
+
 
 PART_NAME = 'data.part'
 LOCK_NAME = '.lock'
@@ -63,7 +66,9 @@ LOCK_STALE_SECONDS = 30
 WRITE_BLOCK = 64 * 1024
 
 INSPECT_HEARTBEAT_SECONDS = 30
-INSPECT_STALE_SECONDS = int(os.getenv('UPLOAD_INSPECT_STALE_SECONDS', '180'))
+# Inspection progress is polled every 1.5 s by the Upload page; writing it
+# more often than this would only add database writes.
+PROGRESS_WRITE_SECONDS = 2
 
 ERROR_MAX = 2000
 
@@ -71,9 +76,9 @@ _ID_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # Statuses that still accept a mapping and a submit. `failed` is excluded:
 # there is nothing to map when the file could not be read.
-SUBMITTABLE = ('ready', 'submitted')
+SUBMITTABLE = ('ready', 'submitted', 'processing')
 # Uploads that never reached a worker; cleaned up once abandoned.
-UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed')
+UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed', 'processing')
 
 _EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
 DB_TARGET_COLUMNS = {
@@ -119,7 +124,7 @@ def upload_dir(upload_id: str) -> str:
     # a path, whatever the call site.
     if not valid_id(upload_id):
         raise UploadError('Invalid upload id', 404)
-    return os.path.join(UPLOAD_ROOT, upload_id)
+    return os.path.join(upload_root(), upload_id)
 
 
 def part_path(upload_id: str) -> str:
@@ -172,8 +177,18 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
         created_at=_now(),
         updated_at=_now(),
     )
-    os.makedirs(upload_dir(upload.id), exist_ok=True)
-    open(part_path(upload.id), 'wb').close()
+    try:
+        os.makedirs(upload_dir(upload.id), exist_ok=True)
+        open(part_path(upload.id), 'wb').close()
+    except OSError as e:
+        # Almost always the data volume's ownership: the container runs as the
+        # non-root `app` user (UID 1000) and a volume created before the image
+        # made the directory is owned by root. A server problem, not the
+        # client's — 503 with a stable message, and one clear log line.
+        logger.error('upload storage is not writable', path=upload_root(), error=e.__class__.__name__,
+                     errno=e.errno, hint='chown the HOUSEKEEPING_DATA_DIR volume to 1000:1000')
+        raise UploadError('Upload storage on the server is not writable. Ask an administrator to fix '
+                          'the data volume permissions.', 503) from None
 
     session = _session()
     session.add(upload)
@@ -181,21 +196,73 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
     return upload
 
 
+def _visible_to(owner_id: int | None):
+    """The caller's own uploads, plus data-folder files held for mapping (no owner)."""
+    return or_(Upload.owner_id == owner_id, Upload.source == 'folder')
+
+
 def get_owned(upload_id: str, owner_id: int | None) -> Upload:
-    """Load an upload the caller owns. Anyone else's is reported as not found."""
+    """Load an upload the caller may see. Anyone else's is reported as not found.
+
+    Data-folder files held for mapping belong to nobody, so every signed-in
+    user can see and map them.
+    """
     if not valid_id(upload_id):
         raise UploadError('Upload not found', 404)
     upload = _session().get(Upload, upload_id)
-    if upload is None or upload.owner_id != owner_id:
+    if upload is None or (upload.owner_id != owner_id and upload.source != 'folder'):
         raise UploadError('Upload not found', 404)
     return upload
 
 
 def list_owned(owner_id: int | None, statuses=UNFINISHED) -> list[Upload]:
     return (_session().query(Upload)
-            .filter(Upload.owner_id == owner_id, Upload.status.in_(statuses))
+            .filter(_visible_to(owner_id), Upload.status.in_(statuses))
             .order_by(Upload.created_at.desc())
             .all())
+
+
+def count_awaiting_mapping(owner_id: int | None) -> int:
+    """Uploads the caller can see that are inspected and waiting for a mapping."""
+    return (_session().query(Upload)
+            .filter(_visible_to(owner_id), Upload.status == 'ready')
+            .count())
+
+
+def hold_from_folder(file_path: str) -> Upload:
+    """Take a data-folder file the default mapping cannot import, and hold it for mapping.
+
+    The file moves into ``uploads/<id>/`` (so the next scan no longer sees it
+    in the data folder root) and is inspected like an upload: preview,
+    checksum, duplicate check and suggested mapping. It then waits, as
+    status ``ready``, for someone to map it on the Upload page.
+    """
+    name = os.path.basename(file_path)
+    upload = Upload(
+        id=uuid.uuid4().hex,
+        owner_id=None,
+        source='folder',
+        original_name=_clip(name, 255),
+        size=os.path.getsize(file_path),
+        status='received',
+        created_at=_now(),
+        updated_at=_now(),
+    )
+    # Row first, then the move: if the move fails the row is removed and the
+    # file is still where the caller can import it the old way.
+    session = _session()
+    session.add(upload)
+    session.commit()
+    try:
+        os.makedirs(upload_dir(upload.id), exist_ok=True)
+        os.replace(file_path, received_path(upload))
+    except OSError:
+        session.delete(upload)
+        session.commit()
+        raise
+    logger.info("data-folder file held for mapping", upload_id=upload.id, file=name)
+    inspect(upload.id)
+    return session.get(Upload, upload.id)
 
 
 def current_offset(upload: Upload) -> int:
@@ -348,7 +415,7 @@ def validate_column_map(column_map, columns: list[str]) -> dict[str, str]:
     return clean
 
 
-def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | None:
+def describe_duplicate(file_path: str, total_rows: int | None = None, checksum: str | None = None) -> dict | None:
     """Describe a previously-ingested file with the same content, if any.
 
     Returns None, or {status, original_filename, processed_at, offset} where
@@ -357,11 +424,15 @@ def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | 
     past the file's row count is also 'processed': files completed before the
     worker started clearing the offset were left with offset == row count.
     """
+    if not get_settings().INGEST_DUPLICATE_CHECK:
+        return None
     try:
         from app.utils import calculate_file_checksum
         from app.repo.file_import import FileImportRepo
 
-        checksum = calculate_file_checksum(file_path, logger)
+        # Inspection passes the checksum it already computed: hashing twice
+        # was a second full read of the file.
+        checksum = checksum or calculate_file_checksum(file_path, logger)
         if not checksum:
             return None
         existing = FileImportRepo().get_by_checksum(checksum)
@@ -382,7 +453,7 @@ def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | 
 
 def _claim_inspection(upload_id: str) -> bool:
     """Atomically take the inspection, so two pollers never run it twice."""
-    stale_before = _now() - datetime.timedelta(seconds=INSPECT_STALE_SECONDS)
+    stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
     session = _session()
     claimed = session.execute(
         update(Upload)
@@ -411,6 +482,41 @@ def _heartbeat(app, upload_id: str, stop: threading.Event):
             logger.warning(f'Upload {upload_id}: heartbeat failed', exc_info=True)
 
 
+class _ProgressWriter:
+    """Records where an inspection has got to on the upload row (Upload page).
+
+    Called by the RDS conversion every couple of seconds; written at most once
+    per PROGRESS_WRITE_SECONDS unless the stage changes. Uses its own Session,
+    like progress_store, so it never commits the inspection's pending changes.
+    It also bumps updated_at, which is what the stale-inspection check reads.
+    """
+
+    def __init__(self, upload_id: str):
+        self.upload_id = upload_id
+        self.elapsed = 0.0
+        self._stage = None
+        self._written = 0.0
+
+    def __call__(self, stage: str, done: int, total: int, elapsed: float, force: bool = False):
+        self.elapsed = elapsed
+        now = time.monotonic()
+        if not force and stage == self._stage and now - self._written < PROGRESS_WRITE_SECONDS:
+            return
+        self._stage, self._written = stage, now
+        from sqlalchemy.orm import Session
+        try:
+            with Session(bind=MyDb.get_db().engine) as session:
+                session.execute(
+                    update(Upload)
+                    .where(Upload.id == self.upload_id, Upload.status == 'inspecting')
+                    .values(progress={'stage': stage, 'done': int(done), 'total': int(total),
+                                      'elapsed': round(elapsed, 1)},
+                            updated_at=_now()))
+                session.commit()
+        except Exception:
+            logger.warning('upload progress write failed', upload_id=self.upload_id, exc_info=True)
+
+
 def inspect(upload_id: str, app=None):
     """Convert, preview and fingerprint a received upload. Runs off the request path."""
     from app.utils.preview import build_preview
@@ -437,8 +543,10 @@ def inspect(upload_id: str, app=None):
         if not os.path.isfile(source):
             raise UploadError('The uploaded file is missing from storage')
 
-        stored = convert_for_ingestion(source)
+        progress = _ProgressWriter(upload_id)
+        stored = convert_for_ingestion(source, on_progress=progress)
         ext = _extension(stored)
+        progress('preview', 0, 0, progress.elapsed, force=True)
         preview = build_preview(stored, ext, use_cache=False)
 
         total_rows = None
@@ -446,19 +554,24 @@ def inspect(upload_id: str, app=None):
             import pyarrow.parquet as pq
             total_rows = pq.ParquetFile(stored).metadata.num_rows
 
+        progress('checksum', 0, 0, progress.elapsed, force=True)
         upload.stored_path = stored
         upload.sha256 = calculate_file_checksum(stored, logger)
+        upload.progress = None
         upload.preview = {**preview, 'total_rows': total_rows}
-        upload.duplicate = describe_duplicate(stored, total_rows)
+        upload.duplicate = describe_duplicate(stored, total_rows, checksum=upload.sha256)
         upload.column_map = suggest_column_map(preview['columns'])
         upload.status = 'ready'
         upload.error = None
     except Exception as e:
-        logger.error(f'Upload {upload_id}: inspection failed: {e}')
+        from app.utils.rds_to_parquet import ConversionError
+        logger.exception(f'Upload {upload_id}: inspection failed: {e}')
         session.rollback()
         upload = session.get(Upload, upload_id)
         upload.status = 'failed'
-        upload.error = _clip(f'Could not read the file: {e}')
+        upload.progress = None
+        # ConversionError already says, for the user, what went wrong.
+        upload.error = _clip(str(e) if isinstance(e, ConversionError) else f'Could not read the file: {e}')
     finally:
         stop.set()
     upload.updated_at = _now()
@@ -474,7 +587,7 @@ def ensure_inspection(app, upload: Upload) -> None:
     """
     if upload.status not in ('received', 'inspecting'):
         return
-    stale_before = _now() - datetime.timedelta(seconds=INSPECT_STALE_SECONDS)
+    stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
     if upload.status == 'inspecting' and upload.updated_at and upload.updated_at >= stale_before:
         return  # alive: its heartbeat is recent
 
@@ -491,13 +604,15 @@ def ensure_inspection(app, upload: Upload) -> None:
 # ── Submission and removal ─────────────────────────────────────
 
 def submit(upload: Upload, column_map=None) -> Upload:
-    """Validate and store the mapping, ready to enqueue. `None` re-uses the saved one (Retry)."""
+    """Validate and store the mapping, ready to process. `None` re-uses the saved one (Retry)."""
     if upload.status not in SUBMITTABLE:
         raise UploadError(f'Upload is {upload.status}, not ready to process', 409)
     columns = (upload.preview or {}).get('columns', [])
     upload.column_map = validate_column_map(
         upload.column_map if column_map is None else column_map, columns)
-    upload.status = 'submitted'
+    # If already processing, keep that status; otherwise mark as submitted
+    if upload.status != 'processing':
+        upload.status = 'submitted'
     upload.error = None
     upload.updated_at = _now()
     _session().commit()
@@ -531,10 +646,15 @@ def discard(upload: Upload) -> None:
 
 
 def cleanup_abandoned(max_age_seconds: int) -> int:
-    """Delete uploads that never reached a worker and have been idle too long."""
+    """Delete uploads that never reached a worker and have been idle too long.
+
+    Never data-folder files held for mapping: they are the operator's files,
+    not an abandoned upload, and would otherwise vanish after a week.
+    """
     cutoff = _now() - datetime.timedelta(seconds=max_age_seconds)
     stale = (_session().query(Upload)
-             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff)
+             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff,
+                     Upload.source != 'folder')
              .all())
     for upload in stale:
         discard(upload)
@@ -546,6 +666,7 @@ def to_dict(upload: Upload) -> dict:
     return {
         'id': upload.id,
         'name': upload.original_name,
+        'source': upload.source or 'upload',
         'size': upload.size,
         'received': current_offset(upload),
         'status': upload.status,
@@ -556,6 +677,7 @@ def to_dict(upload: Upload) -> dict:
         'duplicate': upload.duplicate,
         'column_map': upload.column_map or {},
         'error': upload.error,
+        'progress': upload.progress if upload.status == 'inspecting' else None,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

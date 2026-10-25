@@ -6,8 +6,14 @@ directory lives on (local disk or a shared volume), so it works across
 processes and containers without Redis. A holder that dies cannot release it,
 so a lock whose mtime is older than ``stale_seconds`` is taken over; a live
 holder must ``touch()`` it more often than that.
+
+The file records "<hostname> <pid>". The worker uses the hostname at startup
+to clear locks its previous run left behind (``release_dead_locks``), instead
+of waiting out ``stale_seconds`` — during which a resumed job would find the
+dead lock "held" and skip the file.
 """
 import os
+import socket
 import time
 
 
@@ -24,7 +30,7 @@ class FileLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 try:
                     # Who holds it, for whoever finds it on disk later.
-                    os.write(fd, f"{os.getpid()}\n".encode())
+                    os.write(fd, f"{socket.gethostname()} {os.getpid()}\n".encode())
                 finally:
                     os.close(fd)
                 self.held = True
@@ -37,6 +43,16 @@ class FileLock:
                 except OSError:
                     pass
         return False
+
+    @staticmethod
+    def holder_host(path: str) -> str | None:
+        """The hostname recorded in a lock file; None if unreadable or old-format (pid only)."""
+        try:
+            with open(path) as f:
+                parts = f.read().split()
+        except OSError:
+            return None
+        return parts[0] if len(parts) == 2 else None
 
     def touch(self):
         if self.held:
