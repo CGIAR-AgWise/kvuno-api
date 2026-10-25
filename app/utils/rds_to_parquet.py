@@ -1,10 +1,89 @@
-"""Convert .RDS files to .parquet for faster, splittable downstream processing."""
+"""Convert .RDS files to .parquet for faster, splittable downstream processing.
+
+⚠️ Reading an RDS is the memory-heavy step, not the conversion: pyreadr has no
+partial or chunked read, and it builds one Python object per text cell. A
+7.4 MB AgWise file (2.1 M rows, five text columns) peaks at ~1.1 GB of RSS
+while being read, then writes 0.9 MB of Parquet in under a second.
+
+So uploads and scans convert in a **child process** (`_convert_in_child`):
+in the 512 MB API container the kernel used to kill the gunicorn worker
+mid-read, the stale-inspection recovery restarted the read on the next poll,
+and the upload sat at "Reading the file…" forever. Now only the child dies,
+and the upload fails with a message saying why.
+"""
 import os
+import signal
+import subprocess
+import sys
+
 import pyreadr
 
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# How long a single RDS read + Parquet write may take before it is abandoned.
+CONVERT_TIMEOUT_SECONDS = 30 * 60
+
+# The child imports only pyreadr and pandas — not the app — so it starts fast
+# and its memory is the conversion's alone. Exit codes: 0 ok, 2 unreadable,
+# 3 Parquet write failed (the RDS is still usable), 4 out of memory.
+_CHILD = r'''
+import sys
+src, out = sys.argv[1], sys.argv[2]
+try:
+    import pyreadr
+    df = pyreadr.read_r(src)[None]
+except MemoryError:
+    sys.exit(4)
+except Exception as e:
+    sys.stderr.write(f"{e.__class__.__name__}: {e}"[:500])
+    sys.exit(2)
+try:
+    df.to_parquet(out, index=False, compression="zstd")
+except MemoryError:
+    sys.exit(4)
+except Exception as e:
+    sys.stderr.write(f"{e.__class__.__name__}: {e}"[:500])
+    sys.exit(3)
+'''
+
+
+class ConversionError(Exception):
+    """An RDS that cannot be converted. The message is meant for the user."""
+
+
+class _WriteFailed(Exception):
+    """The RDS was read but Parquet could not be written; the RDS is still usable."""
+
+
+_OUT_OF_MEMORY = ("Reading this R file needs more memory than the server allows, so it was stopped. "
+                  "Upload it as Parquet instead (in R: arrow::write_parquet(df, 'file.parquet')), "
+                  "or ask an administrator to raise the API's memory limit.")
+
+
+def _convert_in_child(rds_path: str, parquet_path: str) -> str:
+    """Convert in a separate process; raise ConversionError / _WriteFailed on failure."""
+    try:
+        result = subprocess.run([sys.executable, '-c', _CHILD, rds_path, parquet_path],
+                                capture_output=True, text=True, timeout=CONVERT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise ConversionError(f"Reading this R file took longer than {CONVERT_TIMEOUT_SECONDS // 60} minutes "
+                              "and was stopped.") from None
+    detail = (result.stderr or '').strip().splitlines()[-1:] or ['']
+    if result.returncode == 0:
+        return parquet_path
+    # A negative code is the signal that killed it; the kernel's OOM killer
+    # sends SIGKILL (Linux), and MemoryError inside the child exits 4.
+    if result.returncode == 4 or result.returncode == -getattr(signal, 'SIGKILL', 9):
+        logger.error("RDS conversion ran out of memory", file=os.path.basename(rds_path),
+                     returncode=result.returncode)
+        raise ConversionError(_OUT_OF_MEMORY)
+    if result.returncode == 3:
+        raise _WriteFailed(detail[0])
+    logger.warning("RDS could not be read", file=os.path.basename(rds_path),
+                   returncode=result.returncode, detail=detail[0])
+    raise ConversionError(f"This is not a readable R data file ({detail[0] or 'exit ' + str(result.returncode)}).")
 
 
 def rds_to_parquet(rds_path: str, parquet_path: str | None = None, compression: str = "zstd") -> str:
@@ -67,7 +146,7 @@ def batch_convert(data_dir: str, pattern: str = ".RDS", delete_originals: bool =
         try:
             if not os.path.exists(rds_path):
                 continue  # converted (and removed) by another process meanwhile
-            rds_to_parquet(rds_path, tmp_path)
+            _convert_in_child(rds_path, tmp_path)  # isolated: the API startup scan runs this too
             os.replace(tmp_path, parquet_path)
             created.append(parquet_path)
             if delete_originals:
@@ -94,19 +173,29 @@ def convert_for_ingestion(path: str) -> str:
     Parquet file answers both from the footer and a single batch, so
     converting once at upload time removes the repeated full parses.
 
-    Returns the original path unchanged for non-RDS input, or if conversion
-    fails — a bad file should surface as a slow upload, not a failed one.
+    Runs in a child process (see the module docstring). Returns the original
+    path unchanged for non-RDS input, or when the RDS was read but Parquet
+    could not be written (the RDS is still usable). Raises ConversionError —
+    with a message for the user — when the RDS cannot be read at all, or the
+    read runs out of memory: falling back to the RDS then would only repeat
+    the same whole-file read in-process.
     """
     if not path.lower().endswith('.rds'):
         return path
 
     out = os.path.splitext(path)[0] + '.parquet'
+    tmp = out + '.tmp'
     try:
-        rds_to_parquet(path, out)
-    except Exception as e:  # noqa: BLE001 - conversion is best-effort
-        logger.warning(f"Parquet conversion failed for {os.path.basename(path)}; keeping the RDS: {e}",
-                       exc_info=True)
+        _convert_in_child(path, tmp)
+        os.replace(tmp, out)
+    except _WriteFailed as e:
+        logger.warning("Parquet conversion failed; keeping the RDS", file=os.path.basename(path), detail=str(e))
         return path
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
     try:
         os.remove(path)

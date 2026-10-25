@@ -360,7 +360,7 @@ def validate_column_map(column_map, columns: list[str]) -> dict[str, str]:
     return clean
 
 
-def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | None:
+def describe_duplicate(file_path: str, total_rows: int | None = None, checksum: str | None = None) -> dict | None:
     """Describe a previously-ingested file with the same content, if any.
 
     Returns None, or {status, original_filename, processed_at, offset} where
@@ -373,7 +373,9 @@ def describe_duplicate(file_path: str, total_rows: int | None = None) -> dict | 
         from app.utils import calculate_file_checksum
         from app.repo.file_import import FileImportRepo
 
-        checksum = calculate_file_checksum(file_path, logger)
+        # Inspection passes the checksum it already computed: hashing twice
+        # was a second full read of the file.
+        checksum = checksum or calculate_file_checksum(file_path, logger)
         if not checksum:
             return None
         existing = FileImportRepo().get_by_checksum(checksum)
@@ -461,16 +463,18 @@ def inspect(upload_id: str, app=None):
         upload.stored_path = stored
         upload.sha256 = calculate_file_checksum(stored, logger)
         upload.preview = {**preview, 'total_rows': total_rows}
-        upload.duplicate = describe_duplicate(stored, total_rows)
+        upload.duplicate = describe_duplicate(stored, total_rows, checksum=upload.sha256)
         upload.column_map = suggest_column_map(preview['columns'])
         upload.status = 'ready'
         upload.error = None
     except Exception as e:
+        from app.utils.rds_to_parquet import ConversionError
         logger.exception(f'Upload {upload_id}: inspection failed: {e}')
         session.rollback()
         upload = session.get(Upload, upload_id)
         upload.status = 'failed'
-        upload.error = _clip(f'Could not read the file: {e}')
+        # ConversionError already says, for the user, what went wrong.
+        upload.error = _clip(str(e) if isinstance(e, ConversionError) else f'Could not read the file: {e}')
     finally:
         stop.set()
     upload.updated_at = _now()

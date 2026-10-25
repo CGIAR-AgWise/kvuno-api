@@ -13,7 +13,7 @@ from app.dto.upload import UploadResponse
 from app.rate_limit import limiter
 from app.utils.logging import get_logger
 from app.utils.preview import read_columns
-from app.utils.rds_to_parquet import convert_for_ingestion
+from app.utils.rds_to_parquet import ConversionError, convert_for_ingestion
 
 logger = get_logger(__name__)
 
@@ -51,9 +51,16 @@ def _process_uploaded_file(f):
     dest = os.path.join(data_dir, unique_name)
     f.save(dest)
 
-    # Convert RDS -> Parquet once so the worker does not re-parse the whole file.
-    # Falls back to the RDS if conversion fails.
-    stored = convert_for_ingestion(dest)
+    # Convert RDS -> Parquet once (in a child process) so the worker does not
+    # re-parse the whole file. Keeps the RDS if only the Parquet write fails.
+    try:
+        stored = convert_for_ingestion(dest)
+    except ConversionError as e:
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        return {"error": str(e), "file": unique_name}, 400
     stored_ext = os.path.splitext(stored)[1].lower()
 
     try:

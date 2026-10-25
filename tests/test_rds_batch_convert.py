@@ -23,7 +23,7 @@ def fake_convert(monkeypatch):
             f.write('parquet')
         return parquet_path
 
-    monkeypatch.setattr(conv, 'rds_to_parquet', convert)
+    monkeypatch.setattr(conv, '_convert_in_child', convert)
     return seen
 
 
@@ -44,7 +44,7 @@ def test_original_removed_by_another_process_is_not_an_error(tmp_path, monkeypat
         os.remove(rds_path)  # the other gunicorn worker finished first
         return parquet_path
 
-    monkeypatch.setattr(conv, 'rds_to_parquet', convert_while_the_other_worker_deletes_it)
+    monkeypatch.setattr(conv, '_convert_in_child', convert_while_the_other_worker_deletes_it)
     assert conv.batch_convert(str(tmp_path), pattern='.rds', delete_originals=True) == [
         str(tmp_path / 'a.parquet')]
 
@@ -70,7 +70,7 @@ def test_one_bad_file_does_not_stop_the_rest(tmp_path, monkeypatch):
             raise ValueError('not an R data file')
         return parquet_path
 
-    monkeypatch.setattr(conv, 'rds_to_parquet', convert)
+    monkeypatch.setattr(conv, '_convert_in_child', convert)
     created = conv.batch_convert(str(tmp_path), pattern='.rds', delete_originals=True)
     assert created == [str(tmp_path / 'good.parquet')]
     # The bad file is untouched and leaves no partial output behind.
