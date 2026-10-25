@@ -1,0 +1,12 @@
+# Build context for the web image (context = frontend/). The Dockerfile copies
+# named files only, so this keeps the upload to the daemon small: a local
+# node_modules (hundreds of MB, and built for the host OS) and dist/ were sent
+# on every build.
+node_modules
+dist
+.idea
+.vscode
+.junie
+.env
+.env.*
+*.log

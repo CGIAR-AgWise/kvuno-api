@@ -1,23 +1,59 @@
+# Build context for the three Python images (docker/Dockerfile*, context = repo
+# root). It must stay at the repo root: Docker only reads .dockerignore from
+# the root of the build context. The web image has its own context
+# (frontend/) and its own frontend/.dockerignore.
+#
+# A pattern without `**/` matches at the root only, so anything that can
+# appear in subdirectories (__pycache__, node_modules) needs `**/`.
+
+# VCS, CI, editors, assistants
 .git
 .gitignore
+.gitattributes
 .github
+.idea
+.vscode
+.junie
+.claude
+
+# Python environments, caches and tool config
 .venv
-__pycache__
-*.pyc
-*.pyo
+.venv-*
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+.pylintrc
+
+# Secrets and local configuration — runtime config comes from the environment
 .env
-.env.example
+.env.*
+
+# Local data, logs and databases: mounted at runtime, never baked in
+data
+logs
+**/*.log
+*.db
+*.db-journal
+static/data
+static/data_old
+
+# The SPA: built into the separate kvuno-web image
+frontend
+**/node_modules
+
+# Not needed in an image
 docker-compose.yml
 Dockerfile*
-README.md
+Makefile
 tests/
 docs/
 model-generator.py
-.idea
-.vscode
 *.md
-# Old sample RDS files kept locally (untracked); not for any image.
-static/data_old
 
 # Exceptions: the `*.md` rule above would otherwise strip README.md from the
 # build context, but pyproject.toml declares `readme = "README.md"` and Poetry
