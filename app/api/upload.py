@@ -51,6 +51,17 @@ def _process_uploaded_file(f):
     dest = os.path.join(data_dir, unique_name)
     f.save(dest)
 
+    # With a worker, an RDS goes to it as it is: the worker converts it (and
+    # shows that on the Jobs page). Reading one here needed ~150x the file
+    # size in memory inside the API, during the request.
+    if ext == '.rds' and settings.HOUSEKEEPING_ENABLED:
+        from app.services.housekeeper import celery_worker_available, process_file_async
+        if celery_worker_available() and process_file_async(file_path=dest):
+            invalidate_planting_data_cache()
+            return UploadResponse(
+                message="File accepted; the worker converts it to Parquet and imports it",
+                file=unique_name, columns=[])
+
     # Convert RDS -> Parquet once (in a child process) so the worker does not
     # re-parse the whole file. Keeps the RDS if only the Parquet write fails.
     try:

@@ -137,6 +137,22 @@ class TestResume:
             (os.path.join(str(tmp_path), 'scan.parquet'), {'original_filename': 'Scan.RDS', 'run_id': 4}),
         ]
 
+    def test_a_stalled_job_from_any_host_is_resumed(self, tmp_path, monkeypatch, enqueued):
+        """Imports the API ran on a gunicorn thread were killed by worker recycling and left stalled."""
+        monkeypatch.setenv('HOUSEKEEPING_DATA_DIR', str(tmp_path))
+        (tmp_path / 'big.parquet').write_bytes(b'x')
+        (tmp_path / 'live.parquet').write_bytes(b'x')
+        jobs = [
+            {'file': 'big.parquet', 'status': 'stale', 'worker': 'kvuno', 'run_id': None},
+            # Another host's job that is still reporting may well be running: left alone.
+            {'file': 'live.parquet', 'status': 'processing', 'worker': 'kvuno', 'run_id': None},
+        ]
+        monkeypatch.setattr(ps, 'load_all_jobs', lambda *a, **kw: jobs)
+        monkeypatch.setattr('app.services.uploads.find_by_stored_name', lambda name: None)
+
+        assert hk.resume_interrupted_jobs('kvuno-worker') == 1
+        assert [os.path.basename(path) for path, _ in enqueued] == ['big.parquet']
+
     def test_resuming_reuses_the_run_and_never_discards_it(self, monkeypatch):
         started, discarded, sent = [], [], []
         monkeypatch.setattr(ps, 'start_run', lambda **kw: started.append(kw) or 99)

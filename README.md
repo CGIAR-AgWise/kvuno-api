@@ -370,11 +370,41 @@ receiving → received → inspecting → ready | failed → submitted → proce
 ```
 
 1. **Receive** — bytes land in `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked at creation, before any bytes arrive
-2. **Inspect** — on a background thread in the API process (no Celery needed): RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping
+2. **Inspect** — RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping. On the **Celery worker** when one consumes the `kvuno` queue (the page shows "Waiting for the worker" until it starts); otherwise on a background thread in the API
 3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once
-4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it on a background thread in the API, using that mapping as-is (not merged over `RDS_COLUMN_MAP`). No worker or Redis is needed; progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
+4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it with that mapping as-is (not merged over `RDS_COLUMN_MAP`): on the **Celery worker** when there is one, otherwise in a separate `ingest_runner` process the API starts. Never inside a gunicorn worker — gunicorn recycles those every `MAX_REQUESTS` requests, which used to kill long imports over and over. Progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
+
+In production run the worker as a Celery worker (`HOUSEKEEPING_MODE` unset), so the API never reads or imports files itself.
 
 Uploads live under `uploads/` rather than the data directory root on purpose: the startup scan (`load_rds_to_db`) ingests every file in the root with the default mapping. Unfinished uploads idle longer than `UPLOAD_ABANDON_AGE` are deleted when an API process starts. The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit, since a large file is many requests.
+
+#### Removing false import conflicts
+
+Before the ingest fix, every imported row was also logged in `import_conflicts` as a duplicate of itself, which inflated the Quality page. `scripts/cleanup_conflicts.py` removes those false entries and keeps real ones (a clash with another file, or a key that really occurs twice in a file). It only reports unless given `--apply`:
+
+```bash
+python scripts/cleanup_conflicts.py            # how many would be removed
+python scripts/cleanup_conflicts.py --apply    # remove them, 50,000 per transaction
+```
+
+In the production stack: `docker exec kvuno python scripts/cleanup_conflicts.py --apply`.
+
+#### Converting large RDS files locally
+
+Reading an RDS takes about 150× its size in memory (`pyreadr` reads the whole file), so the server can refuse a large one with *"Reading this R file needs more memory than the server allows"*. Convert it on a machine with more memory and upload the Parquet instead. `scripts/convert_rds.py` uses the same converter as the server, shows the read time and the rows written, keeps the RDS, never leaves a partial `.parquet`, and exits 1 if any file failed:
+
+```bash
+python scripts/convert_rds.py                                # every .rds under static/, next to each file
+python scripts/convert_rds.py data/field.RDS                 # writes data/field.parquet
+python scripts/convert_rds.py data/ --out-dir converted/     # keeps data/'s folder layout under converted/
+python scripts/convert_rds.py data/ --no-recursive           # only data/ itself, not its subfolders
+python scripts/convert_rds.py data/field.RDS --overwrite     # replace an existing .parquet
+make convert-rds ARGS="data/ -o converted/"
+```
+
+Directories are searched recursively, skipping hidden folders and `uploads/` (uploads in progress, which the app converts itself).
+
+From R, `arrow::write_parquet(df, "field.parquet")` does the same.
 
 ### Housekeeping (on-demand import)
 
@@ -700,7 +730,7 @@ Every setting is a field of `Settings` in [`app/config.py`](app/config.py) — t
 | `CELERY_TASK_MAX_RETRIES` | `10` | Retries for a task failing on a transient error. |
 | `CELERY_TASK_RETRY_DELAY` | `60` | Seconds between task retries. |
 | `CELERY_VISIBILITY_TIMEOUT` | `21600` | Seconds before Redis redelivers an unacked task, even a running one: must exceed the longest single-file ingest. |
-| `CELERY_CONCURRENCY` | — | Worker processes for `python dev_worker.py`. |
+| `CELERY_CONCURRENCY` | `2` | Worker processes (worker image and `python dev_worker.py`). 2: an upload is read while another file imports. Each RDS being read needs ~150x its size in memory. |
 | `WORKER_MAX_MEMORY_PER_CHILD` | `2048` | MB; recycle a worker child past this (set above one file's peak). |
 | `WORKER_MAX_TASKS_PER_CHILD` | `50` | Recycle a worker child after this many tasks. |
 

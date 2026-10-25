@@ -1,16 +1,13 @@
-from typing import Optional, List, Type
+from typing import Optional, Type
 
 from flask_sqlalchemy.pagination import QueryPagination
 from geoalchemy2 import Geography, WKTElement
 from sqlalchemy import cast, func
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query
 
-from app.dto.planting_recommendation import PlantingRecommendationCreate
 from app.dto.data_filters import PLANTING_SORT_COLUMNS, PlantingDataFilter
 from app.models.database_conn import MyDb
-from app.models.kvuno import PlantingRecommendation, ImportConflict
+from app.models.kvuno import PlantingRecommendation
 from app.utils.logging import get_logger
 
 
@@ -293,81 +290,3 @@ class PlantingRecommendationRepo:
                 self.logger.exception(f"Failed to count distinct values for {col}: {e}")
                 result[col] = 0
         return result
-
-    def _log_conflicts(self, session, mappings, inserted_count):
-        if inserted_count == len(mappings):
-            return
-        from sqlalchemy import tuple_
-        unique_cols = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date']
-        key_tuples = [
-            tuple(m.get(c) for c in unique_cols)
-            for m in mappings
-        ]
-        existing = session.query(PlantingRecommendation).filter(
-            tuple_(*[getattr(PlantingRecommendation, c) for c in unique_cols]).in_(key_tuples)
-        ).all()
-        existing_keys = {
-            tuple(getattr(e, c) for c in unique_cols): e.check_sum
-            for e in existing
-        }
-        for m in mappings:
-            key = tuple(m.get(c) for c in unique_cols)
-            if key in existing_keys:
-                record_data = {
-                    k: str(v) if not isinstance(v, (str, int, float, bool, list, dict)) and v is not None else v
-                    for k, v in m.items()
-                }
-                conflict = ImportConflict(
-                    record_data=record_data,
-                    country=m.get('country'),
-                    province=m.get('province'),
-                    lon=m.get('lon'),
-                    lat=m.get('lat'),
-                    variety=m.get('variety'),
-                    season_type=m.get('season_type'),
-                    opt_date=m.get('opt_date'),
-                    check_sum=existing_keys[key],
-                    source='batch_insert',
-                )
-                session.add(conflict)
-        session.flush()
-
-    def batch_insert(self, records: List[PlantingRecommendationCreate]) -> int:
-        if not records:
-            self.logger.warning("No records to insert.")
-            return 0
-
-        session = self._get_session()
-        try:
-            mappings = [
-                {
-                    **record.model_dump(),
-                    'coordinates': WKTElement(f"POINT({record.lon} {record.lat})", srid=4326)
-                    if record.lat and record.lon
-                    else None
-                }
-                for record in records
-            ]
-
-            stmt = insert(PlantingRecommendation).values(mappings)
-            stmt = stmt.on_conflict_do_nothing()
-            result = session.execute(stmt)
-            inserted = result.rowcount
-            self._log_conflicts(session, mappings, inserted)
-            session.commit()
-            if inserted:
-                self.logger.debug(
-                    f"Inserted {inserted} new PlantingRecommendation records "
-                    f"({len(mappings) - inserted} duplicates logged)"
-                )
-            else:
-                self.logger.debug(f"All {len(mappings)} records were duplicates — logged")
-            return inserted
-        except SQLAlchemyError as e:
-            session.rollback()
-            self.logger.error(f"Failed to batch insert PlantingRecommendation records: {e}")
-            raise
-        except Exception as e:
-            session.rollback()
-            self.logger.error(f"An unexpected error occurred: {e}")
-            raise

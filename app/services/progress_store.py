@@ -79,7 +79,23 @@ _last_db_write: dict[str, float] = {}
 _migrated = False
 
 
+# After a Redis error, skip Redis for this long. Every progress write used to
+# open a new connection and wait out the 2 s connect timeout when Redis was
+# down: an import's progress calls then cost ~2 s each, which made a 100k-row
+# file take 54 s instead of 10. Postgres still records the job meanwhile.
+REDIS_RETRY_AFTER_SECONDS = 30
+_redis_down_until = 0.0
+
+
+def _redis_failed():
+    """Note a Redis error, so the next REDIS_RETRY_AFTER_SECONDS skip it."""
+    global _redis_down_until
+    _redis_down_until = time.time() + REDIS_RETRY_AFTER_SECONDS
+
+
 def _redis_client():
+    if time.time() < _redis_down_until:
+        return None
     try:
         from redis import Redis
         url = get_settings().CELERY_BROKER_URL
@@ -208,7 +224,7 @@ def save_progress(file_path: str, status: str, current: int, total: int, message
             job = _to_job(stem, r.hgetall(key))
             r.publish(PROGRESS_CHANNEL, json.dumps(job))
         except Exception:
-            pass
+            _redis_failed()
 
     # Postgres is the durable record, not merely a fallback. Previously an
     # in-flight job existed ONLY in Redis while Redis was healthy, so a broker
@@ -284,7 +300,7 @@ def get_job(stem: str) -> dict | None:
             h = r.hgetall(f"{KEY_PREFIX}{stem}")
             redis_job = _to_job(stem, h) if h else None
         except Exception:
-            pass
+            _redis_failed()
     try:
         db_job = _db_get_job(stem)
     except Exception:
@@ -316,7 +332,7 @@ def load_all_jobs(limit: int | None = None) -> list[dict]:
             for stem, redis_job in _redis_jobs(r, limit).items():
                 jobs[stem] = _newer(redis_job, jobs.get(stem))
         except Exception:
-            pass
+            _redis_failed()
 
     ordered = sorted(jobs.values(), key=lambda j: j.get('mtime', 0), reverse=True)
     return [mark_stale(j) for j in ordered][:limit]

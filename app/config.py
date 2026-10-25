@@ -250,7 +250,10 @@ class Settings(BaseSettings):
     CELERY_VISIBILITY_TIMEOUT: int = _f(21600, 'celery',
                                         "Seconds before Redis redelivers an unacked task, even a running one: must "
                                         "exceed the longest single-file ingest.")
-    CELERY_CONCURRENCY: Optional[int] = _f(None, 'celery', "Worker processes for `python dev_worker.py`.")
+    CELERY_CONCURRENCY: Optional[int] = _f(
+        2, 'celery',
+        "Worker processes (worker image and `python dev_worker.py`). 2: an upload is read while another file "
+        "imports. Each RDS being read needs ~150x its size in memory.")
     WORKER_MAX_MEMORY_PER_CHILD: int = _f(2048, 'celery', "MB; recycle a worker child past this (set above one file's peak).")
     WORKER_MAX_TASKS_PER_CHILD: int = _f(50, 'celery', "Recycle a worker child after this many tasks.")
 

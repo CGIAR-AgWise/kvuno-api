@@ -683,7 +683,8 @@ export interface UploadRecord {
    * preview and checksum. elapsed is seconds since the conversion started.
    */
   progress: {
-    stage: 'reading' | 'writing' | 'preview' | 'checksum'
+    /** queued: waiting for the worker to pick the file up. */
+    stage: 'queued' | 'reading' | 'writing' | 'preview' | 'checksum'
     done: number
     total: number
     elapsed: number

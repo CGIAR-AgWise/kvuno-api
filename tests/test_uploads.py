@@ -60,6 +60,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv('HOUSEKEEPING_ENABLED', 'false')
     monkeypatch.setattr(service.threading, 'Thread', _InlineThread)
 
+    # Imports start a separate process; record them instead.
+    spawned = []
+    monkeypatch.setattr('app.routes.uploads._spawn_runner', spawned.append)
+
     current = {'user': OWNER}
     monkeypatch.setattr('app.auth.get_current_user', lambda: current['user'])
     monkeypatch.setattr('app.routes.uploads.get_current_user', lambda: current['user'])
@@ -72,7 +76,7 @@ def env(tmp_path, monkeypatch):
         Base.metadata.create_all(MyDb.get_db().engine,
                                  tables=[Upload.__table__, FileImport.__table__])
         yield types.SimpleNamespace(app=app, client=app.test_client(), current=current,
-                                    session=MyDb.get_db().session, tmp=tmp_path)
+                                    session=MyDb.get_db().session, tmp=tmp_path, spawned=spawned)
         MyDb.get_db().session.remove()
 
 
@@ -424,3 +428,56 @@ class TestInspectionProgress:
         upload_id = _upload(env, path.read_bytes(), name='trial.RDS')
         body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
         assert (body['status'], body['progress'], body['file']) == ('ready', None, f'{upload_id}.parquet')
+
+
+class TestWorkOffTheApi:
+    """Reading and importing files happens on the worker, never in a gunicorn worker.
+
+    Imports used to run on a thread in the gunicorn worker that took the
+    request; gunicorn recycles workers every MAX_REQUESTS, which killed long
+    imports again and again (2M rows: 40+ hours).
+    """
+
+    def _worker(self, monkeypatch, available=True, queued=True):
+        sent = {'inspect': [], 'process': []}
+        monkeypatch.setattr('app.services.housekeeper.celery_worker_available', lambda: available)
+        monkeypatch.setattr('app.services.housekeeper._enqueue_or_warn',
+                            lambda task, **kw: sent['inspect'].append(kw) or queued)
+        monkeypatch.setattr('app.services.housekeeper.process_file_async',
+                            lambda path, **kw: sent['process'].append((path, kw)) or queued)
+        return sent
+
+    def test_with_a_worker_the_upload_is_read_there(self, env, monkeypatch):
+        sent = self._worker(monkeypatch)
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        body = env.client.get(f'/ui/uploads/{upload_id}').get_json()
+        assert (body['status'], body['progress']['stage']) == ('received', 'queued')
+        assert sent['inspect'] == [{'upload_id': upload_id}], 'queued once, not on every poll'
+
+    def test_a_queue_that_refuses_falls_back_to_reading_in_the_api(self, env, monkeypatch):
+        self._worker(monkeypatch, queued=False)
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'
+
+    def test_with_a_worker_the_import_is_queued_with_the_mapping(self, env, monkeypatch):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))  # read in the API: no worker yet
+        sent = self._worker(monkeypatch)
+        resp = env.client.post(f'/ui/uploads/{upload_id}/process', json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
+        assert resp.get_json()['message'] == 'Queued for the worker'
+        path, kw = sent['process'][0]
+        assert path.endswith(f'{upload_id}.parquet') and kw['column_map'] == {'lon': 'lon', 'lat': 'lat'}
+        assert env.spawned == []
+
+    def test_without_a_worker_the_import_runs_in_its_own_process(self, env):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        env.client.post(f'/ui/uploads/{upload_id}/process', json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
+        assert env.spawned == [upload_id]
+
+    def test_a_process_that_cannot_start_puts_the_upload_back(self, env, monkeypatch):
+        def fail(upload_id):
+            raise OSError('no fork')
+        monkeypatch.setattr('app.routes.uploads._spawn_runner', fail)
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        resp = env.client.post(f'/ui/uploads/{upload_id}/process', json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
+        assert resp.status_code == 503
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'

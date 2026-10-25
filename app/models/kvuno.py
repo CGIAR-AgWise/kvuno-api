@@ -202,7 +202,6 @@ class PlantingRecommendation(Base):
         Index('idx_lon', 'lon'),
         Index('idx_opt_date', 'opt_date'),
         Index('idx_planting_option', 'planting_option'),
-        Index('idx_planting_recommendations_coordinates', 'coordinates', postgresql_using='gist'),
         Index('idx_province', 'province'),
         Index('idx_season_type', 'season_type'),
         Index('idx_variety', 'variety')

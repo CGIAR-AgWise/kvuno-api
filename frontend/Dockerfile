@@ -15,6 +15,9 @@ RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html ./
 COPY src ./src
+# Vite copies public/ into dist/ as is. Without it the image had no
+# favicon.ico, and /favicon.ico was answered with the SPA's index.html.
+COPY public ./public
 # tsc -b runs as part of `build`, so a type error fails the image build rather
 # than shipping a broken bundle.
 RUN pnpm run build

@@ -194,7 +194,7 @@ services:
     # Celery has no HTTP port, so ask the worker itself over the broker. The
     # node name is celery@<container hostname> (kvuno-worker); `$$` stops
     # compose from interpolating $HOSTNAME. The ping is answered by the parent
-    # process, so a long ingest in the (concurrency=1) child does not fail it.
+    # process, so a long ingest in a child does not fail it.
     healthcheck:
       test: [ "CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1" ]
       interval: 60s
