@@ -292,8 +292,10 @@ All tables are defined in `app/models/kvuno.py` and created by Alembic migration
 | `season_type` | VARCHAR(20) | Season classification |
 | `opt_date` | VARCHAR(8) | Optimal sowing date |
 | `planting_option` | INTEGER | Planting option ID |
-| `created_at` | DATETIME | Auto-set on insert |
-| `updated_at` | DATETIME | Auto-set on update |
+| `created_at` | DATETIME | When the data was produced: the upload's confirmed **Data date** (midnight UTC), else the file's first import time (`file_imports.processed_at`). Set by the ingest, not the column default |
+| `updated_at` | DATETIME | When the row was imported. Set by the ingest |
+
+Rows imported before the timestamp fix have NULL in both (the ingest sent explicit NULLs, which override the `now()` defaults).
 
 Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date)` — this is what drives conflict detection. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
 

@@ -154,7 +154,43 @@ def _session():
 
 # ── Lifecycle ──────────────────────────────────────────────────
 
-def create(owner_id: int | None, original_name: str, size: int, max_size: int) -> Upload:
+def parse_client_mtime(raw: str | None) -> datetime.datetime | None:
+    """The tus `lastModified` metadata (ms since the epoch) as naive UTC, or None.
+
+    It comes from the browser, so it is only trusted as far as it is
+    plausible: unparsable or before 1990 is ignored, a future time is now.
+    """
+    try:
+        stamp = datetime.datetime.fromtimestamp(int(raw) / 1000, datetime.timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if stamp < datetime.datetime(1990, 1, 1):
+        return None
+    return min(stamp, _now())
+
+
+def parse_data_date(raw) -> datetime.date:
+    """The mapping form's "Data date" (YYYY-MM-DD). Raises UploadError if not plausible."""
+    try:
+        value = datetime.date.fromisoformat(str(raw))
+    except ValueError:
+        raise UploadError('Data date must be a date (YYYY-MM-DD)')
+    if value > _now().date():
+        raise UploadError('Data date cannot be in the future')
+    if value < datetime.date(1990, 1, 1):
+        raise UploadError('Data date is before 1990; check it')
+    return value
+
+
+def data_datetime(upload: Upload) -> datetime.datetime | None:
+    """The upload's confirmed data date as the rows' created_at (midnight), or None."""
+    if upload.data_date is None:
+        return None
+    return datetime.datetime.combine(upload.data_date, datetime.time())
+
+
+def create(owner_id: int | None, original_name: str, size: int, max_size: int,
+           file_modified_at: datetime.datetime | None = None) -> Upload:
     """Register a new upload and its empty part file. Validates before any bytes arrive."""
     name = os.path.basename(original_name or '').strip()
     if not name:
@@ -174,6 +210,7 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
         original_name=_clip(name, 255),
         size=size,
         status='receiving',
+        file_modified_at=file_modified_at,
         created_at=_now(),
         updated_at=_now(),
     )
@@ -245,6 +282,9 @@ def hold_from_folder(file_path: str) -> Upload:
         original_name=_clip(name, 255),
         size=os.path.getsize(file_path),
         status='received',
+        # os.replace below keeps the file's time; recorded for the page.
+        file_modified_at=datetime.datetime.fromtimestamp(
+            os.path.getmtime(file_path), datetime.timezone.utc).replace(tzinfo=None),
         created_at=_now(),
         updated_at=_now(),
     )
@@ -647,13 +687,19 @@ def ensure_inspection(app, upload: Upload) -> None:
 
 # ── Submission and removal ─────────────────────────────────────
 
-def submit(upload: Upload, column_map=None) -> Upload:
-    """Validate and store the mapping, ready to process. `None` re-uses the saved one (Retry)."""
+def submit(upload: Upload, column_map=None, data_date=None) -> Upload:
+    """Validate and store the mapping and data date, ready to process.
+
+    `None` re-uses the saved value (Retry sends neither). An empty data date
+    clears it: the rows then take the file's first import time.
+    """
     if upload.status not in SUBMITTABLE:
         raise UploadError(f'Upload is {upload.status}, not ready to process', 409)
     columns = (upload.preview or {}).get('columns', [])
-    upload.column_map = validate_column_map(
-        upload.column_map if column_map is None else column_map, columns)
+    mapping = validate_column_map(upload.column_map if column_map is None else column_map, columns)
+    if data_date is not None:
+        upload.data_date = parse_data_date(data_date) if str(data_date).strip() else None
+    upload.column_map = mapping
     # If already processing, keep that status; otherwise mark as submitted
     if upload.status != 'processing':
         upload.status = 'submitted'
@@ -722,6 +768,8 @@ def to_dict(upload: Upload) -> dict:
         'column_map': upload.column_map or {},
         'error': upload.error,
         'progress': upload.progress if upload.status in ('received', 'inspecting') else None,
+        'file_modified_at': upload.file_modified_at.isoformat() if upload.file_modified_at else None,
+        'data_date': upload.data_date.isoformat() if upload.data_date else None,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

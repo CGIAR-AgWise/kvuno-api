@@ -69,7 +69,14 @@ interface Item {
   status: 'sending' | 'paused' | UploadRecord['status']
   record: UploadRecord | null
   columnMap: Record<string, string>
+  /** "Data date" (YYYY-MM-DD) sent with the mapping; '' = first import time. */
+  dataDate: string
   error: string
+}
+
+/** The saved data date, else the file's last-modified date as a suggestion. */
+function suggestedDate(record: UploadRecord): string {
+  return record.data_date ?? record.file_modified_at?.slice(0, 10) ?? ''
 }
 
 function fromRecord(record: UploadRecord): Item {
@@ -84,6 +91,7 @@ function fromRecord(record: UploadRecord): Item {
     status: record.status === 'receiving' ? 'paused' : record.status,
     record,
     columnMap: { ...record.column_map },
+    dataDate: suggestedDate(record),
     error: record.error ?? '',
   }
 }
@@ -263,6 +271,7 @@ export default function Upload() {
                         record.status === 'ready' && item.record?.status !== 'ready'
                           ? { ...record.column_map }
                           : item.columnMap,
+                      dataDate: item.dataDate || suggestedDate(record),
                     }
                   : item,
               ),
@@ -298,7 +307,13 @@ export default function Upload() {
       endpoint: TUS_ENDPOINT,
       chunkSize: CHUNK_SIZE,
       retryDelays: RETRY_DELAYS,
-      metadata: { filename: file.name, filetype: file.type || 'application/octet-stream' },
+      // lastModified becomes the imported rows' created_at: when the data was
+      // made, not when it was uploaded (RDS and Parquet carry no such time).
+      metadata: {
+        filename: file.name,
+        filetype: file.type || 'application/octet-stream',
+        lastModified: String(file.lastModified),
+      },
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       onProgress: (sent) => patch(key, { sent }),
       onError: (err) => {
@@ -333,6 +348,7 @@ export default function Upload() {
           status: 'sending',
           record: null,
           columnMap: {},
+          dataDate: '',
           error: '',
         },
       ]
@@ -397,7 +413,7 @@ export default function Upload() {
     const problems: string[] = []
     for (const item of queue) {
       try {
-        const result = await processUpload(item.id as string, item.columnMap)
+        const result = await processUpload(item.id as string, item.columnMap, item.dataDate)
         if (result.queued) {
           queued += 1
           setItems((current) => current.filter((i) => i.key !== item.key))
@@ -575,6 +591,29 @@ export default function Upload() {
                   </div>
                 )}
                 {item.error && <p className="small text-warning mb-2">{item.error}</p>}
+                <div className="row g-2 align-items-center mb-3">
+                  <label className="col-auto col-form-label col-form-label-sm" htmlFor={'date-' + item.key}>
+                    Data date
+                  </label>
+                  <div className="col-auto">
+                    <input
+                      id={'date-' + item.key}
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={item.dataDate}
+                      min="1990-01-01"
+                      max={new Date().toISOString().slice(0, 10)}
+                      onChange={(e) => patch(item.key, { dataDate: e.target.value })}
+                    />
+                  </div>
+                  <div className="col-12 small text-muted">
+                    When this data was produced; every imported row gets it as its created date.
+                    {record.file_modified_at && !record.data_date
+                      ? " Suggested from the file's last-modified date — check it, since editing or copying a file changes that."
+                      : ''}{' '}
+                    Leave it empty to use the import date.
+                  </div>
+                </div>
                 <p className="small text-muted mb-2">
                   {record.columns.length} columns
                   {record.total_rows !== null ? ', ' + record.total_rows.toLocaleString() + ' rows' : ''}.

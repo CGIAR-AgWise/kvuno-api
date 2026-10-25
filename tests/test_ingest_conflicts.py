@@ -53,3 +53,17 @@ def test_lookup_compares_coordinates_as_real_and_nulls_as_not_distinct():
     assert 'CAST(%(param_3)s AS REAL)' in sql
     assert ') IN (' in sql  # the NULL-free key goes through the indexed tuple IN
     assert 'IS NOT DISTINCT FROM' in sql  # only the key with a NULL needs this
+
+
+# ── Timestamps ───────────────────────────────────────────────────────────
+
+def test_rows_always_get_both_timestamps():
+    """model_dump() carries created_at/updated_at as None, and an explicit NULL beat the now() default."""
+    import datetime
+    from app.dto.planting_recommendation import PlantingRecommendationCreate
+
+    made = datetime.datetime(2023, 11, 14, 22, 13, 20)
+    imported = datetime.datetime(2026, 10, 25, 12, 0, 0)
+    row = hk._row_mapping(PlantingRecommendationCreate(lon=0.0, lat=0.0, check_sum='c'), made, imported)
+    assert (row['created_at'], row['updated_at']) == (made, imported)
+    assert row['coordinates'] is not None, '0,0 is a real place'

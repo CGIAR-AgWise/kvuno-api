@@ -9,6 +9,7 @@ The Celery worker imports this module for ``process_file`` and
 and the standalone CLI.
 """
 import concurrent.futures
+import datetime
 import gc
 import json
 import os
@@ -549,6 +550,25 @@ def _iter_parquet_chunks(parquet_file, columns, start: int, chunk_size: int):
         offset = end
 
 
+def _row_mapping(record, created_at: datetime.datetime, imported_at: datetime.datetime) -> dict:
+    """One planting_recommendations row from a validated record.
+
+    created_at and updated_at are always set: model_dump() carries them as
+    None, and an explicit NULL overrides the columns' now() default — rows
+    used to be stored with no timestamps at all.
+    """
+    return {
+        **record.model_dump(),
+        'created_at': created_at,   # confirmed data date, else first import
+        'updated_at': imported_at,  # when it was imported
+        # `is not None`: 0 is a real coordinate, and a NULL here fails the NOT
+        # NULL column and with it the whole batch.
+        'coordinates': WKTElement(f"POINT({record.lon} {record.lat})", srid=4326)
+        if record.lat is not None and record.lon is not None
+        else None,
+    }
+
+
 # The columns of uq_planting_recommendation, in its order.
 KEY_COLUMNS = ('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date')
 
@@ -669,8 +689,14 @@ def process_file(
     run_id: int | None = None,
     column_map: dict[str, str] | None = None,
     original_filename: str | None = None,
+    created_at: datetime.datetime | None = None,
 ):
     """
+    ``created_at`` is what every row of the file gets as created_at: the data
+    date confirmed when an upload was mapped. Without one (scans, the CLI) it
+    is the file's first import time — RDS and Parquet carry no creation date,
+    and file times change whenever a file is edited or copied.
+
     Processes a single file by reading its contents in chunks, converting data to
     :class:`PlantingDataRecord` instances, and inserting records into the database.
     Supports resumable processing via checkpoint-based commits.
@@ -741,6 +767,12 @@ def process_file(
             # Nothing is uncommitted yet, so a retry may roll the session back
             # (a stale connection used to leave it unusable for every retry).
             existing = retry_db(lambda: file_import_repo.get_by_checksum(checksum), session=session)
+            if created_at is None:
+                # First import time: file_imports.processed_at is set when the
+                # file is first recorded and never updated, so a resume or a
+                # re-import keeps the same date.
+                created_at = (getattr(existing, 'processed_at', None)
+                              or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
             resume_offset = 0
             if existing and existing.offset is None and not get_settings().INGEST_DUPLICATE_CHECK:
                 # Duplicate checking is off: import it again from the start.
@@ -866,19 +898,8 @@ def process_file(
                         try:
                             def _flush_batch(rows):
                                 with session.begin_nested():
-                                    mappings = [
-                                        {
-                                            **r.model_dump(),
-                                            'coordinates': WKTElement(f"POINT({r.lon} {r.lat})", srid=4326)
-                                            # `is not None`: 0 is a real
-                                            # coordinate, and a NULL here fails
-                                            # the NOT NULL column and with it the
-                                            # whole batch.
-                                            if r.lat is not None and r.lon is not None
-                                            else None
-                                        }
-                                        for r in rows
-                                    ]
+                                    imported_at = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+                                    mappings = [_row_mapping(r, created_at, imported_at) for r in rows]
                                     # No conflict target: any unique violation
                                     # is a duplicate. uq_planting_recommendation
                                     # is NULLS NOT DISTINCT on Postgres (see
@@ -1214,7 +1235,8 @@ def resume_interrupted_jobs(hostname: str) -> int:
             if upload is not None and upload.stored_path and os.path.isfile(upload.stored_path):
                 from app.services.housekeeper import process_file_async
                 queued = process_file_async(upload.stored_path, column_map=upload.column_map,
-                                            original_filename=upload.original_name, run_id=job.get('run_id'))
+                                            original_filename=upload.original_name, run_id=job.get('run_id'),
+                                            created_at=upload_service.data_datetime(upload))
             else:
                 path = os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, name)
                 if not os.path.isfile(path):
@@ -1324,7 +1346,8 @@ def _ask_for_worker(timeout: float) -> bool:
 # ── Async wrappers (Flask integration, Celery only) ──────────────
 
 def process_file_async(file_path: str, app=None, column_map: dict | None = None,
-                       original_filename: str | None = None, run_id: int | None = None) -> bool:
+                       original_filename: str | None = None, run_id: int | None = None,
+                       created_at: datetime.datetime | None = None) -> bool:
     """Enqueue a single file for processing via Celery (non-blocking).
 
     Used by the upload API endpoint and worker restart recovery.
@@ -1344,6 +1367,8 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
         kwargs['column_map'] = column_map
     if original_filename:
         kwargs['original_filename'] = original_filename
+    if created_at is not None:
+        kwargs['created_at'] = created_at.isoformat()  # JSON across the broker
 
     # A run per submission. Without a run_id every attempt at a file matched
     # the same progress row, so each one overwrote the previous attempt's

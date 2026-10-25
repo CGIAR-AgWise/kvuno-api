@@ -689,6 +689,10 @@ export interface UploadRecord {
     total: number
     elapsed: number
   } | null
+  /** The file's own last-modified time: only a suggestion for data_date. */
+  file_modified_at: string | null
+  /** When the data was produced (YYYY-MM-DD), confirmed on the mapping form; rows get it as created_at. */
+  data_date: string | null
   /** 'upload' from the Upload page; 'folder' a data-folder file held for mapping. */
   source: 'upload' | 'folder'
   created_at: string | null
@@ -711,10 +715,11 @@ export function fetchUpload(id: string, signal?: AbortSignal) {
   return request<UploadRecord>(`/ui/uploads/${id}`, { signal })
 }
 
-export function processUpload(id: string, columnMap: Record<string, string>) {
+/** dataDate: YYYY-MM-DD, or '' to use the file's first import time. */
+export function processUpload(id: string, columnMap: Record<string, string>, dataDate: string) {
   return request<{ id: string; file: string | null; message: string; queued: boolean }>(
     `/ui/uploads/${id}/process`,
-    { method: 'POST', body: { column_map: columnMap } },
+    { method: 'POST', body: { column_map: columnMap, data_date: dataDate } },
   )
 }
 

@@ -93,6 +93,21 @@ _OUT_OF_MEMORY = ("Reading this R file needs more memory than the server allows,
                   "or ask an administrator to raise the API's memory limit.")
 
 
+def keep_mtime(source: str, target: str) -> None:
+    """Give *target* the modification time of *source*.
+
+    A held data-folder file's time pre-fills the "Data date" on the mapping
+    form, so a converted Parquet carries the RDS's time rather than the
+    moment it was written. Best effort: a file system that refuses it keeps
+    "now".
+    """
+    try:
+        stat = os.stat(source)
+        os.utime(target, (stat.st_atime, stat.st_mtime))
+    except OSError:
+        logger.warning("could not copy the file time to the converted file", file=os.path.basename(target))
+
+
 def _parse(line: str) -> tuple[str, int, int] | None:
     """A child progress line as (stage, done, total), or None if it is not one."""
     parts = line.split()
@@ -214,6 +229,7 @@ def convert(rds_path: str, parquet_path: str | None = None,
     tmp = parquet_path + ".tmp"
     try:
         _convert_in_child(rds_path, tmp, on_progress=on_progress)
+        keep_mtime(rds_path, tmp)
         os.replace(tmp, parquet_path)
     except _WriteFailed as e:
         raise ConversionError(f"The file was read, but writing Parquet failed: {e}") from None
@@ -289,6 +305,7 @@ def batch_convert(data_dir: str, pattern: str = ".RDS", delete_originals: bool =
                 continue  # converted (and removed) by another process meanwhile
             # Isolated in a child: the API startup scan runs this too.
             _convert_in_child(rds_path, tmp_path, on_progress=progress)
+            keep_mtime(rds_path, tmp_path)
             os.replace(tmp_path, parquet_path)
             created.append(parquet_path)
             if delete_originals:
@@ -333,6 +350,7 @@ def convert_for_ingestion(path: str, on_progress: Optional[ProgressCallback] = N
     tmp = out + '.tmp'
     try:
         _convert_in_child(path, tmp, on_progress=on_progress)
+        keep_mtime(path, tmp)
         os.replace(tmp, out)
     except _WriteFailed as e:
         logger.warning("Parquet conversion failed; keeping the RDS", file=os.path.basename(path), detail=str(e))

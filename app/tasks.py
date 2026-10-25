@@ -9,7 +9,8 @@ _settings = get_settings()
 @celery_app.task(bind=True, max_retries=_settings.CELERY_TASK_MAX_RETRIES,
                  default_retry_delay=_settings.CELERY_TASK_RETRY_DELAY, autoretry_for=(Exception,))
 def process_file_task(self, file_path: str, column_map: dict | None = None,
-                      original_filename: str | None = None, run_id: int | None = None):
+                      original_filename: str | None = None, run_id: int | None = None,
+                      created_at: str | None = None):
     # run_id is optional so tasks queued by an older API (without it) still run.
     # process_file only raises for transient DB errors — a bad file is recorded
     # as an error and returns — so autoretry_for retries exactly those, and the
@@ -25,8 +26,11 @@ def process_file_task(self, file_path: str, column_map: dict | None = None,
             file_path = _convert(file_path)
             if file_path is None:
                 return  # recorded on the job; it would not convert on a retry either
+        import datetime
         process_file(file_path, column_map=column_map, original_filename=original_filename,
-                     run_id=run_id, **housekeeping_settings())
+                     run_id=run_id, **housekeeping_settings(),
+                     # The upload's confirmed data date (ISO, as sent across the broker).
+                     created_at=datetime.datetime.fromisoformat(created_at) if created_at else None)
 
 
 def _convert(rds_path: str) -> str | None:

@@ -43,6 +43,7 @@ def run(upload_id: str) -> int:
             logger.error("ingest runner: upload not found or not stored", upload_id=upload_id)
             return 2
         path, column_map, name = upload.stored_path, upload.column_map, upload.original_name
+        created_at = upload_service.data_datetime(upload)
         MyDb.get_db().session.remove()
 
         for attempt, delay in enumerate((0, *RETRY_DELAYS_SECONDS)):
@@ -51,7 +52,8 @@ def run(upload_id: str) -> int:
                                upload_id=upload_id, attempt=attempt, wait_seconds=delay)
                 time.sleep(delay)
             try:
-                process_file(path, column_map=column_map, original_filename=name, **housekeeping_settings())
+                process_file(path, column_map=column_map, original_filename=name, created_at=created_at,
+                             **housekeeping_settings())
                 return 0
             except Exception as e:
                 if not is_transient_db_error(e):

@@ -481,3 +481,65 @@ class TestWorkOffTheApi:
         resp = env.client.post(f'/ui/uploads/{upload_id}/process', json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         assert resp.status_code == 503
         assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'
+
+
+class TestFileTimes:
+    """Imported rows' created_at is the file's own time, not the upload time.
+
+    RDS and Parquet files record no creation time, so the browser's
+    File.lastModified (or a data-folder file's mtime) is the only source.
+    """
+
+    def test_client_time_is_parsed_and_only_trusted_when_plausible(self):
+        assert service.parse_client_mtime('1700000000000') == datetime.datetime(2023, 11, 14, 22, 13, 20)
+        assert service.parse_client_mtime('not a time') is None
+        assert service.parse_client_mtime(None) is None
+        assert service.parse_client_mtime('0') is None  # 1970: a clock that was never set
+        future = service.parse_client_mtime(str(10 ** 13))  # the year 2286
+        assert future <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+    def test_the_browsers_file_time_is_kept_as_a_suggestion(self, env):
+        import base64
+
+        data = _parquet_bytes(env.tmp)
+        meta = ','.join(f'{k} {base64.b64encode(v.encode()).decode()}'
+                        for k, v in {'filename': 'trial.parquet', 'lastModified': '1700000000000'}.items())
+        location = env.client.post('/ui/uploads/tus', headers={**TUS, 'Upload-Length': str(len(data)),
+                                                               'Upload-Metadata': meta}).headers['Location']
+        assert _patch(env.client, location, 0, data).status_code == 204
+        body = env.client.get(f"/ui/uploads/{location.rsplit('/', 1)[1]}").get_json()
+        assert (body['file_modified_at'], body['data_date']) == ('2023-11-14T22:13:20', None)
+
+    def _submit(self, env, upload_id, **extra):
+        return env.client.post(f'/ui/uploads/{upload_id}/process',
+                               json={'column_map': {'lon': 'lon', 'lat': 'lat'}, **extra})
+
+    def test_the_confirmed_data_date_is_saved_and_reused_by_retry(self, env):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        assert self._submit(env, upload_id, data_date='2024-03-01').status_code == 200
+        env.client.post('/ui/process', json={'file': f'{upload_id}.parquet'})  # Retry sends no date
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['data_date'] == '2024-03-01'
+        from app.models.kvuno import Upload
+        assert service.data_datetime(env.session.get(Upload, upload_id)) == datetime.datetime(2024, 3, 1)
+
+    @pytest.mark.parametrize('value, message', [
+        ('2999-01-01', 'future'), ('1980-01-01', 'before 1990'), ('01/03/2024', 'YYYY-MM-DD')])
+    def test_an_implausible_data_date_is_refused(self, env, value, message):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        resp = self._submit(env, upload_id, data_date=value)
+        assert resp.status_code == 400 and message in resp.get_json()['error']
+
+    def test_an_empty_data_date_means_the_import_date(self, env):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        self._submit(env, upload_id, data_date='2024-03-01')
+        env.client.post(f'/ui/uploads/{upload_id}/process', json={'data_date': ''})
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['data_date'] is None
+
+    def test_the_worker_gets_the_data_date(self, env, monkeypatch):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        sent = []
+        monkeypatch.setattr('app.services.housekeeper.celery_worker_available', lambda: True)
+        monkeypatch.setattr('app.services.housekeeper.process_file_async',
+                            lambda path, **kw: sent.append(kw) or True)
+        self._submit(env, upload_id, data_date='2024-03-01')
+        assert sent[0]['created_at'] == datetime.datetime(2024, 3, 1)

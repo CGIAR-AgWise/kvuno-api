@@ -2,7 +2,7 @@ from typing import Any, Optional
 import datetime
 
 from geoalchemy2.types import Geometry
-from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, JSON, PrimaryKeyConstraint, REAL, String, UniqueConstraint, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 class Base(DeclarativeBase):
@@ -128,6 +128,14 @@ class Upload(Base):
     # to every signed-in user and are never deleted as abandoned.
     source: Mapped[str] = mapped_column(String(20), nullable=False, default='upload',
                                         server_default='upload')
+    # The file's own last-modified time (the browser's File.lastModified, or a
+    # data-folder file's mtime), naive UTC. Only a suggestion: edits and copies
+    # change it, so it pre-fills data_date rather than being used directly.
+    file_modified_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime)
+    # When the data was produced, confirmed by the person who mapped it.
+    # Imported rows get it as created_at; without it, the file's first import
+    # time is used (RDS and Parquet record no such date themselves).
+    data_date: Mapped[Optional[datetime.date]] = mapped_column(Date)
     # The file the worker will read. Differs from the received file after an
     # RDS is converted to Parquet during inspection.
     stored_path: Mapped[Optional[str]] = mapped_column(String(512))

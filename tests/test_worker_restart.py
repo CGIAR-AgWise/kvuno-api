@@ -5,6 +5,7 @@ waited for the whole file, Docker SIGKILLed the container, the task message
 stayed unacked for CELERY_VISIBILITY_TIMEOUT (6 h), and the dead ingest lock
 made a manual Retry skip the file. The job showed "processing", then "stale".
 """
+import datetime
 import os
 import socket
 from types import SimpleNamespace
@@ -127,13 +128,15 @@ class TestResume:
             {'file': 'gone.parquet', 'status': 'processing', 'worker': 'w1', 'run_id': 7},
         ]
         monkeypatch.setattr(ps, 'load_all_jobs', lambda *a, **kw: jobs)
-        upload = SimpleNamespace(stored_path=str(uploaded), column_map={'Lat': 'lat'}, original_name='Up.RDS')
+        upload = SimpleNamespace(stored_path=str(uploaded), column_map={'Lat': 'lat'}, original_name='Up.RDS',
+                                 data_date=datetime.date(2024, 3, 1))
         monkeypatch.setattr('app.services.uploads.find_by_stored_name',
                             lambda name: upload if name == 'up.parquet' else None)
 
         assert hk.resume_interrupted_jobs('w1') == 2
         assert enqueued == [
-            (str(uploaded), {'column_map': {'Lat': 'lat'}, 'original_filename': 'Up.RDS', 'run_id': 3}),
+            (str(uploaded), {'column_map': {'Lat': 'lat'}, 'original_filename': 'Up.RDS', 'run_id': 3,
+                             'created_at': datetime.datetime(2024, 3, 1)}),
             (os.path.join(str(tmp_path), 'scan.parquet'), {'original_filename': 'Scan.RDS', 'run_id': 4}),
         ]
 
