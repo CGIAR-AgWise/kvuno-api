@@ -650,7 +650,10 @@ def _log_batch_conflicts(session, skipped):
             'record_data': record_data,
             **{c: m.get(c) for c in KEY_COLUMNS},
             'check_sum': existing.get(_key(m)),
-            'source': 'housekeeper',
+            # 'ingest', not the old 'housekeeper': rows logged by the old
+            # rowcount check are mostly false (every inserted row), and this
+            # is how scripts/cleanup_conflicts.py tells them apart.
+            'source': 'ingest',
         })
     session.execute(insert(ImportConflict), conflicts)
 
@@ -1188,13 +1191,22 @@ def resume_interrupted_jobs(hostname: str) -> int:
     saved with its upload — what the Jobs page's Retry does, done for you.
     Covers both a cooperative stop ("Paused for a worker restart") and a hard
     kill, whose unacked message Redis would only redeliver hours later.
+
+    A 'stale' job (nothing reported for JOB_STALE_AFTER_SECONDS) is resumed
+    whoever ran it — notably imports the API ran on a gunicorn thread before
+    file work moved to the worker, which were killed when gunicorn recycled
+    the thread's worker and were left stalled for someone to Retry. Nothing
+    stale can be running; if it somehow were, its live ingest lock makes the
+    resumed task skip the file.
     """
     from app.services import uploads as upload_service
     from app.services.progress_store import load_all_jobs
 
     resumed = 0
     for job in load_all_jobs():
-        if job.get('worker') != hostname or job.get('status') not in ('processing', 'stale'):
+        status = job.get('status')
+        mine = job.get('worker') == hostname and status in ('processing', 'stale')
+        if not (mine or status == 'stale'):
             continue
         name = job.get('file') or ''
         try:
