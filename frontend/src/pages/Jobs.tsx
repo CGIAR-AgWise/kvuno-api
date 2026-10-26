@@ -299,11 +299,11 @@ export default function Jobs() {
 
       {liveDetail && (
         <JobDetail
-        job={liveDetail}
-        onClose={() => setDetail(null)}
-        onRetry={retry}
-        onDelete={isAdmin ? deleteFile : undefined}
-      />
+          job={liveDetail}
+          onClose={() => setDetail(null)}
+          onRetry={retry}
+          onDelete={isAdmin ? deleteFile : undefined}
+        />
       )}
     </div>
   )
