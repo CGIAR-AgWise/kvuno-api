@@ -278,6 +278,18 @@ class TestCeleryConfig:
         assert conf.task_reject_on_worker_lost is True
         assert conf.broker_transport_options['visibility_timeout'] >= 3600
 
+    def test_a_lost_broker_is_retried_not_fatal(self):
+        """A Redis blip must not leave the worker up but not consuming.
+
+        Startup is still fail-fast (the preflight checks it); after it has
+        connected, the consumer loop retries and reconnects.
+        """
+        from app.celery_app import celery_app
+        conf = celery_app.conf
+        assert conf.broker_connection_retry is True
+        assert conf.broker_connection_max_retries == 1
+        assert conf.broker_connection_retry_on_startup is False
+
 
 # ── 4. Runs and attempts ────────────────────────────────────────────────
 

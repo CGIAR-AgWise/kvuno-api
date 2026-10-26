@@ -30,6 +30,16 @@ celery_app.config_from_object({
         'visibility_timeout': _settings.CELERY_VISIBILITY_TIMEOUT,
     },
     'worker_prefetch_multiplier': 1,
+    # A worker that loses Redis while running must keep trying: the consumer
+    # loop catches the failed connection and restarts (capped at 5 restarts/s),
+    # so the worker stays up and consumes again once the broker returns. It
+    # does not exit, and it does not sit idle. max_retries=1 only keeps each
+    # attempt short before that loop tries again.
+    #
+    # Startup is the opposite: broker_connection_retry_on_startup=False lets
+    # the preflight fail fast rather than a worker wait for a broker that is
+    # not there yet.
+    'broker_connection_retry': True,
     'broker_connection_retry_on_startup': False,
     'broker_connection_max_retries': 1,
     # Recycle a child that has grown past WORKER_MAX_MEMORY_PER_CHILD MB. Pandas
