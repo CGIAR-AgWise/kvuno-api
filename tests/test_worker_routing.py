@@ -42,6 +42,57 @@ def test_the_runner_refuses_an_id_that_is_not_an_upload_id():
     assert ingest_runner.run('../../etc/passwd') == 2
 
 
+def test_the_runner_opens_a_processing_run(monkeypatch):
+    """A fallback import must show in the Runs panel like a Celery one."""
+    from app import worker_app
+    from app.models import database_conn, kvuno
+    from app.services import progress_store, uploads
+
+    class _Upload:
+        stored_path = 'x.parquet'
+        column_map = {}
+        original_name = 'x.parquet'
+        data_date = None
+
+    class _Session:
+        def get(self, model, upload_id):
+            return _Upload()
+
+        def remove(self):
+            pass
+
+    class _Db:
+        session = _Session()
+
+    class _App:
+        def app_context(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    started, discarded, seen = [], [], []
+    monkeypatch.setattr(uploads, 'valid_id', lambda upload_id: True)
+    monkeypatch.setattr(uploads, 'data_datetime', lambda upload: None)
+    monkeypatch.setattr(database_conn.MyDb, 'get_db', classmethod(lambda cls: _Db()))
+    monkeypatch.setattr(kvuno, 'Upload', object)
+    monkeypatch.setattr(worker_app, 'build_app', lambda: _App())
+    monkeypatch.setattr(hk, 'set_app', lambda app: None)
+    monkeypatch.setattr(hk, 'housekeeping_settings', lambda: {})
+    monkeypatch.setattr(hk, 'is_transient_db_error', lambda e: False)
+    monkeypatch.setattr(hk, 'process_file', lambda *a, **kw: seen.append(kw))
+    monkeypatch.setattr(progress_store, 'start_run', lambda **kw: started.append(kw) or 7)
+    monkeypatch.setattr(progress_store, 'discard_run', lambda run_id: discarded.append(run_id))
+
+    assert ingest_runner.run('a' * 32) == 0
+    assert started and started[0]['source'] == 'upload'
+    assert seen and seen[0]['run_id'] == 7
+    assert discarded == [7]
+
+
 def test_the_worker_records_an_rds_that_will_not_convert_and_stops(monkeypatch, tmp_path):
     from app import tasks
     bad = tmp_path / 'x.RDS'
