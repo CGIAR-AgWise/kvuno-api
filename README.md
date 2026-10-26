@@ -14,7 +14,7 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering in metres (geography cast)
 - **Database** — PostgreSQL/PostGIS. SQLite can run the migrations and serve the API for UI work, but ingestion (Postgres `ON CONFLICT`) and the spatial queries need Postgres
-- **Health Check** — `GET /health` returns app name, build version, and database status
+- **Health Check** — `GET /health` returns app name, build version, and database status; `?deep=1` also reports Redis, Celery-worker and data-directory state (status `degraded`, still 200, when one is down)
 - **Dockerized** — Dev, production, and worker Dockerfiles with docker-compose; images published to GitHub Container Registry
 - **Database Migrations** — Alembic-managed schema evolution
 - **Token Authentication** — Sanctum-style opaque `{id}|{secret}` tokens (SHA-256 hashed at rest) with BCrypt password hashing; no signing key, and revoking a token is a single row delete
@@ -491,7 +491,7 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | `GET` | `/` | — | Browsers: a landing page linking the web app and API docs. Other clients: redirect to `SPA_ROOT_URL`, or a JSON pointer when it is unset |
-| `GET` | `/health` | — | Health check with database status |
+| `GET` | `/health` | — | Health check with database status; `?deep=1` adds Redis, worker and data-directory state |
 | `GET` | `/login`, `/register` | — | SPA routes — login and registration pages (nginx) |
 | `GET` | `/jobs` | Required | SPA route — job list (nginx) |
 | `GET` | `/explore` | Required | SPA route — map explorer (nginx) |

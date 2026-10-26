@@ -22,6 +22,41 @@ def _load_jobs():
     return load_all_jobs()
 
 
+def _deep_health() -> dict:
+    """Diagnostics for ?deep=1: the things behind "uploads do nothing".
+
+    Kept off the default response because a probe hits /health often and this
+    asks Redis/Celery. Never raises: a broken dependency is the answer, not a
+    500 from the health endpoint.
+    """
+    from app.config import celery_broker_available
+
+    settings = get_settings()
+    info = {'housekeeping': settings.HOUSEKEEPING_ENABLED}
+    if settings.HOUSEKEEPING_ENABLED:
+        try:
+            info['redis'] = 'UP' if celery_broker_available() else 'DOWN'
+        except Exception:
+            info['redis'] = 'DOWN'
+        try:
+            from app.services import housekeeper
+            info['worker'] = 'UP' if housekeeper.celery_worker_available() else 'DOWN'
+        except Exception:
+            info['worker'] = 'DOWN'
+    else:
+        # Not used, so not a problem (a DOWN here would look like an outage).
+        info['redis'] = info['worker'] = 'DISABLED'
+
+    root = upload_service.upload_root()
+    if not os.path.isdir(root):
+        info['data_dir'] = 'MISSING'
+    elif not os.access(root, os.W_OK):
+        info['data_dir'] = 'READONLY'
+    else:
+        info['data_dir'] = 'UP'
+    return info
+
+
 def _format_jobs(raw):
     counts = {'completed': 0, 'processing': 0, 'error': 0, 'stale': 0, 'unknown': 0}
     for j in raw:
@@ -90,6 +125,13 @@ def register_app_routes(app):
             "version": get_settings().app_version,
             "database": "UP" if db_connected else "DOWN",
         }
+        # Additive and opt-in: probes keep the cheap database-only answer.
+        if request.args.get('deep', '').lower() in ('1', 'true', 'yes'):
+            health_status.update(_deep_health())
+            broken = [v for k, v in health_status.items()
+                      if k in ('redis', 'worker', 'data_dir') and v not in ('UP', 'DISABLED')]
+            if db_connected and broken:
+                health_status['status'] = 'degraded'
         return jsonify(health_status), 200 if db_connected else 500
 
     @app.route('/ui/columns', methods=['GET'])
