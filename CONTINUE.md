@@ -9,7 +9,11 @@ rewrite it once those items are done.
 
 ## Where things stand
 
-- Branch **`develop`**. The last three commits are **local only**, not pushed:
+- Branch **`develop`**. The last seven commits are **local only**, not pushed:
+  - `15fa383` fix(worker): keep reconnecting after a broker blip
+  - `af7bfb9` fix(uploads): let a redelivered inspection take over a dead one
+  - `57bd544` fix(uploads): finish an upload's status when its import ends
+  - `f026e9a` fix(ingest): open a processing run for the fallback ingest runner
   - `e127a6c` feat(jobs): administrators delete a file with its upload and job history
   - `fa1a359` fix(worker): resume at once after a killed import, and stop the OOM kills
   - `90effc3` feat(ingest): `created_at` from a confirmed data date; stop storing NULL timestamps
@@ -20,7 +24,7 @@ rewrite it once those items are done.
   committed by the user. The worker runs Celery (`HOUSEKEEPING_MODE` empty) with
   `CELERY_CONCURRENCY=1` and 2 GB; the API has 2 GB. Whether the latest images
   are deployed is not known. Ask.
-- **Checks at the last commit:** 453 passed, 1 skipped (a POSIX-only lock test,
+- **Checks at the last commit:** 462 passed, 1 skipped (a POSIX-only lock test,
   skipped on Windows); `ruff` clean; `gen_config_docs --check` clean; `pnpm run
   build` passes.
 - **Migrations since the last release**, all applied by the API container on
@@ -50,6 +54,12 @@ rewrite it once those items are done.
 - **Scripts:** `scripts/convert_rds.py` (local RDS → Parquet, recursive, defaults
   to `static/`) and `scripts/cleanup_conflicts.py` (removes the old false
   conflicts; dry run unless `--apply`).
+- **The last four commits closed the known gaps 5–8 below:** the fallback
+  `ingest_runner` opens a processing run; an upload moves `processing → completed`
+  (or `failed`) when its import ends; a redelivered worker inspection takes over
+  at once instead of waiting for the Upload-page poll; and the worker's
+  post-connect broker retry is explicit and verified (it reconnects, it does not
+  exit).
 
 ## Open items
 
@@ -66,23 +76,12 @@ Waiting on the user (ask; do not do these unprompted):
 4. **"Undo import"**: delete a file's imported rows by `check_sum`, as an
    opt-in option on the admin delete. Offered, not built.
 
-Known gaps (fix when asked, or offer):
+Known gaps 5–8 are fixed (see "What changed recently"). Older suggestions the
+user has not taken up:
 
-5. An upload imported by `ingest_runner` (no worker available) opens no
-   processing run, so it does not appear in the Runs panel. Celery imports do.
-6. Nothing moves an upload out of `processing` once its import completes, so
-   the Upload page lists it as Processing until `UPLOAD_ABANDON_AGE` cleanup.
-   Verify before relying on this.
-7. If a worker process is killed while *reading* an upload (not importing it),
-   it recovers only when the Upload page's polling re-queues it, about 3 minutes
-   later, and only while someone has that page open.
-8. `celery_app.py` sets `broker_connection_max_retries: 1`. Unverified whether a
-   Redis blip makes the worker exit (and get restarted) or stay up without
-   consuming. Check the worker log around any future stall.
-9. Older suggestions the user has not taken up: a CI job against
-   `postgis/postgis:17-3.5`; `RATE_LIMIT_STORAGE` on Redis; metrics or a richer
-   `/health`; the token in `localStorage` (consider an HttpOnly cookie); the
-   unused `psycopg2-binary` dependency.
+9. A CI job against `postgis/postgis:17-3.5`; `RATE_LIMIT_STORAGE` on Redis;
+   metrics or a richer `/health`; the token in `localStorage` (consider an
+   HttpOnly cookie); the unused `psycopg2-binary` dependency.
 
 ## How to check work
 
