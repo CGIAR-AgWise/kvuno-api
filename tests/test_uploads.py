@@ -364,6 +364,39 @@ class TestLifecycle:
         listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
         assert upload_id not in listed
 
+    def test_a_finished_job_closes_a_processing_upload_on_read(self, env, monkeypatch):
+        """The ingest's own bookkeeping write is best effort; this is the net."""
+        from app.models.kvuno import Upload
+        from app.services import progress_store
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        monkeypatch.setattr(progress_store, 'get_job',
+                            lambda name: {'status': 'completed'} if name.endswith('.parquet') else None)
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'completed'
+
+    def test_a_failed_job_does_not_close_the_upload(self, env, monkeypatch):
+        """An `error` job may still be retried; only `completed` is final."""
+        from app.models.kvuno import Upload
+        from app.services import progress_store
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        monkeypatch.setattr(progress_store, 'get_job', lambda name: {'status': 'error'})
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id in listed
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'processing'
+
     def test_a_converted_file_is_still_the_same_upload(self, env):
         """stored_path `<id>.rds`, but the worker imported `<id>.parquet`."""
         from app.models.kvuno import Upload

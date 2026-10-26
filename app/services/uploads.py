@@ -257,11 +257,63 @@ def get_owned(upload_id: str, owner_id: int | None) -> Upload:
     return upload
 
 
+def _completed_job_name(upload: Upload) -> str | None:
+    """The job name for an upload whose import has finished, else None.
+
+    Only `completed` is trusted: an `error` job may still be retried (a
+    transient DB error) and a `stale` one may be resumed, so closing the
+    upload on either would leave a later success unable to mark it (only a
+    `processing` row is updated).
+    """
+    from app.services import progress_store
+
+    if upload.status != 'processing' or not upload.stored_path:
+        return None
+    name = os.path.basename(upload.stored_path)
+    candidates = [name]
+    if os.path.splitext(name)[1].lower() == '.rds':
+        candidates.append(os.path.splitext(name)[0] + '.parquet')
+    for candidate in candidates:
+        try:
+            job = progress_store.get_job(candidate)
+        except Exception:
+            return None
+        if job is not None and job.get('status') == 'completed':
+            return candidate
+    return None
+
+
+def reconcile_processing(uploads: list[Upload]) -> list[Upload]:
+    """Drop uploads whose import finished but whose row was never updated.
+
+    `process_file` closes the row when it ends, but that write is best effort
+    by design (it logs a warning and carries on). Without this, a page load
+    showed "Processing" forever after a failed bookkeeping write.
+    """
+    kept = []
+    for upload in uploads:
+        job_name = _completed_job_name(upload)
+        if job_name is None:
+            kept.append(upload)
+            continue
+        try:
+            if mark_processed(job_name, 'completed'):
+                # mark_processed used its own Session; refresh this instance so
+                # the caller's response shows the new status.
+                MyDb.get_db().session.expire(upload)
+        except Exception:
+            kept.append(upload)
+    return kept
+
+
 def list_owned(owner_id: int | None, statuses=UNFINISHED) -> list[Upload]:
-    return (_session().query(Upload)
-            .filter(_visible_to(owner_id), Upload.status.in_(statuses))
-            .order_by(Upload.created_at.desc())
-            .all())
+    uploads = (_session().query(Upload)
+               .filter(_visible_to(owner_id), Upload.status.in_(statuses))
+               .order_by(Upload.created_at.desc())
+               .all())
+    if 'processing' in statuses:
+        uploads = reconcile_processing(uploads)
+    return uploads
 
 
 def count_awaiting_mapping(owner_id: int | None) -> int:

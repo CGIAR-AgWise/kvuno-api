@@ -227,6 +227,9 @@ def register_upload_routes(app):
             upload = service.get_owned(upload_id, _owner_id())
         except UploadError as e:
             return jsonify(error=str(e)), e.status
+        # A processing row whose job already finished: close it even if the
+        # ingest's own bookkeeping write failed.
+        service.reconcile_processing([upload])
         # Also the recovery path: an inspection whose worker died is restarted
         # here once its heartbeat goes stale.
         service.ensure_inspection(current_app._get_current_object(), upload)
