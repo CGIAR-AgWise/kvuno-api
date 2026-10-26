@@ -15,6 +15,7 @@ Each test names the failure of the resumable.js flow it replaced:
 import datetime
 import threading
 import types
+import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -362,6 +363,22 @@ class TestLifecycle:
         assert upload.status == 'completed'
         listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
         assert upload_id not in listed
+
+    def test_a_converted_file_is_still_the_same_upload(self, env):
+        """stored_path `<id>.rds`, but the worker imported `<id>.parquet`."""
+        from app.models.kvuno import Upload
+
+        upload_id = uuid.uuid4().hex
+        env.session.add(Upload(
+            id=upload_id, original_name='trial.RDS', size=10, status='processing',
+            stored_path=str(env.tmp / 'uploads' / upload_id / f'{upload_id}.rds'),
+        ))
+        env.session.commit()
+
+        assert service.find_by_stored_name(f'{upload_id}.parquet').id == upload_id
+        assert service.mark_processed(f'{upload_id}.parquet', 'completed')
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'completed'
 
     def test_a_failed_import_is_recorded_on_the_upload(self, env):
         from app.models.kvuno import Upload

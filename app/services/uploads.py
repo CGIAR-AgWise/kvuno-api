@@ -736,12 +736,19 @@ def mark_ready(upload: Upload, message: str) -> None:
 
 
 def find_by_stored_name(file_name: str) -> Upload | None:
-    """The upload whose stored file is `file_name` (`<id>.parquet`), if any."""
+    """The upload whose stored file has this name's id (`<id>.<ext>`), if any.
+
+    The extension is not compared: an inspection whose Parquet write failed
+    keeps the RDS as `stored_path`, and the worker's later conversion is
+    `<id>.parquet` — the id is what identifies the upload.
+    """
     upload_id = os.path.splitext(os.path.basename(file_name))[0]
     if not valid_id(upload_id):
         return None
     upload = _session().get(Upload, upload_id)
-    if upload is None or os.path.basename(upload.stored_path or '') != os.path.basename(file_name):
+    if upload is None:
+        return None
+    if os.path.splitext(os.path.basename(upload.stored_path or ''))[0] != upload_id:
         return None
     return upload
 
@@ -765,7 +772,9 @@ def mark_processed(file_name: str, status: str, error: str | None = None) -> boo
 
     with Session(bind=MyDb.get_db().engine) as session:
         upload = session.get(Upload, upload_id)
-        if upload is None or os.path.basename(upload.stored_path or '') != os.path.basename(file_name):
+        # The id is the identity; the extension may differ (an RDS converted
+        # by the worker is `<id>.parquet` while stored_path is `<id>.rds`).
+        if upload is None or os.path.splitext(os.path.basename(upload.stored_path or ''))[0] != upload_id:
             return False
         updated = session.execute(
             update(Upload)
