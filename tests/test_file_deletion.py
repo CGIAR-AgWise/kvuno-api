@@ -6,6 +6,7 @@ import types
 
 import pytest
 from flask import Flask
+from sqlalchemy import text
 
 from app.services import progress_store as ps
 
@@ -25,6 +26,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr('app.auth.get_current_user', lambda: current['user'])
     monkeypatch.setattr('app.api.user.get_current_user', lambda: current['user'])
     monkeypatch.setattr('app.api.user.is_admin', lambda user: user is ADMIN)
+    monkeypatch.setattr('app.services.file_deletion.invalidate_planting_data_cache', lambda: None)
 
     app = Flask(__name__)
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
@@ -89,12 +91,51 @@ def test_an_upload_goes_with_its_files_jobs_and_empty_runs_but_not_its_data(env)
     resp = env.client.delete(f'/ui/jobs/{name}')
 
     assert resp.status_code == 200, resp.get_json()
-    assert resp.get_json() == {'file': name, 'file_deleted': True, 'upload_deleted': True, 'jobs_deleted': 2}
+    assert resp.get_json() == {'file': name, 'file_deleted': True, 'upload_deleted': True, 'jobs_deleted': 2,
+                               'rows_deleted': 0, 'conflicts_deleted': 0}
     assert not (env.tmp / 'uploads' / upload_id).exists()
     assert env.session.get(env.Upload, upload_id) is None
     assert [j.file_name for j in env.session.query(env.ProcessingJob)] == ['other.parquet']
     assert [r.id for r in env.session.query(env.ProcessingRun)] == [shared], 'only the emptied run goes'
     assert env.session.query(env.FileImport).count() == 1, 'a re-upload is still known as imported'
+
+
+def _imported_tables(env):
+    """The purge only needs these two tables' id and check_sum.
+
+    The real model has a PostGIS `coordinates` column, which SQLite cannot
+    create (GeoAlchemy registers RecoverGeometryColumn), and a DELETE never
+    touches it.
+    """
+    env.session.execute(text('CREATE TABLE planting_recommendations '
+                             '(id INTEGER PRIMARY KEY, check_sum VARCHAR(100) NOT NULL)'))
+    env.session.execute(text('CREATE TABLE import_conflicts '
+                             '(id INTEGER PRIMARY KEY, check_sum VARCHAR(100))'))
+    env.session.commit()
+
+
+def test_undo_import_removes_the_files_rows_and_checksum(env):
+    (env.tmp / 'undo.parquet').write_bytes(b'x')
+    _job(env, 'undo.parquet')
+    env.session.add(env.FileImport(id=1, check_sum='sum-undo', file_name='undo.parquet', offset=None,
+                                   processed_at=datetime.datetime(2026, 1, 1)))
+    env.session.commit()
+    _imported_tables(env)
+    env.session.execute(text("INSERT INTO planting_recommendations (id, check_sum) "
+                             "VALUES (1, 'sum-undo'), (2, 'sum-undo'), (3, 'other')"))
+    env.session.execute(text("INSERT INTO import_conflicts (id, check_sum) "
+                             "VALUES (1, 'sum-undo'), (2, 'other')"))
+    env.session.commit()
+
+    resp = env.client.delete('/ui/jobs/undo.parquet', json={'purge_rows': True})
+    data = resp.get_json()
+
+    assert resp.status_code == 200, data
+    assert data['rows_deleted'] == 2 and data['conflicts_deleted'] == 1
+    assert [r[0] for r in env.session.execute(text('SELECT id FROM planting_recommendations'))] == [3]
+    assert [r[0] for r in env.session.execute(text('SELECT id FROM import_conflicts'))] == [2]
+    assert env.session.query(env.FileImport).count() == 0, 'the file can be imported afresh'
+    assert not (env.tmp / 'undo.parquet').exists()
 
 
 def test_a_data_folder_file_goes_with_its_mapping_sidecar(env):

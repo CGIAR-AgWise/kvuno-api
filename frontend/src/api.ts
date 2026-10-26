@@ -623,13 +623,22 @@ export function fetchJobProgress(file: string, signal?: AbortSignal) {
 
 /**
  * Administrators: delete a file with its upload and its job history. The rows
- * already imported from it are kept. 409 while it is being processed.
+ * already imported from it are kept unless `purgeRows` is set, which also
+ * deletes them and the checksum record ("Undo import", irreversible).
+ * 409 while it is being processed.
  */
-export function deleteJobFile(file: string) {
-  return request<{ file: string; file_deleted: boolean; upload_deleted: boolean; jobs_deleted: number }>(
-    '/ui/jobs/' + encodeURIComponent(file),
-    { method: 'DELETE' },
-  )
+export function deleteJobFile(file: string, purgeRows = false) {
+  return request<{
+    file: string
+    file_deleted: boolean
+    upload_deleted: boolean
+    jobs_deleted: number
+    rows_deleted: number
+    conflicts_deleted: number
+  }>('/ui/jobs/' + encodeURIComponent(file), {
+    method: 'DELETE',
+    body: purgeRows ? { purge_rows: true } : undefined,
+  })
 }
 
 /**

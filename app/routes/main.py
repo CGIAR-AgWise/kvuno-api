@@ -179,12 +179,15 @@ def register_app_routes(app):
     def ui_delete_file(file_name):
         """Administrators: delete a file with its upload and its jobs (services/file_deletion.py).
 
-        Imported rows and the file's checksum record are kept.
+        Imported rows and the file's checksum record are kept unless the body
+        asks `{"purge_rows": true}` ("Undo import"), which also deletes them.
         """
         from app.api.user import get_current_user
         from app.services.file_deletion import delete_file
+        body = request.get_json(silent=True) or {}
         try:
-            result = delete_file(file_name, getattr(get_current_user(), 'id', None))
+            result = delete_file(file_name, getattr(get_current_user(), 'id', None),
+                                 purge_rows=bool(body.get('purge_rows')))
         except UploadError as e:
             return jsonify(error=str(e)), e.status
         return jsonify(result)
