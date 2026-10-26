@@ -447,7 +447,7 @@ There is no Postgres volume to back up here — the database is external (see §
 |---|---|---|
 | Compose exits immediately with `DB_USER is required` | Missing env var | Set `DB_USER`/`DB_PASSWORD`/`DB_NAME` in the shell or `.env` |
 | API returns 500 on `/health` | DB connection refused | Check `DB_HOST` resolves from inside the container — `db` is no longer a compose service |
-| `psycopg2.OperationalError` | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
+| `psycopg.OperationalError` (psycopg3) | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Upload page files never finish processing | They run on a thread in the API process; a gunicorn worker recycled or killed mid-file (e.g. out of memory on a large file) ends it | The job goes *Stalled* after `JOB_STALE_AFTER_SECONDS`; Retry resumes from the stored offset. For very large files use the worker (`housekeeping.py`) or raise the API memory limit |
 | Files sent to `/api/v1/data/upload` never processed | `HOUSEKEEPING_ENABLED` unset/false: they are saved for the next startup scan | Restart the API after the cooldown (`STARTUP_SCAN_COOLDOWN_SECONDS`), run `housekeeping.py` in the worker, or set `HOUSEKEEPING_ENABLED=true` with the `worker` running |
