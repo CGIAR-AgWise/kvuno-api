@@ -59,6 +59,23 @@ jobs:
     if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      # The image production documents (AGENTS.md), so migrations and the
+      # spatial queries meet the real thing. The unit suite cannot use it:
+      # pytest-env pins SQLite.
+      postgis:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: kvuno
+          POSTGRES_PASSWORD: kvuno
+          POSTGRES_DB: kvuno
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U kvuno -d kvuno"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v7
 
@@ -110,6 +127,17 @@ jobs:
           DB_DRIVER: "sqlite"
           DB_NAME: ":memory:"
         run: poetry run python -c "import app, app.celery_app, app.tasks; from app.config import get_settings; get_settings().database_url()"
+
+      # SQLite cannot run the migrations or ST_DWithin, so a Postgres-only
+      # break (a geometry binding, the geography cast behind `radius` in
+      # metres) passed every other step. This is the real schema, from the
+      # migrations, on the documented PostGIS image.
+      - name: PostGIS migrations and spatial query
+        env:
+          DB_URL: "postgresql://kvuno:kvuno@localhost:5432/kvuno"
+        run: |
+          poetry run alembic upgrade head
+          poetry run python scripts/postgis_smoke.py
 
   frontend:
     name: Frontend (typecheck + build)
