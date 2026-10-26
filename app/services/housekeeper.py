@@ -313,6 +313,20 @@ def _write_progress(file_path: str, status: str, current: int, total: int, messa
         worker=worker_name(),
         original_filename=original_filename or os.path.basename(file_path),
     )
+    if status == 'completed':
+        # The import is over: stop the Upload page listing it as Processing.
+        _mark_upload_processed(file_path, 'completed')
+
+
+def _mark_upload_processed(file_path: str, status: str, error: str | None = None):
+    """Finish the upload this file came from, if any (a scan file has none)."""
+    try:
+        from app.services import uploads as upload_service
+        upload_service.mark_processed(file_path, status, error)
+    except Exception:
+        # Never fail an ingest over bookkeeping the Upload page shows.
+        logger.warning("could not update the upload status", file=os.path.basename(file_path),
+                       exc_info=True)
 
 
 def _duration(seconds: float) -> str:
@@ -1022,6 +1036,9 @@ def process_file(
                 # exception here meant retries never happened at all.
                 raise
             progress('error', checkpoint_row, num_rows, str(e), error=str(e))
+            # A non-transient failure ends the import (a transient one is
+            # retried and keeps its upload `processing`).
+            _mark_upload_processed(file_path, 'failed', str(e))
             if isinstance(e, FileNotFoundError):
                 logger.exception(f"Failed to process file {file_name}: {e}")
             else:

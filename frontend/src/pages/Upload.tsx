@@ -118,9 +118,11 @@ function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
     case 'submitted':
       return { label: 'Submitted', tone: 'neutral', icon: 'bi-send-check' }
     case 'processing':
-      // Listed by GET /ui/uploads since processing moved into the API; without
-      // this case the badge was undefined and the page crashed on reload.
+      // Listed by GET /ui/uploads while the import runs; without this case the
+      // badge was undefined and the page crashed on reload.
       return { label: 'Processing', tone: 'info' }
+    case 'completed':
+      return { label: 'Completed', tone: 'success', icon: 'bi-check2-circle' }
   }
 }
 

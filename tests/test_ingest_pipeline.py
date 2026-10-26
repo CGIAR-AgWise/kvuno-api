@@ -503,3 +503,25 @@ class TestProgressRoute:
     def test_path_separators_are_rejected(self, client, monkeypatch):
         monkeypatch.setattr(ps, 'get_job', MagicMock(side_effect=AssertionError))
         assert client.get('/ui/progress/..%5Csecret').status_code == 404
+
+
+# ── 10. An upload leaves `processing` when its import ends ───────────────
+
+class TestUploadStatusOnImportEnd:
+    def test_completion_finishes_the_upload(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(hk, 'save_progress', lambda *a, **kw: None)
+        monkeypatch.setattr('app.services.uploads.mark_processed',
+                            lambda *a, **kw: calls.append((a, kw)))
+        hk._write_progress('C:/data/uploads/' + 'a' * 32 + '/' + 'a' * 32 + '.parquet',
+                           'completed', 5, 5)
+        assert calls and calls[0][0][1] == 'completed'
+
+    def test_in_flight_progress_does_not_finish_it(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(hk, 'save_progress', lambda *a, **kw: None)
+        monkeypatch.setattr('app.services.uploads.mark_processed',
+                            lambda *a, **kw: calls.append((a, kw)))
+        hk._write_progress('C:/data/uploads/' + 'a' * 32 + '/' + 'a' * 32 + '.parquet',
+                           'processing', 2, 5)
+        assert calls == []

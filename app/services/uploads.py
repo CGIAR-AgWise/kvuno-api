@@ -75,10 +75,15 @@ ERROR_MAX = 2000
 _ID_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # Statuses that still accept a mapping and a submit. `failed` is excluded:
-# there is nothing to map when the file could not be read.
+# there is nothing to map when the file could not be read. `completed` is
+# excluded too: the import already ran.
 SUBMITTABLE = ('ready', 'submitted', 'processing')
-# Uploads that never reached a worker; cleaned up once abandoned.
+# Uploads still in the lifecycle, so the Upload page lists them. `completed`
+# is not here: the import is over and the file is only waiting for cleanup.
 UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed', 'processing')
+# Everything cleanup may remove once idle: the open lifecycle and finished
+# imports (their file is still on disk until then).
+CLEANABLE = (*UNFINISHED, 'completed')
 
 _EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
 DB_TARGET_COLUMNS = {
@@ -728,6 +733,36 @@ def find_by_stored_name(file_name: str) -> Upload | None:
     return upload
 
 
+def mark_processed(file_name: str, status: str, error: str | None = None) -> bool:
+    """Finish an upload's lifecycle when its import ends.
+
+    `processing` was the last status an import ever left behind, so the Upload
+    page kept listing a finished file as Processing until the cleanup task
+    deleted it (CLEANUP_AGE, a day by default). Only a `processing` row is
+    changed: a folder file waiting for a mapping, or an upload already
+    discarded, must not move.
+
+    Uses its own short-lived Session, like progress_store, so it can never
+    commit rows the ingest session is holding between checkpoints.
+    """
+    upload_id = os.path.splitext(os.path.basename(file_name))[0]
+    if not valid_id(upload_id):
+        return False
+    from sqlalchemy.orm import Session
+
+    with Session(bind=MyDb.get_db().engine) as session:
+        upload = session.get(Upload, upload_id)
+        if upload is None or os.path.basename(upload.stored_path or '') != os.path.basename(file_name):
+            return False
+        updated = session.execute(
+            update(Upload)
+            .where(Upload.id == upload_id, Upload.status == 'processing')
+            .values(status=status, error=_clip(error) if error else None, updated_at=_now())
+        ).rowcount
+        session.commit()
+        return bool(updated)
+
+
 def discard(upload: Upload) -> None:
     shutil.rmtree(upload_dir(upload.id), ignore_errors=True)
     session = _session()
@@ -743,7 +778,7 @@ def cleanup_abandoned(max_age_seconds: int) -> int:
     """
     cutoff = _now() - datetime.timedelta(seconds=max_age_seconds)
     stale = (_session().query(Upload)
-             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff,
+             .filter(Upload.status.in_(CLEANABLE), Upload.updated_at < cutoff,
                      Upload.source != 'folder')
              .all())
     for upload in stale:

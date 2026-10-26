@@ -316,6 +316,55 @@ class TestLifecycle:
         assert (env.tmp / 'uploads' / fresh).exists()
         assert not (env.tmp / 'uploads' / old).exists()
 
+    def test_a_finished_import_leaves_processing_and_the_open_list(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        assert service.mark_processed(upload.stored_path, 'completed')
+        env.session.refresh(upload)
+        assert upload.status == 'completed'
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+
+    def test_a_failed_import_is_recorded_on_the_upload(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        assert service.mark_processed(upload.stored_path, 'failed', 'bad rows')
+        env.session.refresh(upload)
+        assert (upload.status, upload.error) == ('failed', 'bad rows')
+
+    def test_an_upload_awaiting_mapping_is_not_finished(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        assert upload.status == 'ready'
+
+        assert service.mark_processed(upload.stored_path, 'completed') is False
+        env.session.refresh(upload)
+        assert upload.status == 'ready'
+
+    def test_cleanup_also_removes_a_finished_upload(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'completed'
+        upload.updated_at = datetime.datetime(2000, 1, 1)
+        env.session.commit()
+
+        assert service.cleanup_abandoned(7 * 86400) == 1
+        assert not (env.tmp / 'uploads' / upload_id).exists()
+
 
 def _folder_file(env, name='field.parquet', columns=None):
     """A data-folder file whose columns the default mapping cannot use."""
