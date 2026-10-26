@@ -62,12 +62,14 @@ def inspect_upload_task(self, upload_id: str):
 
     Runs on the worker so the API never reads files: an RDS read needs ~150x
     the file size in memory, which the API's limit could not give. The claim
-    in inspect() makes a duplicate task (a re-queue by the status poll) a no-op.
+    in inspect() makes a duplicate task (a re-queue by the status poll) a no-op;
+    a redelivered task takes over, because its previous process is gone even
+    when the row's heartbeat is still fresh.
     """
     app = _get_worker_app()
     with app.app_context():
         from app.services import uploads
-        uploads.inspect(upload_id, app)
+        uploads.inspect(upload_id, app, take_over=True)
 
 
 @celery_app.task(bind=True, max_retries=_settings.CELERY_TASK_MAX_RETRIES,

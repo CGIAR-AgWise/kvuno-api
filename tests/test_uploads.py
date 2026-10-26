@@ -239,6 +239,19 @@ class TestInspection:
         assert service._claim_inspection(upload_id) is True
         assert service._claim_inspection(upload_id) is False  # heartbeat is fresh
 
+    def test_a_redelivered_worker_task_takes_over_at_once(self, env):
+        """Its previous process is gone; the heartbeat is not proof of life."""
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        row = env.session.get(Upload, upload_id)
+        row.status = 'inspecting'
+        row.updated_at = service._now()
+        env.session.commit()
+
+        assert service._claim_inspection(upload_id) is False  # the poll waits
+        assert service._claim_inspection(upload_id, take_over=True) is True
+
 
 class TestSubmission:
     def test_without_a_worker_the_mapping_is_kept_and_it_stays_ready(self, env):

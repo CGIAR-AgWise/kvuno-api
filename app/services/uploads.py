@@ -496,17 +496,26 @@ def describe_duplicate(file_path: str, total_rows: int | None = None, checksum: 
         return None
 
 
-def _claim_inspection(upload_id: str) -> bool:
-    """Atomically take the inspection, so two pollers never run it twice."""
+def _claim_inspection(upload_id: str, take_over: bool = False) -> bool:
+    """Atomically take the inspection, so two pollers never run it twice.
+
+    ``take_over`` is for the worker task: a redelivered task means the previous
+    delivery ended (the process was killed), but the row's heartbeat can still
+    be inside the stale window. Waiting for it meant a killed reader was only
+    recovered by the next Upload-page poll, minutes later. The visibility
+    timeout is far longer than CONVERT_TIMEOUT_SECONDS, so a redelivery while
+    the original is still reading is not expected.
+    """
     stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
+    if take_over:
+        state = Upload.status.in_(('received', 'inspecting'))
+    else:
+        state = or_(Upload.status == 'received',
+                    (Upload.status == 'inspecting') & (Upload.updated_at < stale_before))
     session = _session()
     claimed = session.execute(
         update(Upload)
-        .where(
-            Upload.id == upload_id,
-            or_(Upload.status == 'received',
-                (Upload.status == 'inspecting') & (Upload.updated_at < stale_before)),
-        )
+        .where(Upload.id == upload_id, state)
         .values(status='inspecting', updated_at=_now(), error=None, progress=None)
     ).rowcount
     session.commit()
@@ -562,13 +571,17 @@ class _ProgressWriter:
             logger.warning('upload progress write failed', upload_id=self.upload_id, exc_info=True)
 
 
-def inspect(upload_id: str, app=None):
-    """Convert, preview and fingerprint a received upload. Runs off the request path."""
+def inspect(upload_id: str, app=None, take_over: bool = False):
+    """Convert, preview and fingerprint a received upload. Runs off the request path.
+
+    ``take_over`` lets the worker task reclaim an inspection whose process was
+    killed, even before its heartbeat looks stale (see `_claim_inspection`).
+    """
     from app.utils.preview import build_preview
     from app.utils.rds_to_parquet import convert_for_ingestion
     from app.utils import calculate_file_checksum
 
-    if not _claim_inspection(upload_id):
+    if not _claim_inspection(upload_id, take_over):
         return
 
     stop = threading.Event()
