@@ -9,11 +9,16 @@ rewrite it once those items are done.
 
 ## Where things stand
 
-- Branch **`develop`**. The last seven commits are **local only**, not pushed:
+- Branch **`develop`**, ahead of `origin/develop`; nothing is pushed. The
+  newest commits:
+  - `e999cf6` style: tidy the delete-file api doc and dialog props
+  - `e73bae2` fix(uploads): update a Processing card when its import ends
+  - `d8d1e2c` docs: record the closed upload and worker gaps
   - `15fa383` fix(worker): keep reconnecting after a broker blip
   - `af7bfb9` fix(uploads): let a redelivered inspection take over a dead one
   - `57bd544` fix(uploads): finish an upload's status when its import ends
   - `f026e9a` fix(ingest): open a processing run for the fallback ingest runner
+  - `4f86027` docs: add continue.md handoff and fix stale agents.md notes
   - `e127a6c` feat(jobs): administrators delete a file with its upload and job history
   - `fa1a359` fix(worker): resume at once after a killed import, and stop the OOM kills
   - `90effc3` feat(ingest): `created_at` from a confirmed data date; stop storing NULL timestamps
@@ -24,7 +29,7 @@ rewrite it once those items are done.
   committed by the user. The worker runs Celery (`HOUSEKEEPING_MODE` empty) with
   `CELERY_CONCURRENCY=1` and 2 GB; the API has 2 GB. Whether the latest images
   are deployed is not known. Ask.
-- **Checks at the last commit:** 462 passed, 1 skipped (a POSIX-only lock test,
+- **Checks at the last commit:** 463 passed, 1 skipped (a POSIX-only lock test,
   skipped on Windows); `ruff` clean; `gen_config_docs --check` clean; `pnpm run
   build` passes.
 - **Migrations since the last release**, all applied by the API container on
@@ -54,12 +59,17 @@ rewrite it once those items are done.
 - **Scripts:** `scripts/convert_rds.py` (local RDS → Parquet, recursive, defaults
   to `static/`) and `scripts/cleanup_conflicts.py` (removes the old false
   conflicts; dry run unless `--apply`).
-- **The last four commits closed the known gaps 5–8 below:** the fallback
-  `ingest_runner` opens a processing run; an upload moves `processing → completed`
-  (or `failed`) when its import ends; a redelivered worker inspection takes over
-  at once instead of waiting for the Upload-page poll; and the worker's
-  post-connect broker retry is explicit and verified (it reconnects, it does not
-  exit).
+- **The last upload/worker commits closed the known gaps 5–8 below:** the
+  fallback `ingest_runner` opens a processing run; an upload moves
+  `processing → completed` (or `failed`) when its import ends; a redelivered
+  worker inspection takes over at once instead of waiting for the Upload-page
+  poll; and the worker's post-connect broker retry is explicit and verified (it
+  reconnects, it does not exit).
+- **A "Processing" card no longer lies.** The Upload page only polled the
+  inspection states, so a card loaded while an import ran stayed on
+  "Processing" for as long as the page was open, even after the row turned
+  `completed`. It now polls `submitted`/`processing` too and drops the card on
+  completion.
 
 ## Open items
 
@@ -82,6 +92,19 @@ user has not taken up:
 9. A CI job against `postgis/postgis:17-3.5`; `RATE_LIMIT_STORAGE` on Redis;
    metrics or a richer `/health`; the token in `localStorage` (consider an
    HttpOnly cookie); the unused `psycopg2-binary` dependency.
+
+Remaining review findings (not fixed):
+
+10. An RDS upload whose inspection could not write Parquet keeps
+    `stored_path` as `<id>.rds`; the worker converts it to `<id>.parquet`, and
+    `uploads.mark_processed()` rejects the basename mismatch, so the upload
+    stays `processing` although the import finished. Fix: compare the id stem
+    (the extension may change), with a test. Rare — the Parquet write must have
+    failed while the RDS stayed readable.
+11. If `mark_processed()` fails it only logs (`could not update the upload
+    status`) and nothing retries it. A reconciliation on `GET /ui/uploads`
+    could close a `processing` row whose job is terminal; today only a new
+    import or cleanup touches it.
 
 ## How to check work
 
