@@ -243,9 +243,18 @@ export default function Upload() {
     }
   }, [])
 
-  // Poll uploads the server is still reading until they settle.
+  // Poll uploads the server is still reading or importing until they settle.
+  // `processing` matters as much as `inspecting`: the import ends in another
+  // process, so without polling a card loaded while it ran stayed on
+  // "Processing" for as long as the page stayed open.
   const waiting = items.filter(
-    (i) => i.id && (i.status === 'received' || i.status === 'inspecting' || i.status === 'receiving'),
+    (i) =>
+      i.id &&
+      (i.status === 'received' ||
+        i.status === 'inspecting' ||
+        i.status === 'receiving' ||
+        i.status === 'submitted' ||
+        i.status === 'processing'),
   )
   const waitingIds = waiting.map((i) => i.id).join(',')
   useEffect(() => {
@@ -259,6 +268,14 @@ export default function Upload() {
               // Uploaded on this visit (it was being polled): open its mapping.
               setOpen((current) => new Set(current).add(id))
               uploadsChanged()
+            }
+            if (record.status === 'completed') {
+              // The import finished. A completed upload is not an open upload
+              // any more (`GET /ui/uploads` would not list it), so drop the
+              // card instead of leaving it on "Processing" until a reload.
+              setItems((current) => current.filter((item) => item.id !== id))
+              uploadsChanged()
+              return
             }
             setItems((current) =>
               current.map((item) =>

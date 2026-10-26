@@ -343,6 +343,26 @@ class TestLifecycle:
         listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
         assert upload_id not in listed
 
+    def test_the_ingest_completion_finishes_the_upload(self, env, monkeypatch):
+        """The wiring, not just mark_processed: a completed job must close it."""
+        from app.models.kvuno import Upload
+        from app.services import housekeeper as hk
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        # The job table is not part of this fixture; its write is not what
+        # this test is about.
+        monkeypatch.setattr(hk, 'save_progress', lambda *a, **k: None)
+        hk._write_progress(upload.stored_path, 'completed', 2, 2, 'Done')
+
+        env.session.refresh(upload)
+        assert upload.status == 'completed'
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+
     def test_a_failed_import_is_recorded_on_the_upload(self, env):
         from app.models.kvuno import Upload
 
