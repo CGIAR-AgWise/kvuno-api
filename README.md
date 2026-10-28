@@ -2,7 +2,7 @@
 
 A Flask-based REST API for agricultural planting data delivered as R data files (`.RDS`) or Parquet. Every RDS is **converted to Parquet** before it is imported, because Parquet can be read a chunk at a time and an RDS cannot. The API extracts optimal sowing dates, crops, varieties and coordinates, loads them into PostgreSQL/PostGIS, and serves them through paginated, filterable endpoints. Files are tracked by checksum, so the same file is never imported twice.
 
-Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a Green Revolution in Africa / Excellence in Agronomy).
+Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Excellence in Agronomy).
 
 ## Features
 
