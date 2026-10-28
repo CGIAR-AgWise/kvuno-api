@@ -133,3 +133,10 @@ def test_batch_convert_reports_each_file_done_or_failed(tmp_path):
     finals = [e for e in events if e[1] in ('done', 'failed')]
     assert finals[0][:2] == ('bad.RDS', 'failed') and 'not a readable R data file' in finals[0][2]
     assert finals[1] == ('good.RDS', 'done', 'Converted to good.parquet')
+
+
+def test_a_converted_file_keeps_the_rds_time(rds):
+    """A held file's time pre-fills its Data date; the Parquet must not reset it to now."""
+    os.utime(rds, (1600000000, 1600000000))
+    out = conv.convert_for_ingestion(rds)
+    assert int(os.path.getmtime(out)) == 1600000000

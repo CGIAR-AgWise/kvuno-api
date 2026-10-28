@@ -12,9 +12,9 @@ from sqlalchemy.dialects import postgresql
 from app.services import housekeeper as hk
 
 
-def _row(lon, lat, variety='v'):
-    return {'country': 'Nigeria', 'province': 'Oyo', 'lon': lon, 'lat': lat,
-            'variety': variety, 'season_type': 'long', 'opt_date': '30-Nov', 'check_sum': 'new'}
+def _row(lon, lat, variety='v', crop='maize'):
+    return {'country': 'Nigeria', 'province': 'Oyo', 'lon': lon, 'lat': lat, 'variety': variety,
+            'season_type': 'long', 'opt_date': '30-Nov', 'crop_type': crop, 'check_sum': 'new'}
 
 
 def _returned(row):
@@ -38,6 +38,12 @@ def test_a_key_twice_in_one_batch_inserts_once():
     assert hk._not_inserted(rows, [_returned(rows[0])]) == [rows[1]]
 
 
+def test_the_same_place_for_another_crop_is_not_a_conflict():
+    rows = [_row(1.1, 2.2, crop='maize'), _row(1.1, 2.2, crop='cassava')]
+    assert hk._not_inserted(rows, [_returned(r) for r in rows]) == []
+    assert hk._key(rows[0]) != hk._key(rows[1])
+
+
 def test_the_insert_returns_keys_and_compiles_once():
     sql = str(hk._insert_statement().compile(dialect=postgresql.psycopg.dialect()))
     assert 'ON CONFLICT DO NOTHING' in sql
@@ -47,9 +53,23 @@ def test_the_insert_returns_keys_and_compiles_once():
 
 
 def test_lookup_compares_coordinates_as_real_and_nulls_as_not_distinct():
-    keys = {hk._key(_row(1.1, 2.2)), ('Nigeria', None, 1.0, 2.0, 'v', 'long', '30-Nov')}
+    keys = {hk._key(_row(1.1, 2.2)), ('Nigeria', None, 1.0, 2.0, 'v', 'long', '30-Nov', 'maize')}
     sql = str(hk._existing_rows_query(keys).compile(dialect=postgresql.psycopg.dialect()))
     # A REAL column compared with float8 cannot use the index (and never matches).
     assert 'CAST(%(param_3)s AS REAL)' in sql
     assert ') IN (' in sql  # the NULL-free key goes through the indexed tuple IN
     assert 'IS NOT DISTINCT FROM' in sql  # only the key with a NULL needs this
+
+
+# ── Timestamps ───────────────────────────────────────────────────────────
+
+def test_rows_always_get_both_timestamps():
+    """model_dump() carries created_at/updated_at as None, and an explicit NULL beat the now() default."""
+    import datetime
+    from app.dto.planting_recommendation import PlantingRecommendationCreate
+
+    made = datetime.datetime(2023, 11, 14, 22, 13, 20)
+    imported = datetime.datetime(2026, 10, 25, 12, 0, 0)
+    row = hk._row_mapping(PlantingRecommendationCreate(lon=0.0, lat=0.0, check_sum='c'), made, imported)
+    assert (row['created_at'], row['updated_at']) == (made, imported)
+    assert row['coordinates'] is not None, '0,0 is a real place'

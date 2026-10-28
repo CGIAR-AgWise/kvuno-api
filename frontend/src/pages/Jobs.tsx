@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { Link } from 'react-router-dom'
-import { fetchJobProgress, startProcessing } from '../api'
+import { UPLOADS_CHANGED, deleteJobFile, fetchJobProgress, startProcessing } from '../api'
 import type { Job } from '../api'
 import { STATUSES, useJobStream } from '../hooks/useJobStream'
 import type { StatusFilter } from '../hooks/useJobStream'
+import { useAuth } from '../context/AuthContext'
 import { useToast } from '../context/ToastContext'
 import RunPanel from '../components/RunPanel'
 import StatusBadge, { TONE_BAR } from '../components/StatusBadge'
@@ -57,7 +58,8 @@ function rateInfo(job: Job): string {
 }
 
 export default function Jobs() {
-  const { jobs, connected } = useJobStream()
+  const { jobs, connected, remove } = useJobStream()
+  const { isAdmin } = useAuth()
   const toast = useToast()
   const [filter, setFilter] = useState<StatusFilter>('all')
   const [search, setSearch] = useState('')
@@ -105,6 +107,28 @@ export default function Jobs() {
       toast.push('Retry failed: ' + (err as Error).message, 'danger')
     } finally {
       setRetrying(null)
+    }
+  }
+
+  async function deleteFile(file: string, purgeRows: boolean): Promise<boolean> {
+    try {
+      const deleted = await deleteJobFile(file, purgeRows)
+      remove(file)
+      // The upload may have been one awaiting mapping; refresh the sidebar count.
+      window.dispatchEvent(new Event(UPLOADS_CHANGED))
+      if (purgeRows) {
+        const n = deleted.rows_deleted
+        toast.push(
+          `Deleted ${file} and ${n.toLocaleString()} imported row${n === 1 ? '' : 's'}.`,
+          'success',
+        )
+      } else {
+        toast.push('Deleted ' + file + '. Imported rows were kept.', 'success')
+      }
+      return true
+    } catch (err) {
+      toast.push('Could not delete ' + file + ': ' + (err as Error).message, 'danger')
+      return false
     }
   }
 
@@ -282,7 +306,12 @@ export default function Jobs() {
       </div>
 
       {liveDetail && (
-        <JobDetail job={liveDetail} onClose={() => setDetail(null)} onRetry={retry} />
+        <JobDetail
+          job={liveDetail}
+          onClose={() => setDetail(null)}
+          onRetry={retry}
+          onDelete={isAdmin ? deleteFile : undefined}
+        />
       )}
     </div>
   )
@@ -292,12 +321,17 @@ function JobDetail({
   job,
   onClose,
   onRetry,
+  onDelete,
 }: {
   job: Job
   onClose: () => void
   onRetry: (file: string) => Promise<void>
+  /** Administrators only; resolves whether the file was deleted. */
+  onDelete?: (file: string, purgeRows: boolean) => Promise<boolean>
 }) {
   const [busy, setBusy] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const [purgeRows, setPurgeRows] = useState(false)
   const [fetched, setFetched] = useState<Partial<Job> | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
   const closeRef = useRef(onClose)
@@ -400,6 +434,67 @@ function JobDetail({
               </dl>
             </div>
             <div className="modal-footer">
+              {onDelete && !confirming && shown.status !== 'processing' && shown.status !== 'converting' && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline-danger me-auto"
+                  disabled={busy}
+                  onClick={() => {
+                    setPurgeRows(false)
+                    setConfirming(true)
+                  }}
+                >
+                  <i className="bi bi-trash me-1" aria-hidden="true" />
+                  Delete file
+                </button>
+              )}
+              {onDelete && confirming && (
+                <div className="me-auto small">
+                  <div className="d-flex flex-wrap align-items-center gap-2">
+                    <span>
+                      {purgeRows
+                        ? 'Delete the file, its upload, its job history and every row it imported? This cannot be undone.'
+                        : 'Delete the file, its upload and its job history? Imported rows are kept.'}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-danger"
+                      disabled={busy}
+                      onClick={async () => {
+                        setBusy(true)
+                        // onDelete reports its own failure as a toast and resolves false.
+                        if (await onDelete(file, purgeRows)) onClose()
+                        else {
+                          setBusy(false)
+                          setConfirming(false)
+                        }
+                      }}
+                    >
+                      {purgeRows ? 'Delete and purge' : 'Delete'}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-outline-secondary"
+                      disabled={busy}
+                      onClick={() => setConfirming(false)}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <label className="form-check mt-2 mb-0">
+                    <input
+                      type="checkbox"
+                      className="form-check-input"
+                      checked={purgeRows}
+                      disabled={busy}
+                      onChange={(e) => setPurgeRows(e.target.checked)}
+                    />
+                    <span className="form-check-label">
+                      Also delete the imported data (Undo import)
+                    </span>
+                  </label>
+                </div>
+              )}
               {(shown.status === 'error' || shown.status === 'stale') && (
                 <button
                   type="button"

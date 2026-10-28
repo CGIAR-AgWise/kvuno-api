@@ -239,7 +239,7 @@ class Settings(BaseSettings):
                                        "page). Off: faster imports; clashing rows are still skipped, just not "
                                        "recorded.")
     RDS_COLUMN_MAP: Optional[str] = _f(None, 'ingest', "JSON object overriding the default source→DB column map.",
-                                       example='{"Variety": "variety"}')
+                                       example='{"Variety": "variety", "CropName": "crop_type"}')
 
     # ── Celery / Redis ─────────────────────────────────────────
     CELERY_BROKER_URL: str = _f('redis://localhost:6379/0', 'celery', "Redis URL for the Celery broker (also SSE and the cache).")
@@ -251,10 +251,14 @@ class Settings(BaseSettings):
                                         "Seconds before Redis redelivers an unacked task, even a running one: must "
                                         "exceed the longest single-file ingest.")
     CELERY_CONCURRENCY: Optional[int] = _f(
-        2, 'celery',
-        "Worker processes (worker image and `python dev_worker.py`). 2: an upload is read while another file "
-        "imports. Each RDS being read needs ~150x its size in memory.")
-    WORKER_MAX_MEMORY_PER_CHILD: int = _f(2048, 'celery', "MB; recycle a worker child past this (set above one file's peak).")
+        1, 'celery',
+        "Worker processes (worker image and `python dev_worker.py`). Each needs memory for one file: an "
+        "import ~0.3 GB, an RDS read ~150x the file's size. 2 in a 2 GB worker got processes OOM-killed "
+        "(WorkerLostError, signal 9); raise it only with the worker's memory limit.")
+    WORKER_MAX_MEMORY_PER_CHILD: int = _f(
+        512, 'celery',
+        "MB; a worker process holding more than this after a task is replaced (pandas/pyarrow keep freed "
+        "memory). Never stops a running task.")
     WORKER_MAX_TASKS_PER_CHILD: int = _f(50, 'celery', "Recycle a worker child after this many tasks.")
 
     # ── Job progress ───────────────────────────────────────────

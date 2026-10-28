@@ -15,6 +15,7 @@ Each test names the failure of the resumable.js flow it replaced:
 import datetime
 import threading
 import types
+import uuid
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -239,6 +240,19 @@ class TestInspection:
         assert service._claim_inspection(upload_id) is True
         assert service._claim_inspection(upload_id) is False  # heartbeat is fresh
 
+    def test_a_redelivered_worker_task_takes_over_at_once(self, env):
+        """Its previous process is gone; the heartbeat is not proof of life."""
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        row = env.session.get(Upload, upload_id)
+        row.status = 'inspecting'
+        row.updated_at = service._now()
+        env.session.commit()
+
+        assert service._claim_inspection(upload_id) is False  # the poll waits
+        assert service._claim_inspection(upload_id, take_over=True) is True
+
 
 class TestSubmission:
     def test_without_a_worker_the_mapping_is_kept_and_it_stays_ready(self, env):
@@ -315,6 +329,124 @@ class TestLifecycle:
         assert service.cleanup_abandoned(7 * 86400) == 1
         assert (env.tmp / 'uploads' / fresh).exists()
         assert not (env.tmp / 'uploads' / old).exists()
+
+    def test_a_finished_import_leaves_processing_and_the_open_list(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        assert service.mark_processed(upload.stored_path, 'completed')
+        env.session.refresh(upload)
+        assert upload.status == 'completed'
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+
+    def test_the_ingest_completion_finishes_the_upload(self, env, monkeypatch):
+        """The wiring, not just mark_processed: a completed job must close it."""
+        from app.models.kvuno import Upload
+        from app.services import housekeeper as hk
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        # The job table is not part of this fixture; its write is not what
+        # this test is about.
+        monkeypatch.setattr(hk, 'save_progress', lambda *a, **k: None)
+        hk._write_progress(upload.stored_path, 'completed', 2, 2, 'Done')
+
+        env.session.refresh(upload)
+        assert upload.status == 'completed'
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+
+    def test_a_finished_job_closes_a_processing_upload_on_read(self, env, monkeypatch):
+        """The ingest's own bookkeeping write is best effort; this is the net."""
+        from app.models.kvuno import Upload
+        from app.services import progress_store
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        monkeypatch.setattr(progress_store, 'get_job',
+                            lambda name: {'status': 'completed'} if name.endswith('.parquet') else None)
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id not in listed
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'completed'
+
+    def test_a_failed_job_does_not_close_the_upload(self, env, monkeypatch):
+        """An `error` job may still be retried; only `completed` is final."""
+        from app.models.kvuno import Upload
+        from app.services import progress_store
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        monkeypatch.setattr(progress_store, 'get_job', lambda name: {'status': 'error'})
+        listed = [u['id'] for u in env.client.get('/ui/uploads').get_json()['uploads']]
+        assert upload_id in listed
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'processing'
+
+    def test_a_converted_file_is_still_the_same_upload(self, env):
+        """stored_path `<id>.rds`, but the worker imported `<id>.parquet`."""
+        from app.models.kvuno import Upload
+
+        upload_id = uuid.uuid4().hex
+        env.session.add(Upload(
+            id=upload_id, original_name='trial.RDS', size=10, status='processing',
+            stored_path=str(env.tmp / 'uploads' / upload_id / f'{upload_id}.rds'),
+        ))
+        env.session.commit()
+
+        assert service.find_by_stored_name(f'{upload_id}.parquet').id == upload_id
+        assert service.mark_processed(f'{upload_id}.parquet', 'completed')
+        env.session.expire_all()
+        assert env.session.get(Upload, upload_id).status == 'completed'
+
+    def test_a_failed_import_is_recorded_on_the_upload(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'processing'
+        env.session.commit()
+
+        assert service.mark_processed(upload.stored_path, 'failed', 'bad rows')
+        env.session.refresh(upload)
+        assert (upload.status, upload.error) == ('failed', 'bad rows')
+
+    def test_an_upload_awaiting_mapping_is_not_finished(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        assert upload.status == 'ready'
+
+        assert service.mark_processed(upload.stored_path, 'completed') is False
+        env.session.refresh(upload)
+        assert upload.status == 'ready'
+
+    def test_cleanup_also_removes_a_finished_upload(self, env):
+        from app.models.kvuno import Upload
+
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        upload = env.session.get(Upload, upload_id)
+        upload.status = 'completed'
+        upload.updated_at = datetime.datetime(2000, 1, 1)
+        env.session.commit()
+
+        assert service.cleanup_abandoned(7 * 86400) == 1
+        assert not (env.tmp / 'uploads' / upload_id).exists()
 
 
 def _folder_file(env, name='field.parquet', columns=None):
@@ -481,3 +613,65 @@ class TestWorkOffTheApi:
         resp = env.client.post(f'/ui/uploads/{upload_id}/process', json={'column_map': {'lon': 'lon', 'lat': 'lat'}})
         assert resp.status_code == 503
         assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['status'] == 'ready'
+
+
+class TestFileTimes:
+    """Imported rows' created_at is the file's own time, not the upload time.
+
+    RDS and Parquet files record no creation time, so the browser's
+    File.lastModified (or a data-folder file's mtime) is the only source.
+    """
+
+    def test_client_time_is_parsed_and_only_trusted_when_plausible(self):
+        assert service.parse_client_mtime('1700000000000') == datetime.datetime(2023, 11, 14, 22, 13, 20)
+        assert service.parse_client_mtime('not a time') is None
+        assert service.parse_client_mtime(None) is None
+        assert service.parse_client_mtime('0') is None  # 1970: a clock that was never set
+        future = service.parse_client_mtime(str(10 ** 13))  # the year 2286
+        assert future <= datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+    def test_the_browsers_file_time_is_kept_as_a_suggestion(self, env):
+        import base64
+
+        data = _parquet_bytes(env.tmp)
+        meta = ','.join(f'{k} {base64.b64encode(v.encode()).decode()}'
+                        for k, v in {'filename': 'trial.parquet', 'lastModified': '1700000000000'}.items())
+        location = env.client.post('/ui/uploads/tus', headers={**TUS, 'Upload-Length': str(len(data)),
+                                                               'Upload-Metadata': meta}).headers['Location']
+        assert _patch(env.client, location, 0, data).status_code == 204
+        body = env.client.get(f"/ui/uploads/{location.rsplit('/', 1)[1]}").get_json()
+        assert (body['file_modified_at'], body['data_date']) == ('2023-11-14T22:13:20', None)
+
+    def _submit(self, env, upload_id, **extra):
+        return env.client.post(f'/ui/uploads/{upload_id}/process',
+                               json={'column_map': {'lon': 'lon', 'lat': 'lat'}, **extra})
+
+    def test_the_confirmed_data_date_is_saved_and_reused_by_retry(self, env):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        assert self._submit(env, upload_id, data_date='2024-03-01').status_code == 200
+        env.client.post('/ui/process', json={'file': f'{upload_id}.parquet'})  # Retry sends no date
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['data_date'] == '2024-03-01'
+        from app.models.kvuno import Upload
+        assert service.data_datetime(env.session.get(Upload, upload_id)) == datetime.datetime(2024, 3, 1)
+
+    @pytest.mark.parametrize('value, message', [
+        ('2999-01-01', 'future'), ('1980-01-01', 'before 1990'), ('01/03/2024', 'YYYY-MM-DD')])
+    def test_an_implausible_data_date_is_refused(self, env, value, message):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        resp = self._submit(env, upload_id, data_date=value)
+        assert resp.status_code == 400 and message in resp.get_json()['error']
+
+    def test_an_empty_data_date_means_the_import_date(self, env):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        self._submit(env, upload_id, data_date='2024-03-01')
+        env.client.post(f'/ui/uploads/{upload_id}/process', json={'data_date': ''})
+        assert env.client.get(f'/ui/uploads/{upload_id}').get_json()['data_date'] is None
+
+    def test_the_worker_gets_the_data_date(self, env, monkeypatch):
+        upload_id = _upload(env, _parquet_bytes(env.tmp))
+        sent = []
+        monkeypatch.setattr('app.services.housekeeper.celery_worker_available', lambda: True)
+        monkeypatch.setattr('app.services.housekeeper.process_file_async',
+                            lambda path, **kw: sent.append(kw) or True)
+        self._submit(env, upload_id, data_date='2024-03-01')
+        assert sent[0]['created_at'] == datetime.datetime(2024, 3, 1)

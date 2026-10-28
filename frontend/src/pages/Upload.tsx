@@ -69,7 +69,16 @@ interface Item {
   status: 'sending' | 'paused' | UploadRecord['status']
   record: UploadRecord | null
   columnMap: Record<string, string>
+  /** "Data date" (YYYY-MM-DD) sent with the mapping; '' = first import time. */
+  dataDate: string
+  /** Crop type sent with the mapping; '' = none. */
+  cropType: string
   error: string
+}
+
+/** The saved data date, else the file's last-modified date as a suggestion. */
+function suggestedDate(record: UploadRecord): string {
+  return record.data_date ?? record.file_modified_at?.slice(0, 10) ?? ''
 }
 
 function fromRecord(record: UploadRecord): Item {
@@ -84,6 +93,8 @@ function fromRecord(record: UploadRecord): Item {
     status: record.status === 'receiving' ? 'paused' : record.status,
     record,
     columnMap: { ...record.column_map },
+    dataDate: suggestedDate(record),
+    cropType: record.crop_type ?? '',
     error: record.error ?? '',
   }
 }
@@ -110,9 +121,11 @@ function statusBadge(item: Item): { label: string; tone: Tone; icon?: string } {
     case 'submitted':
       return { label: 'Submitted', tone: 'neutral', icon: 'bi-send-check' }
     case 'processing':
-      // Listed by GET /ui/uploads since processing moved into the API; without
-      // this case the badge was undefined and the page crashed on reload.
+      // Listed by GET /ui/uploads while the import runs; without this case the
+      // badge was undefined and the page crashed on reload.
       return { label: 'Processing', tone: 'info' }
+    case 'completed':
+      return { label: 'Completed', tone: 'success', icon: 'bi-check2-circle' }
   }
 }
 
@@ -183,6 +196,7 @@ export default function Upload() {
   })
   const [dbColumns, setDbColumns] = useState<ColumnOption[]>([SKIP])
   const [maxSize, setMaxSize] = useState<number | null>(null)
+  const [knownCrops, setKnownCrops] = useState<string[]>([])
   const [items, setItems] = useState<Item[]>([])
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -208,9 +222,10 @@ export default function Upload() {
   useEffect(() => {
     const controller = new AbortController()
     fetchDBColumns(controller.signal)
-      .then(({ columns, max_file_size }) => {
+      .then(({ columns, max_file_size, crop_types }) => {
         setDbColumns([SKIP, ...columns.map((c) => ({ value: c, label: c }))])
         setMaxSize(max_file_size)
+        setKnownCrops(crop_types ?? [])
       })
       .catch(() => undefined)
     fetchUploads(controller.signal)
@@ -233,9 +248,18 @@ export default function Upload() {
     }
   }, [])
 
-  // Poll uploads the server is still reading until they settle.
+  // Poll uploads the server is still reading or importing until they settle.
+  // `processing` matters as much as `inspecting`: the import ends in another
+  // process, so without polling a card loaded while it ran stayed on
+  // "Processing" for as long as the page stayed open.
   const waiting = items.filter(
-    (i) => i.id && (i.status === 'received' || i.status === 'inspecting' || i.status === 'receiving'),
+    (i) =>
+      i.id &&
+      (i.status === 'received' ||
+        i.status === 'inspecting' ||
+        i.status === 'receiving' ||
+        i.status === 'submitted' ||
+        i.status === 'processing'),
   )
   const waitingIds = waiting.map((i) => i.id).join(',')
   useEffect(() => {
@@ -250,6 +274,14 @@ export default function Upload() {
               setOpen((current) => new Set(current).add(id))
               uploadsChanged()
             }
+            if (record.status === 'completed') {
+              // The import finished. A completed upload is not an open upload
+              // any more (`GET /ui/uploads` would not list it), so drop the
+              // card instead of leaving it on "Processing" until a reload.
+              setItems((current) => current.filter((item) => item.id !== id))
+              uploadsChanged()
+              return
+            }
             setItems((current) =>
               current.map((item) =>
                 item.id === id
@@ -263,6 +295,7 @@ export default function Upload() {
                         record.status === 'ready' && item.record?.status !== 'ready'
                           ? { ...record.column_map }
                           : item.columnMap,
+                      dataDate: item.dataDate || suggestedDate(record),
                     }
                   : item,
               ),
@@ -298,7 +331,13 @@ export default function Upload() {
       endpoint: TUS_ENDPOINT,
       chunkSize: CHUNK_SIZE,
       retryDelays: RETRY_DELAYS,
-      metadata: { filename: file.name, filetype: file.type || 'application/octet-stream' },
+      // lastModified becomes the imported rows' created_at: when the data was
+      // made, not when it was uploaded (RDS and Parquet carry no such time).
+      metadata: {
+        filename: file.name,
+        filetype: file.type || 'application/octet-stream',
+        lastModified: String(file.lastModified),
+      },
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       onProgress: (sent) => patch(key, { sent }),
       onError: (err) => {
@@ -333,6 +372,8 @@ export default function Upload() {
           status: 'sending',
           record: null,
           columnMap: {},
+          dataDate: '',
+          cropType: '',
           error: '',
         },
       ]
@@ -397,7 +438,7 @@ export default function Upload() {
     const problems: string[] = []
     for (const item of queue) {
       try {
-        const result = await processUpload(item.id as string, item.columnMap)
+        const result = await processUpload(item.id as string, item.columnMap, item.dataDate, item.cropType)
         if (result.queued) {
           queued += 1
           setItems((current) => current.filter((i) => i.key !== item.key))
@@ -422,6 +463,12 @@ export default function Upload() {
 
   return (
     <div className="pb-3">
+      {/* Suggestions for every card's Crop type field: crops chosen before. */}
+      <datalist id="known-crops">
+        {knownCrops.map((crop) => (
+          <option key={crop} value={crop} />
+        ))}
+      </datalist>
       <div
         className={'kvuno-card p-5 text-center mb-3' + (dragging ? ' border-primary' : '')}
         style={{ borderStyle: 'dashed', cursor: 'pointer' }}
@@ -575,6 +622,52 @@ export default function Upload() {
                   </div>
                 )}
                 {item.error && <p className="small text-warning mb-2">{item.error}</p>}
+                <div className="row g-2 align-items-center mb-3">
+                  <label className="col-auto col-form-label col-form-label-sm" htmlFor={'date-' + item.key}>
+                    Data date
+                  </label>
+                  <div className="col-auto">
+                    <input
+                      id={'date-' + item.key}
+                      type="date"
+                      className="form-control form-control-sm"
+                      value={item.dataDate}
+                      min="1990-01-01"
+                      max={new Date().toISOString().slice(0, 10)}
+                      onChange={(e) => patch(item.key, { dataDate: e.target.value })}
+                    />
+                  </div>
+                  <div className="col-12 small text-muted">
+                    When this data was produced; every imported row gets it as its created date.
+                    {record.file_modified_at && !record.data_date
+                      ? " Suggested from the file's last-modified date — check it, since editing or copying a file changes that."
+                      : ''}{' '}
+                    Leave it empty to use the import date.
+                  </div>
+                </div>
+                <div className="row g-2 align-items-center mb-3">
+                  <label className="col-auto col-form-label col-form-label-sm" htmlFor={'crop-' + item.key}>
+                    Crop type
+                  </label>
+                  <div className="col-auto">
+                    <input
+                      id={'crop-' + item.key}
+                      type="text"
+                      className="form-control form-control-sm"
+                      list="known-crops"
+                      maxLength={30}
+                      placeholder="e.g. maize"
+                      value={item.cropType}
+                      onChange={(e) => patch(item.key, { cropType: e.target.value })}
+                    />
+                  </div>
+                  <div className="col-12 small text-muted">
+                    {Object.values(item.columnMap).includes('crop_type')
+                      ? 'A file column is mapped to crop_type; rows where it is empty get this crop.'
+                      : 'The crop this file is about; every imported row gets it.'}{' '}
+                    Stored in lower case. Leave it empty if the file covers no single crop.
+                  </div>
+                </div>
                 <p className="small text-muted mb-2">
                   {record.columns.length} columns
                   {record.total_rows !== null ? ', ' + record.total_rows.toLocaleString() + ' rows' : ''}.

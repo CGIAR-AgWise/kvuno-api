@@ -12,15 +12,15 @@ information).
 
 | Goal | Frequency | Current UX |
 |------|-----------|------------|
-| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page (`/upload`) with tus (`frontend/src/lib/tus.ts`) drag-drop, resume, and column mapping |
+| Upload RDS/Parquet files | Daily/weekly | ✅ Upload page (`/upload`) with tus (`frontend/src/lib/tus.ts`) drag-drop, resume, column mapping, Data date and Crop type |
 | Preview data before ingestion | Every upload | ✅ Columns + sample rows + duplicate check from background inspection (`GET /ui/uploads/<id>`) |
 | Monitor processing status | Per upload | ✅ Jobs page (`/jobs`) with live SSE updates |
 | Explore / query ingested data | Daily | ✅ `/explore` — filters, map, paged table |
-| Filter by country, variety, date | Daily | ✅ `<select>` dropdowns populated from `/planting-data/filters` |
+| Filter by crop, country, variety, date | Daily | ✅ `<select>` dropdowns (Crop, Country, Province, Variety, Season) populated from `/planting-data/filters` |
 | View data on a map | Weekly | ✅ Leaflet + markercluster + optional heat layer |
 | Export data for offline analysis | Weekly | ✅ Server-streamed CSV / JSON from `/planting-data/export` |
 | Understand data quality | Weekly | ✅ Quality dashboard (`/quality`) with conflicts, duplicates, coverage stats |
-| Test API queries interactively | Monthly | ⚠️ Swagger at `/api-docs`, but no live query builder |
+| Test API queries interactively | Monthly | ⚠️ Swagger at `/api-docs` (every filter plus `page`/`per_page` on paginated endpoints), but no live query builder |
 
 ---
 
@@ -92,6 +92,7 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 - SSE live-updating table with status, progress bar, timestamps
 - Status filter tabs (All / Completed / Processing / Failed) and filename search
 - Per-job detail modal with a Retry action, wired to `POST /ui/process` with only the file name, so the server re-uses the mapping saved with the upload (it used to send `{}` and wipe it). The modal reads `/ui/progress/<file_name>`, which returns the job record from `app/services/progress_store.py` (Redis hot path, Postgres durable record) — it used to read a `.progress.json` file nothing wrote, so it always showed `unknown` and hid Retry
+- Administrators get **Delete file** in the modal (not while the job is processing or converting): a second, inline confirmation, then `DELETE /ui/jobs/<file>` removes the file, its upload and its job history. The confirmation says imported rows are kept, and offers an **Also delete the imported data (Undo import)** checkbox that sends `{"purge_rows": true}` to remove them and the checksum record too — irreversible, so it is never the default
 - The modal is a real dialog: `role="dialog"`, focus moves into it and back on close, Escape closes it
 - Rows open their detail from the keyboard (focusable, Enter/Space), and progress bars carry an accessible label and value
 - Highlight scroll from upload redirect
@@ -105,7 +106,7 @@ Explore empty. Explore's sortable headers are keyboard-operable and expose
 **What exists:**
 - Summary stat cards (total records, conflicts, files, spatial coverage %)
 - Paginated conflicts table with country/source/search filters
-- Duplicates viewer: conflicts grouped by country/province/variety/season/date on the server (`GET /api/v1/quality/duplicates`), one page at a time
+- Duplicates viewer: conflicts grouped by country/province/variety/season/date/crop on the server (`GET /api/v1/quality/duplicates`), one page at a time
 - Source breakdown with bar visualization
 - Spatial coverage heatmap on the explore page
 
@@ -143,7 +144,7 @@ Rationale:
 - Server-side `LIMIT/OFFSET` is already indexed and fast, so infinite scroll would add client-side row-accumulation state for no query-plan gain.
 - Keeping each page fetch a single request keeps the render path trivial — the table body is one state update per page.
 
-Defaults: `perPage=200`, hard-capped at 500 server-side by `_clamp_per_page()` (`app/api/planting_data.py:70-74`).
+Defaults: `perPage=200`, hard-capped at 500 server-side by `get_pagination()` (`app/dto/pagination.py`).
 
 ---
 
@@ -184,17 +185,18 @@ Client-side (React, served by nginx — no Flask route):
   /admin/users             → account approval (RequireAdmin; others → /jobs)
 
 Flask (JSON, reverse-proxied by nginx):
-GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_file_size
+GET    /ui/columns                 → JSON: mappable DB columns, aliases, max_file_size, crop_types (suggestions)
 GET    /ui/jobs/data               → JSON: job list
 GET    /ui/jobs/runs               → JSON: recent processing runs
 GET    /ui/jobs/events             → SSE: live updates (Redis pub/sub, 3s poll fallback)
+DELETE /ui/jobs/<file>             → admin only: delete the file, its upload and its job history (imported rows kept unless body `{purge_rows: true}`; 409 while processing)
 POST   /ui/uploads/tus             → tus create (size/type checked before any bytes; 413/415)
 HEAD   /ui/uploads/tus/<id>        → tus Upload-Offset, for resuming
 PATCH  /ui/uploads/tus/<id>        → tus append at offset (409 mismatch, 423 busy)
 GET    /ui/uploads                 → JSON: the caller's unfinished uploads + data-folder files held for mapping
 GET    /ui/uploads/awaiting        → JSON: {count} of those waiting for a mapping (sidebar badge)
 GET    /ui/uploads/<id>            → JSON: status, preview, duplicate, suggested mapping
-POST   /ui/uploads/<id>/process    → validate + save mapping, process it in the API (`processing`)
+POST   /ui/uploads/<id>/process    → validate + save column_map, data_date, crop_type; import on the worker (else an ingest_runner process) (`processing`)
 DELETE /ui/uploads/<id>            → discard an upload not yet submitted or processing (409 otherwise; a data-folder file is admin-only, 403)
 POST   /ui/process                 → re-process a stored file (Jobs Retry; re-uses the saved mapping)
 GET    /ui/progress/<file>         → JSON: one job record from progress_store (or status "unknown")
@@ -213,15 +215,16 @@ POST   /api/v1/admin/users/<id>/reject    → pending → rejected, tokens revok
 POST   /api/v1/admin/users/<id>/disable   → approved → disabled, tokens revoked (admin)
 POST   /api/v1/admin/users/<id>/role      → {role: user|admin}, approved accounts only (admin)
 
-GET  /api/v1/planting-data             → JSON: filtered data (public, rate-limited)
-GET  /api/v1/planting-data/filters     → JSON: distinct filter values (per-column paged)
+GET  /api/v1/planting-data             → JSON: filtered data incl. crop_type (public, rate-limited)
+GET  /api/v1/planting-data/filters     → JSON: distinct country/province/variety/season_type/crop_type values (per-column paged)
 GET  /api/v1/planting-data/coordinates → JSON: lat/lon points for the map (paged)
 GET  /api/v1/planting-data/clusters    → JSON: server-side spatial clusters (paged)
 GET  /api/v1/planting-data/export      → CSV / JSON stream of one page of results
 
 POST /api/v1/data/upload               → upload a single RDS/Parquet file
 GET  /api/v1/quality/stats             → JSON: summary statistics (auth required)
-GET  /api/v1/quality/conflicts         → JSON: paginated conflict list (auth required)
+GET  /api/v1/quality/conflicts         → JSON: paginated conflict list, filter country/crop_type/source/search (auth required)
+GET  /api/v1/quality/duplicates        → JSON: conflicts grouped by key incl. crop_type, paged by group (auth required)
 ```
 
 Every Flask `/ui/*` endpoint requires a session (`@require_auth`); they redirect browsers to the SPA login route (`SPA_LOGIN_PATH`, default `/login`) and return `401` JSON to API clients. The React routes are guarded client-side by `AuthContext` (a single provider). A `401` from **any** API call dispatches `kvuno:unauthorized` (`frontend/src/api.ts`); `AuthContext` drops the token and `RequireAuth` sends the user to `/login?next=<page>`, instead of leaving a signed-in shell whose every request fails. Logout always clears local state, even if the server call fails. The token cookie is `Secure` on HTTPS.
@@ -233,10 +236,12 @@ defaults to `1`, `per_page` to `100`, clamped to `MAX_PER_PAGE` (500). Values ar
 clamped rather than rejected, and `page` is floored at `1` so a malformed
 parameter cannot produce a negative SQL offset. All of it funnels through
 `get_pagination()` in `app/dto/pagination.py`, so the default and the ceiling
-exist in exactly one place.
+exist in exactly one place. `PaginationQuery` in the same file puts `page` and
+`per_page` in the OpenAPI spec, so Swagger UI can page every collection endpoint;
+it only documents them, and the clamping stays in `get_pagination()`.
 
 Responses carry `total` / `pages` / `current_page` / `per_page` next to their
-rows. `/planting-data/filters` is the exception: it returns a dict of four
+rows. `/planting-data/filters` is the exception: it returns a dict of five
 independent lists, so `page` slices each column on its own and `totals` / `pages`
 are reported per column. `/quality/stats` returns aggregates rather than a record
 list and so has no pagination.

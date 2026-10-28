@@ -6,7 +6,7 @@ from flask import abort, redirect, jsonify, request, Response, stream_with_conte
 
 from pathlib import Path
 
-from app.auth import require_auth
+from app.auth import require_admin, require_auth
 from app.config import ALLOWED_EXTENSIONS, APP_NAME, get_settings
 from app.models.database_conn import MyDb
 from app.routes.uploads import enqueue_upload, register_upload_routes
@@ -20,6 +20,41 @@ logger = get_logger(__name__)
 def _load_jobs():
     from app.services.progress_store import load_all_jobs
     return load_all_jobs()
+
+
+def _deep_health() -> dict:
+    """Diagnostics for ?deep=1: the things behind "uploads do nothing".
+
+    Kept off the default response because a probe hits /health often and this
+    asks Redis/Celery. Never raises: a broken dependency is the answer, not a
+    500 from the health endpoint.
+    """
+    from app.config import celery_broker_available
+
+    settings = get_settings()
+    info = {'housekeeping': settings.HOUSEKEEPING_ENABLED}
+    if settings.HOUSEKEEPING_ENABLED:
+        try:
+            info['redis'] = 'UP' if celery_broker_available() else 'DOWN'
+        except Exception:
+            info['redis'] = 'DOWN'
+        try:
+            from app.services import housekeeper
+            info['worker'] = 'UP' if housekeeper.celery_worker_available() else 'DOWN'
+        except Exception:
+            info['worker'] = 'DOWN'
+    else:
+        # Not used, so not a problem (a DOWN here would look like an outage).
+        info['redis'] = info['worker'] = 'DISABLED'
+
+    root = upload_service.upload_root()
+    if not os.path.isdir(root):
+        info['data_dir'] = 'MISSING'
+    elif not os.access(root, os.W_OK):
+        info['data_dir'] = 'READONLY'
+    else:
+        info['data_dir'] = 'UP'
+    return info
 
 
 def _format_jobs(raw):
@@ -90,6 +125,13 @@ def register_app_routes(app):
             "version": get_settings().app_version,
             "database": "UP" if db_connected else "DOWN",
         }
+        # Additive and opt-in: probes keep the cheap database-only answer.
+        if request.args.get('deep', '').lower() in ('1', 'true', 'yes'):
+            health_status.update(_deep_health())
+            broken = [v for k, v in health_status.items()
+                      if k in ('redis', 'worker', 'data_dir') and v not in ('UP', 'DISABLED')]
+            if db_connected and broken:
+                health_status['status'] = 'degraded'
         return jsonify(health_status), 200 if db_connected else 500
 
     @app.route('/ui/columns', methods=['GET'])
@@ -98,7 +140,8 @@ def register_app_routes(app):
         # max_file_size lets the SPA refuse an oversized file before sending a
         # byte, from the server's own limit rather than a hardcoded copy of it.
         return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES,
-                       max_file_size=get_settings().max_file_size)
+                       max_file_size=get_settings().max_file_size,
+                       crop_types=upload_service.known_crop_types())
 
     register_upload_routes(app)
 
@@ -173,6 +216,24 @@ def register_app_routes(app):
         if job is None:
             return jsonify(status='unknown', current=0, total=0, message='')
         return jsonify(job)
+
+    @app.route('/ui/jobs/<file_name>', methods=['DELETE'])
+    @require_admin
+    def ui_delete_file(file_name):
+        """Administrators: delete a file with its upload and its jobs (services/file_deletion.py).
+
+        Imported rows and the file's checksum record are kept unless the body
+        asks `{"purge_rows": true}` ("Undo import"), which also deletes them.
+        """
+        from app.api.user import get_current_user
+        from app.services.file_deletion import delete_file
+        body = request.get_json(silent=True) or {}
+        try:
+            result = delete_file(file_name, getattr(get_current_user(), 'id', None),
+                                 purge_rows=bool(body.get('purge_rows')))
+        except UploadError as e:
+            return jsonify(error=str(e)), e.status
+        return jsonify(result)
 
     @app.route('/ui/jobs/data', methods=['GET'])
     @require_auth

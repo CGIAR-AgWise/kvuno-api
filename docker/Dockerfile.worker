@@ -40,6 +40,6 @@ ENTRYPOINT ["/app/docker/entrypoint.worker.sh"]
 
 # Shell form to read LOG_LEVEL (the one level for every process) and
 # CELERY_CONCURRENCY. `exec` keeps celery as PID 1's direct child so signals
-# (SIGTERM on stop) still reach it. Two processes by default, so an upload is
-# read while another file imports instead of waiting behind it.
-CMD ["sh", "-c", "exec celery -A app.celery_app worker --loglevel=\"${LOG_LEVEL:-INFO}\" --concurrency=\"${CELERY_CONCURRENCY:-2}\""]
+# (SIGTERM on stop) still reach it. One process by default: two in a 2 GB
+# worker got processes OOM-killed mid-import; raise both together.
+CMD ["sh", "-c", "exec celery -A app.celery_app worker --loglevel=\"${LOG_LEVEL:-INFO}\" --concurrency=\"${CELERY_CONCURRENCY:-1}\""]

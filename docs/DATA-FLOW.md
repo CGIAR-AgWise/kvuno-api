@@ -103,10 +103,10 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 5. **Checksum calculation** — Each file is hashed with SHA-256 (`app/utils/__init__.py::calculate_file_checksum`)
 6. **Deduplication / resume** — `FileImportRepo.get_by_checksum()` checks `file_imports`. A row with `offset IS NULL` is fully imported: the file is skipped and a `completed` progress entry ("Already ingested") is written so a submitted duplicate still shows up on the Jobs page. A non-null `offset` resumes mid-file; an `offset` at or past the row count (left by files completed before the offset was cleared on success) is treated as processed and normalised to `NULL`. `INGEST_DUPLICATE_CHECK=false` imports a completed file again from row 0 (a partial one still resumes; rows already stored are still skipped by the unique constraint) and the Upload page stops flagging duplicates
 7. **File parsing** — `.parquet` is **streamed**: `_iter_parquet_chunks()` reads record batches from a `pyarrow.parquet.ParquetFile` starting at the resume offset, so the whole file is never in memory. `.RDS` is read with `pyreadr.read_r()`, which has no chunked mode and deserialises the **whole** file before it is sliced — which is why SPA uploads are converted to Parquet during inspection. Either way rows are processed in chunks of `HOUSEKEEPING_CHUNK_SIZE` (default 5000), which sizes the insert batches rather than bounding memory
-8. **Column mapping** — Rows without coordinates are dropped. A file submitted from the Upload page carries the user's `column_map` (passed to `process_file(column_map=...)`), which is used **as is** — not merged over the defaults, so a skipped column stays skipped. Any other file resolves its columns through `load_column_map()`: built-in defaults, overridden by `RDS_COLUMN_MAP` JSON, overridden by a per-file `.map.json` sidecar — and that map is then **intersected with the file's actual columns** (`_select_columns()`; missing ones are logged and skipped), because asking pyarrow for an absent column fails the whole read. `XY` is read only if the file has it. The aliases (`cultivar`→`variety`, `season`→`season_type`, `sowing_date`/`planting_date`/`date`→`opt_date`, `longitude`/`long`/`lon_x`→`lon`, `latitude`/`lat_y`→`lat`) live in `COLUMN_ALIASES` (`app/services/uploads.py`) and only seed the suggested mapping during upload inspection. The file checksum is attached to every row
+8. **Column mapping** — Rows without coordinates are dropped. A file submitted from the Upload page carries the user's `column_map` (passed to `process_file(column_map=...)`), which is used **as is** — not merged over the defaults, so a skipped column stays skipped. Any other file resolves its columns through `load_column_map()`: built-in defaults, overridden by `RDS_COLUMN_MAP` JSON, overridden by a per-file `.map.json` sidecar — and that map is then **intersected with the file's actual columns** (`_select_columns()`; missing ones are logged and skipped), because asking pyarrow for an absent column fails the whole read. `XY` is read only if the file has it. The aliases (`cultivar`→`variety`, `season`→`season_type`, `sowing_date`/`planting_date`/`date`→`opt_date`, `longitude`/`long`/`lon_x`→`lon`, `latitude`/`lat_y`→`lat`, `crop`/`croptype`→`crop_type`) live in `COLUMN_ALIASES` (`app/services/uploads.py`) and only seed the suggested mapping during upload inspection. The file checksum is attached to every row. **Crop type**: a mapped `crop_type` column's value is normalised to lower case (`app/utils/crop_type.py::normalise`, which never raises, so one odd cell cannot fail a batch); a row whose cell is empty, or a file with no such column, gets `process_file(crop_type=...)` — the crop chosen on the mapping form — or stays NULL
 9. **Batch insert** — Records are bulk-inserted, each batch wrapped in `begin_nested()` (savepoint) and retried with backoff. `coordinates` is built as `POINT(lon lat)` WKT, SRID 4326, whenever `lat` and `lon` are not `None` — `0` is a valid coordinate (a truthiness check used to null it and fail the whole batch). A batch that still fails is skipped and counted — unless the failure is a **transient** database error (`is_transient_db_error()`: lost connection, pool timeout, …), which aborts the file instead, since skipping would move the offset past rows that were never written
 10. **Checkpointing** — Every `HOUSEKEEPING_CHECKPOINT_INTERVAL` batches (default 50) the inserted rows **and** the new `offset` (`upsert_offset(commit=False)`) are committed in **one** transaction. Committing rows first left a window where a crash kept rows past the stored offset, which a resume re-inserted. Don't split them
-11. **Conflict capture** — Each batch is one `INSERT … ON CONFLICT DO NOTHING RETURNING <key columns>` executed as executemany (compiled once). The rows not RETURNed are the duplicates (a multiset, so a key twice in a batch counts once as inserted); only those are looked up, through the unique index (`tuple IN`, coordinates cast to `REAL`, `IS NOT DISTINCT FROM` only for keys with a NULL), and bulk-inserted into `import_conflicts` with the checksum of the row they clash with. ⚠️ Until this change the batch tested `rowcount`, which is -1 under psycopg 3: every batch ran the lookup as a full table scan (a 2M-row file took ~45 min, now ~2.5 min on a local PostGIS) and, running after the insert, logged every inserted row as a conflict. `lon`/`lat` are `REAL`, so keys are compared at float4 precision (`_as_real`). Conflicts logged by the fixed code have `source='ingest'`; the old false entries (`source='housekeeper'`, clashing with their own file) are removed with `python scripts/cleanup_conflicts.py` (report) / `--apply` (delete). Duplicates against the `uq_planting_recommendation` unique constraint are recorded in `import_conflicts` (country/province/lon/lat/variety/season_type/opt_date). The constraint is `NULLS NOT DISTINCT` on PostgreSQL ≥ 15 (migration `f3a9c2d4e5b6`), so a row with a NULL key column now conflicts instead of being re-inserted on every replay, and the conflict lookup matches with `IS NOT DISTINCT FROM`. `INGEST_CONFLICT_LOGGING=false` skips the recording (one extra query per batch that had duplicates); duplicates are still not inserted, and the Quality page says logging is off
+11. **Conflict capture** — Each batch is one `INSERT … ON CONFLICT DO NOTHING RETURNING <key columns>` executed as executemany (compiled once). The rows not RETURNed are the duplicates (a multiset, so a key twice in a batch counts once as inserted); only those are looked up, through the unique index (`tuple IN`, coordinates cast to `REAL`, `IS NOT DISTINCT FROM` only for keys with a NULL), and bulk-inserted into `import_conflicts` with the checksum of the row they clash with. ⚠️ Until this change the batch tested `rowcount`, which is -1 under psycopg 3: every batch ran the lookup as a full table scan (a 2M-row file took ~45 min, now ~2.5 min on a local PostGIS) and, running after the insert, logged every inserted row as a conflict. `lon`/`lat` are `REAL`, so keys are compared at float4 precision (`_as_real`). Conflicts logged by the fixed code have `source='ingest'`; the old false entries (`source='housekeeper'`, clashing with their own file) are removed with `python scripts/cleanup_conflicts.py` (report) / `--apply` (delete). Duplicates against the `uq_planting_recommendation` unique constraint are recorded in `import_conflicts` (country/province/lon/lat/variety/season_type/opt_date/crop_type). The constraint is `NULLS NOT DISTINCT` on PostgreSQL ≥ 15 (migration `f3a9c2d4e5b6`), so a row with a NULL key column now conflicts instead of being re-inserted on every replay, and the conflict lookup matches with `IS NOT DISTINCT FROM`. `INGEST_CONFLICT_LOGGING=false` skips the recording (one extra query per batch that had duplicates); duplicates are still not inserted, and the Quality page says logging is off
 12. **File tracking** — A `FileImport` record (file name, checksum, `original_filename`, `offset`) is saved. On completion `offset` is stored as `NULL`, which is what every "already processed" check tests for (it used to store the row count, so no finished file was ever recognised and re-uploads were reported as partial). A partially processed file keeps its numeric offset. Completion with skipped batches is reported as `completed` with an error note ("Done with errors")
 13. **Graceful shutdown / failure** — Ingestion stops only at a **chunk boundary**: the chunk's rows and the offset after it are committed together, so a resume never re-inserts rows. In the CLI (`python housekeeping.py`), SIGTERM/SIGINT request it and a second signal force-quits; the handlers are installed by `install_signal_handlers()` from `housekeeper.run()` only — they used to be installed at import, which replaced gunicorn's and Celery's own SIGTERM handling. On the Celery worker, `worker_shutting_down` drops a stop file the pool child checks; the job is left `processing` ("Paused for a worker restart") and on the next start `worker_ready` re-enqueues every job that host left unfinished, in its own run, after `worker_init` has cleared that host's dead ingest locks. On an exception the session is rolled back and the error is reported at the last checkpoint row (where a retry will resume). A transient DB error is **re-raised**, so the Celery task's `autoretry_for` retries it from the stored offset; any other error (a bad file) is recorded as `error` and the task returns, so it is **not** retried
 14. **Progress** — `save_progress()` in `app/services/progress_store.py` writes the `job:{stem}` hash to Redis and publishes on the `jobs:updates` channel, which `/ui/jobs/events` streams to browsers (the hot path, throttled by `JOB_PROGRESS_MIN_INTERVAL`). It also checkpoints the job to the `processing_jobs` table (grouped under a `processing_runs` row) every `JOB_DB_CHECKPOINT_SECONDS` (default 5s) whether or not Redis is up; terminal states always write through to both. Database progress writes use their **own short-lived `Session`** (`_db_session()`), never the scoped session holding the uncommitted ingest batch, so a progress write can no longer commit ingest rows ahead of their offset. `attempts` counts on from the file's history for each new run and increments when a run's job comes back to `processing` (a retry). Timestamps are stored naive UTC and converted with `_epoch()`, which treats them as UTC — `datetime.timestamp()` assumed local time and made jobs look stale (or fresh) on non-UTC hosts. On completion the worker also calls `invalidate_planting_data_cache()`, so new rows appear in the cached map/filter endpoints immediately
@@ -132,9 +132,9 @@ RDS/Parquet files containing crop planting data are either uploaded through the 
 
 | Table | Action | Key columns |
 |---|---|---|
-| `planting_recommendations` | INSERT (bulk) | `check_sum`, `country`, `province`, `coordinates` (POINT), `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option` |
+| `planting_recommendations` | INSERT (bulk) | `check_sum`, `country`, `province`, `coordinates` (POINT), `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option`, `crop_type`, `created_at`, `updated_at` |
 | `file_imports` | UPSERT | `check_sum` (unique), `file_name`, `original_filename`, `offset`, `processed_at` |
-| `import_conflicts` | INSERT | `record_data` (JSON), `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `check_sum`, `source` |
+| `import_conflicts` | INSERT | `record_data` (JSON), `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `crop_type`, `check_sum`, `source` |
 | `processing_runs` | INSERT (one per enqueued submission/Retry, one per scan) | `id`, `label`, `source`, `status`, `total_files`, `started_at`, `finished_at` |
 | `processing_jobs` | INSERT / UPDATE (checkpointed, always on terminal states) | `run_id` → `processing_runs.id`, `file_name` (not unique), `status`, `current_row`, `total_rows`, `error`, `attempts`, `updated_at` |
 
@@ -156,8 +156,10 @@ The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.
                                            start inspection thread
  GET   /ui/uploads/<id>  (poll) ───────▶ `inspecting` → `ready` | `failed`
                                            restarts a dead inspection
- POST  /ui/uploads/<id>/process ───────▶ validate + save column_map, `processing`
-                                           ──▶ API thread: process_file(column_map=…)
+ POST  /ui/uploads/<id>/process ───────▶ validate + save column_map, data_date,
+   column_map, data_date, crop_type        crop_type; `processing`
+                                           ──▶ Celery worker, else ingest_runner ──▶ process_file(column_map=…,
+                                               process                                created_at=…, crop_type=…)
 ```
 
 ### Lifecycle
@@ -168,9 +170,9 @@ The Upload page sends files with the in-house tus client (`frontend/src/lib/tus.
 2. **Receive** — `PATCH` appends at `Upload-Offset` into `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The part file's size *is* the offset, so an API restart loses nothing and `HEAD` tells the client where to resume. An offset mismatch is `409`; a second request while another holds the per-upload `.lock` file (O_EXCL, taken over after 30s without a write) is `423`, which the client retries
 3. **Received** — after the last byte the part file is renamed to `<id>.rds` / `<id>.parquet` and inspection starts
 4. **Inspect** — on a daemon thread in the API process, so it works with `HOUSEKEEPING_ENABLED=false`: `convert_for_ingestion()` (RDS → Parquet in a **child process**: reading an RDS is the expensive step — a 7.4 MB file of 2.1 M rows peaks at ~1.1 GB — so if it runs out of memory only the child is killed and the upload fails with "needs more memory than the server allows" instead of the API worker dying and the inspection restarting forever; an unreadable file fails with "not a readable R data file"; only a failed Parquet *write* keeps the RDS), preview rows, row count, SHA-256, duplicate lookup against `file_imports` (`processed` or `partial`), and a suggested `column_map` (exact DB column name, case-insensitive, then `COLUMN_ALIASES`). The claim is a conditional `UPDATE`, so two pollers never run it twice. A heartbeat refreshes `updated_at` every 30s; a row still `inspecting` without one after `UPLOAD_INSPECT_STALE_SECONDS` (default 180) — its gunicorn worker was recycled — is re-claimed by the next `GET /ui/uploads/<id>`
-5. **Map** — the SPA shows the server's suggestion, so what is in the selects is exactly what will be sent; choosing *skip* removes the key. Validation on submit: `lat` and `lon` must be mapped, no DB column used twice, every source must exist in the file, every target must be a `planting_recommendations` column
-6. **Process** — `POST /ui/uploads/<id>/process` validates and saves the mapping, sets the upload to `processing` and starts `process_file(column_map=…)` on a daemon thread in the API process — no Celery or Redis, whatever `HOUSEKEEPING_ENABLED` says. Progress goes to `progress_store` like any other ingest. A thread dies with its gunicorn worker; the file's stored offset is kept, and Retry resumes from it
-7. **Retry** — the Jobs page calls `POST /ui/process` with only the file name; for an upload the server re-uses the saved `column_map` (it used to send `{}` and wipe it). Files with no `uploads` row fall back to the sidecar path, resolved with `Path.is_relative_to` against the data dir
+5. **Map** — the SPA shows the server's suggestion, so what is in the selects is exactly what will be sent; choosing *skip* removes the key. Validation on submit: `lat` and `lon` must be mapped, no DB column used twice, every source must exist in the file, every target must be a `planting_recommendations` column. The same form sets the **Data date** (`data_date`, `YYYY-MM-DD`, 1990..today; rows' `created_at`) and the **Crop type** (`crop_type`, ≤ 30 characters of letters, digits, spaces and `-_()'`, stored lower-case; `400` otherwise), both saved on the `uploads` row. Omitting either keeps the saved value; `""` clears it
+6. **Process** — `POST /ui/uploads/<id>/process` validates and saves them, sets the upload to `processing` and starts `process_file(column_map=…, created_at=…, crop_type=…)` — on the Celery worker when one consumes the queue (`created_at`/`crop_type` travel as task kwargs), otherwise in a detached `python -m app.services.ingest_runner <id>` process. Never on a gunicorn thread: gunicorn recycles its workers every `MAX_REQUESTS`, which used to kill long imports. Progress goes to `progress_store` like any other ingest
+7. **Retry** — the Jobs page calls `POST /ui/process` with only the file name; for an upload the server re-uses the saved `column_map`, data date and crop type (it used to send `{}` and wipe the mapping). Files with no `uploads` row fall back to the sidecar path, resolved with `Path.is_relative_to` against the data dir
 
 Uploads are per user (`owner_id`); anyone else's id is reported as `404`. `GET /ui/uploads` lists the caller's unfinished uploads so a page reload does not lose files waiting to be mapped, and `DELETE /ui/uploads/<id>` discards one that is not yet `submitted` or `processing` (`409` otherwise). The tus `HEAD`/`PATCH` and the status `GET` are exempt from the default rate limit.
 
@@ -208,7 +210,8 @@ Clients retrieve planting data via `GET /api/v1/planting-data/`, which applies f
                     ▼                                  ▼                              ▼
           ┌─────────────────┐                ┌─────────────────┐          ┌─────────────────────┐
           │  Spatial filter  │                │  Field filters   │          │  Pagination          │
-          │  ST_DWithin      │                │  country         │          │  query.paginate()    │
+          │  ST_DWithin      │                │  crop_type       │          │  query.paginate()    │
+          │                  │                │  country         │          │                      │
           │  (coordinates +  │                │  province (ILIKE)│          │  page, per_page      │
           │   radius meters) │                │  variety         │          └──────────┬──────────┘
           └─────────────────┘                │  season_type     │                     │
@@ -228,16 +231,17 @@ Clients retrieve planting data via `GET /api/v1/planting-data/`, which applies f
 
 ### Step-by-step
 
-1. **HTTP request** — `GET /api/v1/planting-data/?country=Zambia&variety=Soybean&page=1&per_page=20` (`app/api/planting_data.py::get_data`)
-2. **Parameter extraction** — `page` and `per_page` from `request.args` via `get_pagination()` (`app/dto/pagination.py`; defaults 1 and `DEFAULT_PER_PAGE` = 100; `per_page` is clamped to `[1, MAX_PER_PAGE]` = `[1, 500]`). All filter params are injected as a `PlantingDataFilter` Pydantic model (`app/dto/data_filters.py`)
+1. **HTTP request** — `GET /api/v1/planting-data/?crop_type=maize&country=Kenya&page=1&per_page=20` (`app/api/planting_data.py::get_data`)
+2. **Parameter extraction** — `page` and `per_page` from `request.args` via `get_pagination()` (`app/dto/pagination.py`; defaults 1 and `DEFAULT_PER_PAGE` = 100; `per_page` is clamped to `[1, MAX_PER_PAGE]` = `[1, 500]`). All filter params are injected as a `PlantingDataFilter` Pydantic model (`app/dto/data_filters.py`), which extends `PaginationQuery` so `page`/`per_page` are documented in the OpenAPI spec as well (unbounded there: clamping stays in `get_pagination()`)
 3. **Validation** — Pydantic validators check:
    - `coordinates`: must match `lon,lat` format; lat in [-90, 90], lon in [-180, 180]
-   - `opt_date`: must be `YYYY-MM-DD`
+   - `opt_date`: `30-Nov`, `--11-30` or a full date whose year is ignored, converted to the stored day-month form
+   - `crop_type`: lower-cased and whitespace-collapsed, so `Maize` matches `maize`
    - `sort_col` / `sort_dir`: allow-listed scalar columns (`PLANTING_SORT_COLUMNS` / `CONFLICT_SORT_COLUMNS` in `app/dto/data_filters.py`) and `asc`/`desc`; anything else is a `422` (flask-openapi3's validation status). It used to reach `getattr(Model, sort_col)` unchecked and 500 on names like `metadata`
    - Whitespace is stripped; enum values resolved
 4. **Query building** — `PlantingRecommendationRepo.get_filtered_data()` (`app/repo/planting_recommendation.py`) constructs a SQLAlchemy query with optional filters:
    - **Spatial**: If `coordinates` + `radius` provided, uses `ST_DWithin(coordinates::geography, point::geography, radius)`, so `radius` is in **metres**. Without the cast, `ST_DWithin` on SRID 4326 geometries measured in degrees and `radius=50000` matched the whole planet
-   - **Exact match**: `country`, `variety`, `season_type`, `opt_date`, `planting_option`
+   - **Exact match**: `crop_type`, `country`, `variety`, `season_type`, `opt_date`, `planting_option`
    - **Partial/ILIKE**: `province` uses `ILIKE '%search%'`
    - **Sort**: `sort_col` / `sort_dir` (defaults to `id` ascending)
 5. **Pagination** — `query.paginate(page, per_page)` returns a `QueryPagination` object with items, total count, and page metadata
@@ -253,15 +257,20 @@ Other serving details: `/clusters` pages by cluster — `pages` is computed from
   "data": [
     {
       "id": 1,
-      "country": "Zambia",
-      "province": "Southern",
-      "lat": -17.85,
-      "lon": 25.92,
-      "variety": "Soybean",
-      "season_type": "Main",
-      "opt_date": "2024-11-15",
+      "country": "Kenya",
+      "province": "Nairobi",
+      "lat": -1.29,
+      "lon": 36.82,
+      "variety": "H614",
+      "season_type": "Average",
+      "opt_date": "30-Nov",
+      "opt_month_day": "--11-30",
       "planting_option": 1,
-      "check_sum": "abc123..."
+      "crop_type": "maize",
+      "check_sum": "abc123...",
+      "coordinates": { "type": "Point", "coordinates": [36.82, -1.29] },
+      "created_at": "2024-03-01T00:00:00Z",
+      "updated_at": "2026-10-28T10:15:00Z"
     }
   ],
   "total": 42,
@@ -292,12 +301,15 @@ All tables are defined in `app/models/kvuno.py` and created by Alembic migration
 | `season_type` | VARCHAR(20) | Season classification |
 | `opt_date` | VARCHAR(8) | Optimal sowing date |
 | `planting_option` | INTEGER | Planting option ID |
-| `created_at` | DATETIME | Auto-set on insert |
-| `updated_at` | DATETIME | Auto-set on update |
+| `crop_type` | VARCHAR(30) | Crop, lower-case (`maize`). From a file column mapped to `crop_type` (aliases `crop`, `croptype`), else the **Crop type** chosen on the mapping form (`uploads.crop_type`); NULL for rows imported before migration `f4b6d8a0c2e3` and for scanned files without a `crop_type`/`Crop` column (the default map reads either) |
+| `created_at` | DATETIME | When the data was produced: the upload's confirmed **Data date** (midnight UTC), else the file's first import time (`file_imports.processed_at`). Set by the ingest, not the column default |
+| `updated_at` | DATETIME | When the row was imported. Set by the ingest |
 
-Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date)` — this is what drives conflict detection. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
+Rows imported before the timestamp fix have NULL in both (the ingest sent explicit NULLs, which override the `now()` defaults).
 
-Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_province`, `idx_lon`, `idx_lat`, `idx_variety`, `idx_season_type`, `idx_opt_date`, `idx_planting_option`, plus a second GiST index `idx_planting_recommendations_coordinates`.
+Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date, crop_type)` — this is what drives conflict detection. `crop_type` joined it in migration `f4b6d8a0c2e3` (Postgres only; rebuilding it on a large table takes a while and blocks writes meanwhile), so the same place, variety, season and date for two crops are two rows; existing rows all have NULL there and collide with each other as before. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
+
+Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_crop_type`, `idx_province`, `idx_lon`, `idx_lat`, `idx_variety`, `idx_season_type`, `idx_opt_date`, `idx_planting_option`, plus a second GiST index `idx_planting_recommendations_coordinates`.
 
 ### `file_imports`
 
@@ -320,7 +332,12 @@ One row per SPA upload, from the first byte to submission (migration `2026102212
 | `owner_id` | BIGINT FK → `users.id` (SET NULL) | Uploader; other users get `404` |
 | `original_name` | VARCHAR(255) NOT NULL | User-facing file name |
 | `size` | BIGINT NOT NULL | tus `Upload-Length`, checked against `MAX_FILE_SIZE` |
-| `status` | VARCHAR(20) NOT NULL | `receiving` / `received` / `inspecting` / `ready` / `failed` / `submitted` / `processing` |
+| `status` | VARCHAR(20) NOT NULL | `receiving` / `received` / `inspecting` / `ready` / `failed` / `submitted` / `processing` / `completed` |
+| `source` | VARCHAR(20) NOT NULL | `upload` (Upload page) or `folder` (a data-folder file held for mapping; no owner, visible to every signed-in user) |
+| `file_modified_at` | DATETIME | The file's own last-modified time (browser `File.lastModified` or a held file's mtime); only pre-fills `data_date` |
+| `data_date` | DATE | When the data was produced, confirmed on the mapping form; imported rows' `created_at` |
+| `crop_type` | VARCHAR(30) | Crop chosen on the mapping form, lower-case; rows take it where no mapped `crop_type` column gives one |
+| `progress` | JSON | While inspecting: `{stage, done, total, elapsed}` |
 | `stored_path` | VARCHAR(512) | File the worker reads (`.parquet` after conversion) |
 | `sha256` | VARCHAR(64) | Checksum of the stored file |
 | `preview` | JSON | Columns, sample rows, `total_rows` |
@@ -338,9 +355,9 @@ Indexes: `ix_uploads_owner_id`, `ix_uploads_status`.
 |---|---|---|
 | `id` | BIGINT PK | Auto-increment ID |
 | `record_data` | JSON NOT NULL | Full rejected row |
-| `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date` | matching types | Denormalized for conflict filtering |
-| `check_sum` | VARCHAR(100) | Source file checksum |
-| `source` | VARCHAR(50) | Originating filename |
+| `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `crop_type` | matching types | The skipped row's unique key, denormalized for filtering and the Duplicates grouping |
+| `check_sum` | VARCHAR(100) | Checksum of the file the existing row came from |
+| `source` | VARCHAR(50) | `ingest` (current code) or `housekeeper` (the old, mostly false entries `scripts/cleanup_conflicts.py` removes) |
 | `created_at` | DATETIME | Auto-set on insert |
 
 Index: `idx_conflict_created_at`.

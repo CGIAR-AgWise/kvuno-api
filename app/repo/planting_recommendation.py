@@ -102,6 +102,8 @@ class PlantingRecommendationRepo:
             query = query.filter(PlantingRecommendation.variety == filters.variety)
         if filters.season_type:
             query = query.filter(PlantingRecommendation.season_type == filters.season_type)
+        if filters.crop_type:
+            query = query.filter(PlantingRecommendation.crop_type == filters.crop_type)
         if filters.opt_date:
             query = query.filter(PlantingRecommendation.opt_date == filters.opt_date)
         if filters.planting_option is not None:

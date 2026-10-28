@@ -12,7 +12,7 @@ from sqlalchemy import text
 from app.config import API_PREFIX, API_VERSION, admin_emails, get_settings
 from app.dto.auth import RegisterRequest, RegisterResponse, LoginRequest, LoginResponse, CreateTokenRequest
 from app.dto.auth import password_too_long
-from app.dto.pagination import get_pagination
+from app.dto.pagination import PaginationQuery, get_pagination
 from app.models.database_conn import MyDb
 from app.models.kvuno import User, UserToken
 from app.rate_limit import limiter
@@ -313,7 +313,8 @@ class TokenListResponse(BaseModel):
          summary="List active tokens for the current user",
          description="Return non-expired tokens belonging to the authenticated user, paginated server-side. Defaults to 100 per page, capped at 500.",
          security=[{"jwt": []}])
-def list_tokens():
+def list_tokens(query: PaginationQuery):
+    # `query` documents page/per_page in the spec; get_pagination() reads them.
     user = get_current_user()
     if not user:
         return {"msg": "authentication required"}, 401
