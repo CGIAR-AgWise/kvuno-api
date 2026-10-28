@@ -1,6 +1,6 @@
 # Development
 
-IITA Internal Use. Overview, quick start and the other guides: [README.md](../README.md).
+Overview, quick start and the other guides: [README.md](../README.md).
 
 Working on the code: where things are, how the processes check their dependencies, the frontend, and running without PostgreSQL or Redis.
 

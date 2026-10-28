@@ -1,6 +1,6 @@
 # Configuration
 
-IITA Internal Use. Overview, quick start and the other guides: [README.md](../README.md).
+Overview, quick start and the other guides: [README.md](../README.md).
 
 
 

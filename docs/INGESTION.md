@@ -1,6 +1,6 @@
 # Ingesting Files
 
-IITA Internal Use. Overview, quick start and the other guides: [README.md](../README.md).
+Overview, quick start and the other guides: [README.md](../README.md).
 
 How RDS and Parquet files reach the database: uploads, the data folder, the Celery worker, the housekeeping CLI and the maintenance scripts. [DATA-FLOW.md](DATA-FLOW.md) goes step by step through the pipeline.
 

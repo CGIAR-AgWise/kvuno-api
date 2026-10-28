@@ -1,6 +1,6 @@
 # API
 
-IITA Internal Use. Overview, quick start and the other guides: [README.md](../README.md).
+Overview, quick start and the other guides: [README.md](../README.md).
 
 Authentication, accounts, every endpoint, pagination and the planting-data query. The live spec is at `/api-docs/swagger` (Swagger UI) and `/api-docs/openapi.json`.
 

@@ -1,6 +1,6 @@
 # Docker
 
-IITA Internal Use. Overview, quick start and the other guides: [README.md](../README.md).
+Overview, quick start and the other guides: [README.md](../README.md).
 
 Running the stack with Docker Compose, the published images, and the shared builder base. [DEPLOYMENT.md](DEPLOYMENT.md) has the full deployment guide.
 
