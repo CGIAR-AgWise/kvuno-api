@@ -11,7 +11,8 @@ Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a 
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
 - **Background Processing** — SPA uploads and a data-folder scan are processed on background threads in the API (no Redis needed); a Celery + Redis worker is optional and separately deployable
 - **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
-- **Paginated & Filterable Queries** — Filter by coordinates + radius, country, province, variety, season type, optimal date, planting option
+- **Crop Types** — Every row records its crop (`crop_type`), from a mapped file column or the crop chosen when the file was mapped; the same place, variety, season and date for two crops are two rows
+- **Paginated & Filterable Queries** — Filter by coordinates + radius, crop type, country, province, variety, season type, optimal date, planting option; `page`/`per_page` are documented on every paginated endpoint in Swagger UI
 - **Spatial Data Support** — PostGIS `POINT` geometry (SRID 4326) with `ST_DWithin` radius filtering in metres (geography cast)
 - **Database** — PostgreSQL/PostGIS. SQLite can run the migrations and serve the API for UI work, but ingestion (Postgres `ON CONFLICT`) and the spatial queries need Postgres
 - **Health Check** — `GET /health` returns app name, build version, and database status; `?deep=1` also reports Redis, Celery-worker and data-directory state (status `degraded`, still 200, when one is down)
@@ -371,8 +372,8 @@ receiving → received → inspecting → ready | failed → submitted → proce
 
 1. **Receive** — bytes land in `HOUSEKEEPING_DATA_DIR/uploads/<id>/data.part`. The size cap (`MAX_FILE_SIZE_MB`) and extension are checked at creation, before any bytes arrive
 2. **Inspect** — RDS → Parquet conversion, preview rows, SHA-256, duplicate lookup against `file_imports`, and a suggested column mapping. On the **Celery worker** when one consumes the `kvuno` queue (the page shows "Waiting for the worker" until it starts); otherwise on a background thread in the API
-3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once. The **Data date** (when the data was produced) becomes every imported row's `created_at`; it is pre-filled from the file's last-modified date, which editing or copying a file changes, so it is there to be checked. Left empty, rows take the date the file was first imported (RDS and Parquet files record no creation date of their own)
-4. **Process** — `POST /ui/uploads/<id>/process` saves the mapping, sets the upload to `processing` and imports it with that mapping as-is (not merged over `RDS_COLUMN_MAP`): on the **Celery worker** when there is one, otherwise in a separate `ingest_runner` process the API starts. Never inside a gunicorn worker — gunicorn recycles those every `MAX_REQUESTS` requests, which used to kill long imports over and over. Progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
+3. **Map** — the page shows the server's suggested mapping, which is exactly what will be sent. `lat` and `lon` must be mapped, and each database column at most once. The **Data date** (when the data was produced) becomes every imported row's `created_at`; it is pre-filled from the file's last-modified date, which editing or copying a file changes, so it is there to be checked. Left empty, rows take the date the file was first imported (RDS and Parquet files record no creation date of their own). The **Crop type** (e.g. `maize`, suggestions from earlier uploads) is stored in lower case on every imported row; if a file column is mapped to `crop_type` (a column named `crop` is mapped automatically), its values win and only its empty cells take the chosen crop. Leave it empty for a file that covers no single crop
+4. **Process** — `POST /ui/uploads/<id>/process` (`{"column_map": {...}, "data_date": "2024-03-01", "crop_type": "maize"}`; omit a field to keep its saved value, `""` to clear it) saves the mapping, sets the upload to `processing` and imports it with that mapping as-is (not merged over `RDS_COLUMN_MAP`): on the **Celery worker** when there is one, otherwise in a separate `ingest_runner` process the API starts. Never inside a gunicorn worker — gunicorn recycles those every `MAX_REQUESTS` requests, which used to kill long imports over and over. Progress shows on the Jobs page. A submitted or processing upload can no longer be discarded (`409`)
 
 In production run the worker as a Celery worker (`HOUSEKEEPING_MODE` unset), so the API never reads or imports files itself.
 
@@ -507,11 +508,11 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `PATCH` | `/ui/uploads/tus/<id>` | Required | tus append at `Upload-Offset` (`409` offset mismatch, `423` another request holds the upload) |
 | `GET` | `/ui/uploads` | Required | The caller's unfinished uploads (survives a page reload) |
 | `GET` | `/ui/uploads/<id>` | Required | Upload status, preview, duplicate info, suggested mapping |
-| `POST` | `/ui/uploads/<id>/process` | Required | Validate + save the column mapping, then process it in the API (`processing`) |
+| `POST` | `/ui/uploads/<id>/process` | Required | Validate + save the column mapping, data date and crop type (`column_map`, `data_date`, `crop_type`), then start the import (`processing`) on the worker, or in an `ingest_runner` process without one |
 | `DELETE` | `/ui/uploads/<id>` | Required | Discard an upload that is not yet submitted or processing (`409` otherwise) |
 | `POST` | `/ui/process` | Required | (Re)process a stored file — Jobs page Retry; omit `column_map` to re-use the saved one |
 | `GET` | `/ui/progress/<file_name>` | Required | One job's progress record (same shape as a `/ui/jobs/data` item), or `status: unknown` |
-| `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, and `max_file_size` |
+| `GET` | `/ui/columns` | Required | Mappable DB columns, aliases, `max_file_size`, and `crop_types` (crops chosen on earlier uploads, as suggestions) |
 | `POST` | `/api/v1/users/register` | — | Register a new account — `201` with `status: pending` (or `approved` for an `ADMIN_EMAILS` address); `400` invalid email, `409` taken |
 | `POST` | `/api/v1/users/login` | — | Authenticate and get a token (`401` wrong credentials, `403` + `status` when the account is pending/rejected/disabled) |
 | `GET` | `/api/v1/users/me` | Required | The signed-in account: `id`, `username`, `email`, `status`, `role`, `is_admin` |
@@ -525,14 +526,14 @@ Error responses never carry exception text: a failing endpoint returns a generic
 | `GET` | `/api/v1/users/tokens` | Required | List active tokens (paginated) |
 | `DELETE` | `/api/v1/users/tokens/<id>` | Required | Revoke a specific token |
 | `POST` | `/api/v1/data/upload` | Required | Upload RDS/Parquet files (queued for the worker when `HOUSEKEEPING_ENABLED=true`) |
-| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data. Each record has `coordinates` as a GeoJSON Point, `opt_date` as in the source (`30-Nov`, no year) plus `opt_month_day` (`--11-30`), and ISO 8601 UTC `created_at`/`updated_at` |
-| `GET` | `/api/v1/planting-data/filters` | Required | Distinct filter values (paginated per column) |
+| `GET` | `/api/v1/planting-data/` | **Public** | Paginated, filterable crop data. Each record has `coordinates` as a GeoJSON Point, `opt_date` as in the source (`30-Nov`, no year) plus `opt_month_day` (`--11-30`), `crop_type` (lower-case, `null` for rows imported before crop types were recorded), and ISO 8601 UTC `created_at`/`updated_at` |
+| `GET` | `/api/v1/planting-data/filters` | Required | Distinct `country`, `province`, `variety`, `season_type` and `crop_type` values (paginated per column) |
 | `GET` | `/api/v1/planting-data/coordinates` | Required | Map coordinates (paginated) |
 | `GET` | `/api/v1/planting-data/clusters` | Required | Spatial clusters (paginated by cluster: `pages` from `total_clusters`; bad `zoom`/bounds → `400`) |
-| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated; `0` values are kept) |
+| `GET` | `/api/v1/planting-data/export` | Required | Export data (CSV/JSON, paginated; `0` values are kept). Columns: `country, province, lon, lat, variety, season_type, opt_date, planting_option, crop_type` — `crop_type` last, so existing column positions are unchanged |
 | `GET` | `/api/v1/quality/stats` | Required | Quality statistics |
-| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated) |
-| `GET` | `/api/v1/quality/duplicates` | Required | Conflicts grouped by country/province/variety/season/date, most repeated first, with counts per source (paginated by group) |
+| `GET` | `/api/v1/quality/conflicts` | Required | Import conflicts (paginated; filters `country`, `crop_type`, `source`, `search`) |
+| `GET` | `/api/v1/quality/duplicates` | Required | Conflicts grouped by country/province/variety/season/date/crop, most repeated first, with counts per source (paginated by group; same filters as `/conflicts`) |
 
 ### Pagination
 
@@ -545,6 +546,11 @@ Responses carry `total`, `pages`, `current_page`, and `per_page` alongside their
 rows. `page` is 1-based. `/planting-data/filters` is the one exception to a
 single row axis: its columns are paginated independently, and `totals` / `pages`
 are reported per column so a client can tell when each is exhausted.
+
+`page` and `per_page` appear as query parameters on every paginated endpoint in
+the OpenAPI spec and Swagger UI (`/api-docs/swagger`), from the shared
+`PaginationQuery` model. Out-of-range or unparsable values are still clamped or
+defaulted, never rejected.
 
 `/quality/stats` returns aggregates rather than a record list, so it has no
 pagination; `register`, `login`, `logout`, `upload`, and token creation return
@@ -560,13 +566,20 @@ single objects.
 | `per_page` | int | Items per page (default: 100, max 500) |
 | `coordinates` | string | Center point for radius search (`lon,lat`) |
 | `radius` | float | Search radius in metres (requires `coordinates`; measured on the geography, not in degrees) |
-| `country` | string | Country name (partial ILIKE match) |
+| `crop_type` | string | Crop, exact match, case-insensitive (`Maize` finds `maize`) |
+| `country` | string | Country name, exact match |
 | `province` | string | Province name (partial ILIKE match) |
 | `variety` | string | Crop variety exact match |
 | `season_type` | string | Season type exact match |
-| `opt_date` | string | Optimal sowing date (`YYYY-MM-DD`) |
-| `planting_option` | string | Planting option exact match |
-| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI. `sort_col` must be one of `id`, `check_sum`, `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option`, `created_at`, `updated_at`; `sort_dir` `asc`/`desc`. Anything else is `422` |
+| `opt_date` | string | Optimal sowing day, which has no year: `30-Nov`, ISO month-day `--11-30`, or a full date such as `2026-11-30` whose year is ignored |
+| `planting_option` | int | Planting option exact match |
+| `sort_col` / `sort_dir` | string | Server-side sorting used by the explore UI. `sort_col` must be one of `id`, `check_sum`, `country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`, `planting_option`, `crop_type`, `created_at`, `updated_at`; `sort_dir` `asc`/`desc`. Anything else is `422` |
+
+Example:
+
+```bash
+curl "http://localhost:5000/api/v1/planting-data/?crop_type=maize&country=Kenya&page=1&per_page=10"
+```
 
 ### Response Format
 
@@ -575,16 +588,20 @@ single objects.
   "data": [
     {
       "id": 1,
-      "lat": -17.85,
-      "lon": 25.92,
-      "country": "Zambia",
-      "province": "Southern",
-      "variety": "Soybean",
-      "season_type": "Main",
-      "opt_date": "2024-11-15",
+      "lat": -1.29,
+      "lon": 36.82,
+      "country": "Kenya",
+      "province": "Nairobi",
+      "variety": "H614",
+      "season_type": "Average",
+      "opt_date": "30-Nov",
+      "opt_month_day": "--11-30",
       "planting_option": 1,
+      "crop_type": "maize",
       "check_sum": "a1b2c3d4e5f6...",
-      "coordinates": "POINT(25.92 -17.85)"
+      "coordinates": { "type": "Point", "coordinates": [36.82, -1.29] },
+      "created_at": "2024-03-01T00:00:00Z",
+      "updated_at": "2026-10-28T10:15:00Z"
     }
   ],
   "total": 42,
@@ -593,6 +610,10 @@ single objects.
   "per_page": 10
 }
 ```
+
+`coordinates` is a GeoJSON Point, `[lon, lat]`. `created_at` is the data date
+confirmed when the file was mapped (else its first import time); `updated_at`
+is when the row was imported.
 
 ## Configuration
 

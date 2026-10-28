@@ -239,7 +239,7 @@ class Settings(BaseSettings):
                                        "page). Off: faster imports; clashing rows are still skipped, just not "
                                        "recorded.")
     RDS_COLUMN_MAP: Optional[str] = _f(None, 'ingest', "JSON object overriding the default source→DB column map.",
-                                       example='{"Variety": "variety"}')
+                                       example='{"Variety": "variety", "CropName": "crop_type"}')
 
     # ── Celery / Redis ─────────────────────────────────────────
     CELERY_BROKER_URL: str = _f('redis://localhost:6379/0', 'celery', "Redis URL for the Celery broker (also SSE and the cache).")

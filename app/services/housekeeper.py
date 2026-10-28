@@ -255,6 +255,10 @@ def load_column_map(file_path: str | None = None) -> dict[str, str]:
         'Season_type': 'season_type',
         'Opt_date': 'opt_date',
         'Planting_Option': 'planting_option',
+        # Folder files have no mapping form, so a crop column is their only
+        # way to a crop type. Only columns the file has are read.
+        'crop_type': 'crop_type',
+        'Crop': 'crop_type',
     }
     raw = get_settings().RDS_COLUMN_MAP
     if raw:
