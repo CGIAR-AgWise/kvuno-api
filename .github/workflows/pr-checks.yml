@@ -112,7 +112,7 @@ jobs:
       - name: Run tests
         run: poetry run pytest -q --tb=short
 
-      # .env.example and the README configuration table are generated from
+      # .env.example and the docs/CONFIGURATION.md tables are generated from
       # app/config.py; a setting changed there without regenerating fails here.
       - name: Check generated configuration docs
         run: poetry run python scripts/gen_config_docs.py --check

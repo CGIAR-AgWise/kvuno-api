@@ -69,7 +69,7 @@ The compose file reads these variables from the host environment (or `.env` file
 
 `DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation too. `FLASK_DEBUG` only affects `python run.py` (`api-dev`); the production `api` runs gunicorn.
 
-Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the README's Configuration tables are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
+Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the tables in [CONFIGURATION.md](CONFIGURATION.md) are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
 
 ### Env loading per service
 

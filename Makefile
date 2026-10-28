@@ -48,10 +48,10 @@ test: ## pytest (unit only: no DB, Redis or server needed)
 audit: ## pip-audit --strict (security-gated deps)
 	$(POETRY) run pip-audit --strict
 
-config-docs: ## Regenerate .env.example + README config table from app/config.py
+config-docs: ## Regenerate .env.example + docs/CONFIGURATION.md tables from app/config.py
 	$(PY) scripts/gen_config_docs.py
 
-config-check: ## Fail if .env.example / README config table are out of date
+config-check: ## Fail if .env.example / docs/CONFIGURATION.md tables are out of date
 	$(PY) scripts/gen_config_docs.py --check
 
 check: lint config-check test build-web ## Everything CI checks: lint, config docs, tests, SPA build
