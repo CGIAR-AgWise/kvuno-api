@@ -137,7 +137,8 @@ def enqueue_upload(upload):
     if celery_worker_available():
         if process_file_async(upload.stored_path, column_map=upload.column_map,
                               original_filename=upload.original_name,
-                              created_at=service.data_datetime(upload)):
+                              created_at=service.data_datetime(upload),
+                              crop_type=upload.crop_type):
             logger.info("upload queued for the worker", upload_id=upload.id)
             return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
                            message='Queued for the worker', queued=True)
@@ -241,7 +242,7 @@ def register_upload_routes(app):
         body = request.get_json(silent=True) or {}
         try:
             upload = service.get_owned(upload_id, _owner_id())
-            service.submit(upload, body.get('column_map'), body.get('data_date'))
+            service.submit(upload, body.get('column_map'), body.get('data_date'), body.get('crop_type'))
         except UploadError as e:
             return jsonify(error=str(e)), e.status
         return enqueue_upload(upload)

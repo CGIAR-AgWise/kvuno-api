@@ -10,7 +10,7 @@ _settings = get_settings()
                  default_retry_delay=_settings.CELERY_TASK_RETRY_DELAY, autoretry_for=(Exception,))
 def process_file_task(self, file_path: str, column_map: dict | None = None,
                       original_filename: str | None = None, run_id: int | None = None,
-                      created_at: str | None = None):
+                      created_at: str | None = None, crop_type: str | None = None):
     # run_id is optional so tasks queued by an older API (without it) still run.
     # process_file only raises for transient DB errors — a bad file is recorded
     # as an error and returns — so autoretry_for retries exactly those, and the
@@ -30,7 +30,8 @@ def process_file_task(self, file_path: str, column_map: dict | None = None,
         process_file(file_path, column_map=column_map, original_filename=original_filename,
                      run_id=run_id, **housekeeping_settings(),
                      # The upload's confirmed data date (ISO, as sent across the broker).
-                     created_at=datetime.datetime.fromisoformat(created_at) if created_at else None)
+                     created_at=datetime.datetime.fromisoformat(created_at) if created_at else None,
+                     crop_type=crop_type)
 
 
 def _convert(rds_path: str) -> str | None:

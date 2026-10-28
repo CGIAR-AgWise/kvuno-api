@@ -10,7 +10,7 @@ from app.auth import require_auth
 from app.cache import api_cache
 from app.config import API_PREFIX, API_VERSION, get_settings
 from app.dto.data_filters import PlantingDataFilter
-from app.dto.pagination import get_pagination
+from app.dto.pagination import PaginationQuery, get_pagination
 from app.dto.planting_recommendation import PlantingRecommendationRecord, PlantingRecommendationResponse, Unauthorized
 from app.rate_limit import limiter
 from app.repo.planting_recommendation import PlantingRecommendationRepo
@@ -45,7 +45,9 @@ logger = get_logger(__name__)
 
 repo = PlantingRecommendationRepo()
 
-EXPORT_COLUMNS = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date', 'planting_option']
+# crop_type last: existing readers of the CSV address columns by position.
+EXPORT_COLUMNS = ['country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date', 'planting_option',
+                  'crop_type']
 
 
 class CoordinatesResponse(BaseModel):
@@ -94,6 +96,7 @@ class FiltersResponse(BaseModel):
     province: list[str] = Field(default=[], description="Distinct province values")
     variety: list[str] = Field(default=[], description="Distinct variety values")
     season_type: list[str] = Field(default=[], description="Distinct season_type values")
+    crop_type: list[str] = Field(default=[], description="Distinct crop_type values")
     totals: dict[str, int] = Field(default={}, description="Distinct value count per column")
     pages: dict[str, int] = Field(default={}, description="Total pages per column")
     current_page: int = Field(1, description="Current page number")
@@ -116,7 +119,7 @@ def _data_limit() -> str:
 @public_api.get('',
          responses={200: PlantingRecommendationResponse, 401: Unauthorized},
          summary="Query planting recommendation data",
-         description="Return paginated planting recommendation records with optional filters (country, province, variety, season_type, date range, coordinates). Defaults to 100 records per page, capped at 500.",
+         description="Return paginated planting recommendation records with optional filters (country, province, crop_type, variety, season_type, date range, coordinates). Defaults to 100 records per page, capped at 500.",
          security=[])
 @limiter.limit(_data_limit)
 def get_data(query: PlantingDataFilter):
@@ -136,6 +139,7 @@ def get_data(query: PlantingDataFilter):
             opt_date=item.opt_date,
             opt_month_day=month_day(item.opt_date),
             planting_option=item.planting_option,
+            crop_type=item.crop_type,
             check_sum=item.check_sum,
             # GeoJSON Point; str() of the geometry was hex EWKB.
             coordinates=point_geojson(item.coordinates),
@@ -156,17 +160,18 @@ def get_data(query: PlantingDataFilter):
         return {'error': 'Failed to retrieve planting data'}, 500
 
 
-FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type']
+FILTER_COLUMNS = ['country', 'province', 'variety', 'season_type', 'crop_type']
 
 
 @protected_api.get('/filters',
          responses={200: FiltersResponse, 401: Unauthorized},
          summary="Get distinct filter values",
-         description="Return distinct values for country, province, variety, and season_type columns for use in filter dropdowns. Each column is paginated independently; `totals` reports the distinct count per column so a client can keep paging until it has them all.")
+         description="Return distinct values for country, province, variety, season_type and crop_type columns for use in filter dropdowns. Each column is paginated independently; `totals` reports the distinct count per column so a client can keep paging until it has them all.")
 @require_auth
 @limiter.limit(_data_limit)
 @api_cache('filters', ttl=300)
-def get_filter_options():
+def get_filter_options(query: PaginationQuery):
+    # `query` documents page/per_page in the spec; get_pagination() reads them.
     pagination = get_pagination()
     try:
         values = repo.get_distinct_values(

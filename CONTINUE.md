@@ -37,9 +37,16 @@ rewrite it once those items are done.
 - **Migrations since the last release**, all applied by the API container on
   start: `b7d3f1a9c2e4` (uploads.source), `c4e8a2d6f1b3` (uploads.progress),
   `d9f1b3c5e7a2` (drop the duplicate GiST index), `e2a4c6b8d0f1`
-  (uploads.file_modified_at and data_date). Head is `e2a4c6b8d0f1`.
+  (uploads.file_modified_at and data_date). Then `f4b6d8a0c2e3` (crop_type), which is head.
 
 ## What changed recently, and why (one line each; details in AGENTS.md)
+
+- **Crop type** (2026-10-28): `planting_recommendations.crop_type`, part of the
+  unique key, set from a mapped column or the mapping form's Crop type; Explore
+  filters by it. Migration `f4b6d8a0c2e3` (now head) rebuilds the unique
+  constraint, which takes a while on production's table and blocks writes
+  meanwhile; deploy when no import is running. Existing rows stay NULL; a
+  backfill (e.g. by `check_sum` per known file) is the user's call.
 
 - **Ingest was slow and logged false conflicts.** psycopg 3 returns `rowcount = -1`,
   so every batch ran a full-table lookup and logged every inserted row as a

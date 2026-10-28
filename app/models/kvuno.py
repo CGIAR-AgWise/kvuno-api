@@ -136,6 +136,9 @@ class Upload(Base):
     # Imported rows get it as created_at; without it, the file's first import
     # time is used (RDS and Parquet record no such date themselves).
     data_date: Mapped[Optional[datetime.date]] = mapped_column(Date)
+    # The crop the file is about, chosen when it was mapped (lower-case).
+    # Rows take it unless a file column is mapped to crop_type and has a value.
+    crop_type: Mapped[Optional[str]] = mapped_column(String(30))
     # The file the worker will read. Differs from the received file after an
     # RDS is converted to Parquet during inspection.
     stored_path: Mapped[Optional[str]] = mapped_column(String(512))
@@ -188,6 +191,7 @@ class ImportConflict(Base):
     variety: Mapped[Optional[str]] = mapped_column(String(20))
     season_type: Mapped[Optional[str]] = mapped_column(String(20))
     opt_date: Mapped[Optional[str]] = mapped_column(String(8))
+    crop_type: Mapped[Optional[str]] = mapped_column(String(30))
     check_sum: Mapped[Optional[str]] = mapped_column(String(100))
     source: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=text('now()'))
@@ -201,11 +205,14 @@ class PlantingRecommendation(Base):
         # default NULLS DISTINCT a row with any NULL key never conflicted, so
         # ON CONFLICT DO NOTHING re-inserted it on every replay. Declared here
         # too so autogenerate does not try to revert migration f3a9c2d4e5b6.
+        # crop_type is part of the key (migration f4b6d8a0c2e3): the same
+        # place, variety, season and date for two crops is two rows.
         UniqueConstraint('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date',
-                         name='uq_planting_recommendation', postgresql_nulls_not_distinct=True),
+                         'crop_type', name='uq_planting_recommendation', postgresql_nulls_not_distinct=True),
         Index('idx_check_sum', 'check_sum'),
         Index('idx_coordinates', 'coordinates', postgresql_using='gist'),
         Index('idx_country', 'country'),
+        Index('idx_crop_type', 'crop_type'),
         Index('idx_lat', 'lat'),
         Index('idx_lon', 'lon'),
         Index('idx_opt_date', 'opt_date'),
@@ -226,6 +233,9 @@ class PlantingRecommendation(Base):
     season_type: Mapped[Optional[str]] = mapped_column(String(20))
     opt_date: Mapped[Optional[str]] = mapped_column(String(8))
     planting_option: Mapped[Optional[int]] = mapped_column(Integer)
+    # Lower-case, e.g. 'maize'. From a mapped file column, else the crop type
+    # chosen when the file was mapped; NULL for rows imported before it existed.
+    crop_type: Mapped[Optional[str]] = mapped_column(String(30))
     created_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, server_default=func.now())
 

@@ -584,7 +584,7 @@ def _row_mapping(record, created_at: datetime.datetime, imported_at: datetime.da
 
 
 # The columns of uq_planting_recommendation, in its order.
-KEY_COLUMNS = ('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date')
+KEY_COLUMNS = ('country', 'province', 'lon', 'lat', 'variety', 'season_type', 'opt_date', 'crop_type')
 
 
 def _insert_statement():
@@ -704,12 +704,16 @@ def process_file(
     column_map: dict[str, str] | None = None,
     original_filename: str | None = None,
     created_at: datetime.datetime | None = None,
+    crop_type: str | None = None,
 ):
     """
     ``created_at`` is what every row of the file gets as created_at: the data
     date confirmed when an upload was mapped. Without one (scans, the CLI) it
     is the file's first import time — RDS and Parquet carry no creation date,
     and file times change whenever a file is edited or copied.
+
+    ``crop_type`` is the crop chosen when the upload was mapped. A row whose
+    mapped crop_type column has a value keeps that value; the others get this.
 
     Processes a single file by reading its contents in chunks, converting data to
     :class:`PlantingDataRecord` instances, and inserting records into the database.
@@ -905,7 +909,10 @@ def process_file(
                             if target_attr == 'planting_option' and value is not None:
                                 value = int(value)
                             kwargs[target_attr] = value
-                        batch.append(PlantingRecommendationCreate(**kwargs))
+                        record = PlantingRecommendationCreate(**kwargs)
+                        if record.crop_type is None and crop_type:
+                            record.crop_type = crop_type
+                        batch.append(record)
 
                     for i in range(0, len(batch), batch_size):
                         sub = batch[i:i + batch_size]
@@ -1253,7 +1260,8 @@ def resume_interrupted_jobs(hostname: str) -> int:
                 from app.services.housekeeper import process_file_async
                 queued = process_file_async(upload.stored_path, column_map=upload.column_map,
                                             original_filename=upload.original_name, run_id=job.get('run_id'),
-                                            created_at=upload_service.data_datetime(upload))
+                                            created_at=upload_service.data_datetime(upload),
+                                            crop_type=upload.crop_type)
             else:
                 path = os.path.join(get_settings().HOUSEKEEPING_DATA_DIR, name)
                 if not os.path.isfile(path):
@@ -1364,7 +1372,8 @@ def _ask_for_worker(timeout: float) -> bool:
 
 def process_file_async(file_path: str, app=None, column_map: dict | None = None,
                        original_filename: str | None = None, run_id: int | None = None,
-                       created_at: datetime.datetime | None = None) -> bool:
+                       created_at: datetime.datetime | None = None,
+                       crop_type: str | None = None) -> bool:
     """Enqueue a single file for processing via Celery (non-blocking).
 
     Used by the upload API endpoint and worker restart recovery.
@@ -1386,6 +1395,8 @@ def process_file_async(file_path: str, app=None, column_map: dict | None = None,
         kwargs['original_filename'] = original_filename
     if created_at is not None:
         kwargs['created_at'] = created_at.isoformat()  # JSON across the broker
+    if crop_type:
+        kwargs['crop_type'] = crop_type
 
     # A run per submission. Without a run_id every attempt at a file matched
     # the same progress row, so each one overwrote the previous attempt's

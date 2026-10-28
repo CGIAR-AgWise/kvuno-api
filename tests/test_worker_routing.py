@@ -53,6 +53,7 @@ def test_the_runner_opens_a_processing_run(monkeypatch):
         column_map = {}
         original_name = 'x.parquet'
         data_date = None
+        crop_type = 'cassava'
 
     class _Session:
         def get(self, model, upload_id):
@@ -90,6 +91,7 @@ def test_the_runner_opens_a_processing_run(monkeypatch):
     assert ingest_runner.run('a' * 32) == 0
     assert started and started[0]['source'] == 'upload'
     assert seen and seen[0]['run_id'] == 7
+    assert seen[0]['crop_type'] == 'cassava', "the crop chosen on the mapping form reaches the import"
     assert discarded == [7]
 
 

@@ -292,14 +292,15 @@ All tables are defined in `app/models/kvuno.py` and created by Alembic migration
 | `season_type` | VARCHAR(20) | Season classification |
 | `opt_date` | VARCHAR(8) | Optimal sowing date |
 | `planting_option` | INTEGER | Planting option ID |
+| `crop_type` | VARCHAR(30) | Crop, lower-case (`maize`). From a file column mapped to `crop_type` (aliases `crop`, `croptype`), else the **Crop type** chosen on the mapping form (`uploads.crop_type`); NULL for rows imported before migration `f4b6d8a0c2e3` and for scanned files without such a column |
 | `created_at` | DATETIME | When the data was produced: the upload's confirmed **Data date** (midnight UTC), else the file's first import time (`file_imports.processed_at`). Set by the ingest, not the column default |
 | `updated_at` | DATETIME | When the row was imported. Set by the ingest |
 
 Rows imported before the timestamp fix have NULL in both (the ingest sent explicit NULLs, which override the `now()` defaults).
 
-Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date)` — this is what drives conflict detection. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
+Unique constraint `uq_planting_recommendation` on `(country, province, lon, lat, variety, season_type, opt_date, crop_type)` — this is what drives conflict detection. `crop_type` joined it in migration `f4b6d8a0c2e3` (Postgres only; rebuilding it on a large table takes a while and blocks writes meanwhile), so the same place, variety, season and date for two crops are two rows; existing rows all have NULL there and collide with each other as before. On PostgreSQL ≥ 15 it is `UNIQUE NULLS NOT DISTINCT` (migration `f3a9c2d4e5b6`, `20261022130000_planting_unique_nulls_not_distinct.py`), which first deletes existing NULL-aware duplicates keeping the lowest `id`; its downgrade does not restore them. Every key column is nullable, so under the default NULLS DISTINCT a row with any NULL key never conflicted and was inserted again on every replay. On SQLite / PostgreSQL < 15 the migration is a no-op.
 
-Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_province`, `idx_lon`, `idx_lat`, `idx_variety`, `idx_season_type`, `idx_opt_date`, `idx_planting_option`, plus a second GiST index `idx_planting_recommendations_coordinates`.
+Indexes: `idx_check_sum`, `idx_coordinates` (GiST), `idx_country`, `idx_crop_type`, `idx_province`, `idx_lon`, `idx_lat`, `idx_variety`, `idx_season_type`, `idx_opt_date`, `idx_planting_option`, plus a second GiST index `idx_planting_recommendations_coordinates`.
 
 ### `file_imports`
 

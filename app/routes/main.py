@@ -140,7 +140,8 @@ def register_app_routes(app):
         # max_file_size lets the SPA refuse an oversized file before sending a
         # byte, from the server's own limit rather than a hardcoded copy of it.
         return jsonify(columns=sorted(DB_TARGET_COLUMNS), aliases=COLUMN_ALIASES,
-                       max_file_size=get_settings().max_file_size)
+                       max_file_size=get_settings().max_file_size,
+                       crop_types=upload_service.known_crop_types())
 
     register_upload_routes(app)
 

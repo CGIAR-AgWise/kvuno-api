@@ -1,7 +1,9 @@
 import re
 from typing import Optional
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import Field, ConfigDict, field_validator
+
+from app.dto.pagination import PaginationQuery
 
 
 # Columns a client may sort by. sort_col used to go straight into
@@ -12,11 +14,11 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 # meaningless or unsupported by the database.
 PLANTING_SORT_COLUMNS = (
     'id', 'check_sum', 'country', 'province', 'lon', 'lat', 'variety',
-    'season_type', 'opt_date', 'planting_option', 'created_at', 'updated_at',
+    'season_type', 'opt_date', 'planting_option', 'crop_type', 'created_at', 'updated_at',
 )
 CONFLICT_SORT_COLUMNS = (
     'id', 'country', 'province', 'lon', 'lat', 'variety', 'season_type',
-    'opt_date', 'check_sum', 'source', 'created_at',
+    'opt_date', 'crop_type', 'check_sum', 'source', 'created_at',
 )
 SORT_DIRECTIONS = ('asc', 'desc')
 
@@ -39,7 +41,7 @@ def _check_sort_dir(value):
     return value
 
 
-class PlantingDataFilter(BaseModel):
+class PlantingDataFilter(PaginationQuery):
     coordinates: Optional[str] = Field(
         default=None,
         description='Coordinates in lon,lat format',
@@ -69,6 +71,11 @@ class PlantingDataFilter(BaseModel):
         default=None,
         description='Type of season, e.g., Average, High',
         json_schema_extra={"example": "Average"},
+    )
+    crop_type: Optional[str] = Field(
+        default=None,
+        description='Crop, case-insensitive',
+        json_schema_extra={"example": "maize"},
     )
     opt_date: Optional[str] = Field(
         default=None,
@@ -116,6 +123,13 @@ class PlantingDataFilter(BaseModel):
                 raise ValueError("Longitude must be between -180 and 180.")
         return value
 
+    @field_validator('crop_type', mode='before')
+    @classmethod
+    def validate_crop_type(cls, value):
+        # Stored lower-case, so 'Maize' must still match.
+        from app.utils.crop_type import normalise
+        return normalise(value)
+
     @field_validator('opt_date', mode='before')
     @classmethod
     def validate_opt_date(cls, value):
@@ -138,12 +152,20 @@ class PlantingDataFilter(BaseModel):
         return _check_sort_dir(value)
 
 
-class QualityFilter(BaseModel):
+class QualityFilter(PaginationQuery):
     country: Optional[str] = Field(default=None)
+    crop_type: Optional[str] = Field(default=None, description='Crop, case-insensitive',
+                                     json_schema_extra={"example": "maize"})
     source: Optional[str] = Field(default=None)
     search: Optional[str] = Field(default=None)
     sort_col: Optional[str] = Field(default=None, description='Column to sort by')
     sort_dir: Optional[str] = Field(default=None, description='Sort direction: asc or desc')
+
+    @field_validator('crop_type', mode='before')
+    @classmethod
+    def validate_crop_type(cls, value):
+        from app.utils.crop_type import normalise
+        return normalise(value)
 
     @field_validator('sort_col', mode='before')
     @classmethod

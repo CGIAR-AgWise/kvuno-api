@@ -8,7 +8,7 @@ from app.models.kvuno import ImportConflict
 from app.utils.logging import get_logger
 
 # What makes two conflicts "the same recommendation" on the Duplicates tab.
-DUPLICATE_KEYS = ('country', 'province', 'variety', 'season_type', 'opt_date')
+DUPLICATE_KEYS = ('country', 'province', 'variety', 'season_type', 'opt_date', 'crop_type')
 
 
 class ImportConflictRepo:
@@ -42,6 +42,8 @@ class ImportConflictRepo:
     def _filtered(self, query, filters: QualityFilter):
         if filters.country:
             query = query.filter(ImportConflict.country.ilike(f"%{filters.country}%"))
+        if filters.crop_type:
+            query = query.filter(ImportConflict.crop_type == filters.crop_type)
         if filters.source:
             query = query.filter(ImportConflict.source == filters.source)
         if filters.search:

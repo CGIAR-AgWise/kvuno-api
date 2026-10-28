@@ -129,14 +129,14 @@ class TestResume:
         ]
         monkeypatch.setattr(ps, 'load_all_jobs', lambda *a, **kw: jobs)
         upload = SimpleNamespace(stored_path=str(uploaded), column_map={'Lat': 'lat'}, original_name='Up.RDS',
-                                 data_date=datetime.date(2024, 3, 1))
+                                 data_date=datetime.date(2024, 3, 1), crop_type='maize')
         monkeypatch.setattr('app.services.uploads.find_by_stored_name',
                             lambda name: upload if name == 'up.parquet' else None)
 
         assert hk.resume_interrupted_jobs('w1') == 2
         assert enqueued == [
             (str(uploaded), {'column_map': {'Lat': 'lat'}, 'original_filename': 'Up.RDS', 'run_id': 3,
-                             'created_at': datetime.datetime(2024, 3, 1)}),
+                             'created_at': datetime.datetime(2024, 3, 1), 'crop_type': 'maize'}),
             (os.path.join(str(tmp_path), 'scan.parquet'), {'original_filename': 'Scan.RDS', 'run_id': 4}),
         ]
 

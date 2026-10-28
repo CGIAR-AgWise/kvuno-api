@@ -225,6 +225,8 @@ export interface PlantingRecord {
   /** The same day as ISO 8601 month-day, '--11-30'. */
   opt_month_day: string | null
   planting_option: string | null
+  /** Lower-case ('maize'); null for rows imported before crop types were recorded. */
+  crop_type: string | null
   check_sum: string | null
   /** GeoJSON Point (RFC 7946): coordinates are [lon, lat]. */
   coordinates: { type: 'Point'; coordinates: number[] } | null
@@ -248,10 +250,11 @@ export interface FilterColumns {
   province: string[]
   variety: string[]
   season_type: string[]
+  crop_type: string[]
 }
 
 /**
- * /filters pages each column independently — the response is a dict of four
+ * /filters pages each column independently — the response is a dict of five
  * unrelated lists, so there is no single row axis. `pages` is a per-column
  * map, which is why this deliberately does not extend PageMeta.
  */
@@ -269,6 +272,7 @@ export interface Conflict {
   variety: string | null
   season_type: string | null
   opt_date: string | null
+  crop_type: string | null
   source: string | null
   created_at: string | null
 }
@@ -359,7 +363,7 @@ export function fetchPlantingRecords(
 }
 
 export function fetchFilters(signal?: AbortSignal): Promise<FilterColumns> {
-  const acc: FilterColumns = { country: [], province: [], variety: [], season_type: [] }
+  const acc: FilterColumns = { country: [], province: [], variety: [], season_type: [], crop_type: [] }
   const keys = Object.keys(acc) as (keyof FilterColumns)[]
   let page = 1
   let pages = 1
@@ -466,6 +470,7 @@ export interface DuplicateGroup {
   variety: string | null
   season_type: string | null
   opt_date: string | null
+  crop_type: string | null
   count: number
   sources: Record<string, number>
 }
@@ -605,6 +610,8 @@ export async function fetchDBColumns(signal?: AbortSignal): Promise<{
   aliases: Record<string, string>
   /** The server's MAX_FILE_SIZE in bytes, so the client checks the real limit. */
   max_file_size: number
+  /** Crop types chosen on earlier uploads: suggestions for the mapping form. */
+  crop_types?: string[]
 }> {
   return request('/ui/columns', { signal })
 }
@@ -714,6 +721,8 @@ export interface UploadRecord {
   file_modified_at: string | null
   /** When the data was produced (YYYY-MM-DD), confirmed on the mapping form; rows get it as created_at. */
   data_date: string | null
+  /** The crop the file is about (lower-case), chosen on the mapping form. */
+  crop_type: string | null
   /** 'upload' from the Upload page; 'folder' a data-folder file held for mapping. */
   source: 'upload' | 'folder'
   created_at: string | null
@@ -736,11 +745,19 @@ export function fetchUpload(id: string, signal?: AbortSignal) {
   return request<UploadRecord>(`/ui/uploads/${id}`, { signal })
 }
 
-/** dataDate: YYYY-MM-DD, or '' to use the file's first import time. */
-export function processUpload(id: string, columnMap: Record<string, string>, dataDate: string) {
+/**
+ * dataDate: YYYY-MM-DD, or '' to use the file's first import time.
+ * cropType: given to every row whose mapped crop_type column is empty; '' for none.
+ */
+export function processUpload(
+  id: string,
+  columnMap: Record<string, string>,
+  dataDate: string,
+  cropType: string,
+) {
   return request<{ id: string; file: string | null; message: string; queued: boolean }>(
     `/ui/uploads/${id}/process`,
-    { method: 'POST', body: { column_map: columnMap, data_date: dataDate } },
+    { method: 'POST', body: { column_map: columnMap, data_date: dataDate, crop_type: cropType } },
   )
 }
 

@@ -71,6 +71,8 @@ interface Item {
   columnMap: Record<string, string>
   /** "Data date" (YYYY-MM-DD) sent with the mapping; '' = first import time. */
   dataDate: string
+  /** Crop type sent with the mapping; '' = none. */
+  cropType: string
   error: string
 }
 
@@ -92,6 +94,7 @@ function fromRecord(record: UploadRecord): Item {
     record,
     columnMap: { ...record.column_map },
     dataDate: suggestedDate(record),
+    cropType: record.crop_type ?? '',
     error: record.error ?? '',
   }
 }
@@ -193,6 +196,7 @@ export default function Upload() {
   })
   const [dbColumns, setDbColumns] = useState<ColumnOption[]>([SKIP])
   const [maxSize, setMaxSize] = useState<number | null>(null)
+  const [knownCrops, setKnownCrops] = useState<string[]>([])
   const [items, setItems] = useState<Item[]>([])
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -218,9 +222,10 @@ export default function Upload() {
   useEffect(() => {
     const controller = new AbortController()
     fetchDBColumns(controller.signal)
-      .then(({ columns, max_file_size }) => {
+      .then(({ columns, max_file_size, crop_types }) => {
         setDbColumns([SKIP, ...columns.map((c) => ({ value: c, label: c }))])
         setMaxSize(max_file_size)
+        setKnownCrops(crop_types ?? [])
       })
       .catch(() => undefined)
     fetchUploads(controller.signal)
@@ -368,6 +373,7 @@ export default function Upload() {
           record: null,
           columnMap: {},
           dataDate: '',
+          cropType: '',
           error: '',
         },
       ]
@@ -432,7 +438,7 @@ export default function Upload() {
     const problems: string[] = []
     for (const item of queue) {
       try {
-        const result = await processUpload(item.id as string, item.columnMap, item.dataDate)
+        const result = await processUpload(item.id as string, item.columnMap, item.dataDate, item.cropType)
         if (result.queued) {
           queued += 1
           setItems((current) => current.filter((i) => i.key !== item.key))
@@ -457,6 +463,12 @@ export default function Upload() {
 
   return (
     <div className="pb-3">
+      {/* Suggestions for every card's Crop type field: crops chosen before. */}
+      <datalist id="known-crops">
+        {knownCrops.map((crop) => (
+          <option key={crop} value={crop} />
+        ))}
+      </datalist>
       <div
         className={'kvuno-card p-5 text-center mb-3' + (dragging ? ' border-primary' : '')}
         style={{ borderStyle: 'dashed', cursor: 'pointer' }}
@@ -631,6 +643,29 @@ export default function Upload() {
                       ? " Suggested from the file's last-modified date — check it, since editing or copying a file changes that."
                       : ''}{' '}
                     Leave it empty to use the import date.
+                  </div>
+                </div>
+                <div className="row g-2 align-items-center mb-3">
+                  <label className="col-auto col-form-label col-form-label-sm" htmlFor={'crop-' + item.key}>
+                    Crop type
+                  </label>
+                  <div className="col-auto">
+                    <input
+                      id={'crop-' + item.key}
+                      type="text"
+                      className="form-control form-control-sm"
+                      list="known-crops"
+                      maxLength={30}
+                      placeholder="e.g. maize"
+                      value={item.cropType}
+                      onChange={(e) => patch(item.key, { cropType: e.target.value })}
+                    />
+                  </div>
+                  <div className="col-12 small text-muted">
+                    {Object.values(item.columnMap).includes('crop_type')
+                      ? 'A file column is mapped to crop_type; rows where it is empty get this crop.'
+                      : 'The crop this file is about; every imported row gets it.'}{' '}
+                    Stored in lower case. Leave it empty if the file covers no single crop.
                   </div>
                 </div>
                 <p className="small text-muted mb-2">

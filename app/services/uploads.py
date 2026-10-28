@@ -42,6 +42,7 @@ from sqlalchemy import or_, update
 from app.config import ALLOWED_EXTENSIONS, get_settings
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, Upload
+from app.utils import crop_type as crops
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -93,6 +94,8 @@ DB_TARGET_COLUMNS = {
 
 COLUMN_ALIASES = {
     'cultivar': 'variety',
+    'crop': 'crop_type',
+    'croptype': 'crop_type',
     'season': 'season_type',
     'sowing_date': 'opt_date',
     'planting_date': 'opt_date',
@@ -757,11 +760,31 @@ def ensure_inspection(app, upload: Upload) -> None:
 
 # ── Submission and removal ─────────────────────────────────────
 
-def submit(upload: Upload, column_map=None, data_date=None) -> Upload:
-    """Validate and store the mapping and data date, ready to process.
+def parse_crop_type(raw) -> str | None:
+    """The mapping form's crop type, normalised. '' clears it; raises UploadError if unusable."""
+    try:
+        return crops.parse(raw)
+    except ValueError as e:
+        raise UploadError(str(e))
 
-    `None` re-uses the saved value (Retry sends neither). An empty data date
-    clears it: the rows then take the file's first import time.
+
+def known_crop_types() -> list[str]:
+    """Crop types chosen on earlier uploads: suggestions for the mapping form.
+
+    From uploads, not planting_recommendations: a DISTINCT over millions of
+    rows is too slow for a form, and every crop chosen on the form is here.
+    """
+    rows = (_session().query(Upload.crop_type).filter(Upload.crop_type.isnot(None))
+            .distinct().order_by(Upload.crop_type).all())
+    return [r[0] for r in rows]
+
+
+def submit(upload: Upload, column_map=None, data_date=None, crop_type=None) -> Upload:
+    """Validate and store the mapping, data date and crop type, ready to process.
+
+    `None` re-uses the saved value (Retry sends none of them). An empty data
+    date clears it: the rows then take the file's first import time. An empty
+    crop type clears it too: rows then have one only from a mapped column.
     """
     if upload.status not in SUBMITTABLE:
         raise UploadError(f'Upload is {upload.status}, not ready to process', 409)
@@ -769,6 +792,8 @@ def submit(upload: Upload, column_map=None, data_date=None) -> Upload:
     mapping = validate_column_map(upload.column_map if column_map is None else column_map, columns)
     if data_date is not None:
         upload.data_date = parse_data_date(data_date) if str(data_date).strip() else None
+    if crop_type is not None:
+        upload.crop_type = parse_crop_type(crop_type)
     upload.column_map = mapping
     # If already processing, keep that status; otherwise mark as submitted
     if upload.status != 'processing':
@@ -879,6 +904,7 @@ def to_dict(upload: Upload) -> dict:
         'progress': upload.progress if upload.status in ('received', 'inspecting') else None,
         'file_modified_at': upload.file_modified_at.isoformat() if upload.file_modified_at else None,
         'data_date': upload.data_date.isoformat() if upload.data_date else None,
+        'crop_type': upload.crop_type,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

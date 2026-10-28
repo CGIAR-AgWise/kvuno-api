@@ -45,6 +45,7 @@ def run(upload_id: str) -> int:
             return 2
         path, column_map, name = upload.stored_path, upload.column_map, upload.original_name
         created_at = upload_service.data_datetime(upload)
+        crop_type = upload.crop_type
         MyDb.get_db().session.remove()
 
         # A run of its own, like a Celery import, so this file shows in the Runs
@@ -73,7 +74,7 @@ def run(upload_id: str) -> int:
                 time.sleep(delay)
             try:
                 process_file(path, column_map=column_map, original_filename=name, created_at=created_at,
-                             run_id=run_id, **housekeeping_settings())
+                             crop_type=crop_type, run_id=run_id, **housekeeping_settings())
                 _discard_empty_run()  # the file was already held by another process
                 return 0
             except Exception as e:

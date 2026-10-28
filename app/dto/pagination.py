@@ -1,12 +1,38 @@
-from typing import Generic, List, TypeVar
+from typing import Generic, List, Optional, TypeVar
 
 from flask import request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 T = TypeVar("T")
 
 DEFAULT_PER_PAGE = 100
 MAX_PER_PAGE = 500
+
+
+class PaginationQuery(BaseModel):
+    """``page``/``per_page`` as query parameters, so the OpenAPI spec (and
+    Swagger UI) shows them on every paginated endpoint.
+
+    Documentation only: get_pagination() still reads and clamps them, which is
+    why there are no ge/le bounds here — out-of-range values are clamped, not
+    rejected, and an unparsable one falls back to the default as it always did.
+    """
+
+    # json_schema_extra, not examples=[...]: flask-openapi3 turns query fields
+    # into Parameter objects, whose `examples` must be a dict.
+    page: Optional[int] = Field(default=None, description="1-based page number; default 1, values below 1 mean 1",
+                                json_schema_extra={"example": 1})
+    per_page: Optional[int] = Field(
+        default=None, json_schema_extra={"example": DEFAULT_PER_PAGE},
+        description=f"Items per page; default {DEFAULT_PER_PAGE}, clamped to 1..{MAX_PER_PAGE}")
+
+    @field_validator('page', 'per_page', mode='before')
+    @classmethod
+    def _lenient(cls, value):
+        try:
+            return int(value) if value not in (None, '') else None
+        except (TypeError, ValueError):
+            return None
 
 
 class PaginatedResponse(BaseModel, Generic[T]):
