@@ -107,13 +107,12 @@ class TestCoordinatesPagination:
 class TestFiltersPagination:
     def test_reports_per_column_totals(self, client, authed):
         repo = MagicMock()
+        # A full first page (100) means more may follow, so country is counted.
         repo.get_distinct_values.return_value = {
-            "country": ["Kenya"], "province": ["Nairobi"],
+            "country": [f"C{i}" for i in range(100)], "province": ["Nairobi"] * 47,
             "variety": [], "season_type": [],
         }
-        repo.count_distinct_values.return_value = {
-            "country": 250, "province": 47, "variety": 0, "season_type": 0,
-        }
+        repo.count_distinct_values.return_value = {"country": 250}
         with patch("app.api.planting_data.repo", repo):
             resp = client.get("/api/v1/planting-data/filters")
         body = resp.get_json()
@@ -122,6 +121,25 @@ class TestFiltersPagination:
         # Each column pages independently, so pages differ per column.
         assert body["pages"]["country"] == 3
         assert body["pages"]["province"] == 1
+        assert body["totals"]["province"] == 47
+        # Only the full column needed a COUNT(DISTINCT); short ones are counted from the page.
+        assert repo.count_distinct_values.call_args.args == (["country"],)
+
+    def test_short_columns_need_no_count_query(self, client, authed):
+        repo = MagicMock()
+        repo.get_distinct_values.return_value = {"crop_type": ["cotton", "maize", "soybean"]}
+        with patch("app.api.planting_data.repo", repo):
+            body = client.get("/api/v1/planting-data/filters").get_json()
+        assert body["totals"]["crop_type"] == 3
+        repo.count_distinct_values.assert_not_called()
+
+    def test_later_pages_still_count(self, client, authed):
+        repo = MagicMock()
+        repo.get_distinct_values.return_value = {"country": ["Zambia"]}
+        repo.count_distinct_values.return_value = {"country": 101}
+        with patch("app.api.planting_data.repo", repo):
+            body = client.get("/api/v1/planting-data/filters?page=2").get_json()
+        assert body["totals"]["country"] == 101
 
     def test_slice_is_passed_per_column(self, client, authed):
         repo = MagicMock()
@@ -151,14 +169,13 @@ class TestExportPagination:
         """Export used to stream every matching row; it is now capped."""
         repo = MagicMock()
         query = MagicMock()
-        query.limit.return_value = query
-        query.offset.return_value = query
         query.yield_per.return_value = []
-        repo.get_filtered_data.return_value = query
+        repo.get_page_query.return_value = query
         with patch("app.api.planting_data.repo", repo):
-            resp = client.get("/api/v1/planting-data/export?format=json&per_page=200")
+            resp = client.get("/api/v1/planting-data/export?format=json&per_page=200&page=3")
         assert resp.status_code == 200
-        query.limit.assert_called_once_with(200)
+        repo.get_page_query.assert_called_once()
+        assert repo.get_page_query.call_args.args[1:] == (200, 400)
 
 
 class TestListEndpointsDefaultTo100:

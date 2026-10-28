@@ -140,8 +140,10 @@ single objects.
 Example:
 
 ```bash
-curl "http://localhost:5000/api/v1/planting-data/?crop_type=maize&country=Kenya&page=1&per_page=10"
+curl "http://localhost:5000/api/v1/planting-data/?crop_type=maize&variety=medium&country=Kenya&page=1&per_page=10"
 ```
+
+**Fast queries.** Send `crop_type` **and** `variety`, plus a location: `coordinates` + `radius`, or `country`. These are indexed and answer in tens of milliseconds on 5.5 M rows (a 10 km radius ~12 ms, crop + variety + country ~34 ms). A crop without a variety has no index in the page order and takes ~350 ms; an unfiltered or crop-only count over millions of rows takes a few hundred ms. Deep pages cost little, since a page is located in the index before any rows are read.
 
 ## Response Format
 

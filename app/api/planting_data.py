@@ -177,7 +177,15 @@ def get_filter_options(query: PaginationQuery):
         values = repo.get_distinct_values(
             FILTER_COLUMNS, limit=pagination.per_page, offset=pagination.offset
         )
-        totals = repo.count_distinct_values(FILTER_COLUMNS)
+        # A short page holds the rest of a column, so on page 1 it is the
+        # whole column: count it from the list. A COUNT(DISTINCT) per column
+        # over 5.5 M rows cost ~1.6 s of each 5-minute refresh, for columns
+        # with a handful of values. Full pages (and later pages) still count.
+        known = {col: len(values.get(col, [])) for col in FILTER_COLUMNS
+                 if pagination.page == 1 and len(values.get(col, [])) < pagination.per_page}
+        counted = [col for col in FILTER_COLUMNS if col not in known]
+        totals = {**known, **(repo.count_distinct_values(counted) if counted else {})}
+        totals = {col: totals.get(col, 0) for col in FILTER_COLUMNS}
         pages = {
             col: ((totals.get(col, 0) + pagination.per_page - 1) // pagination.per_page)
             for col in FILTER_COLUMNS
@@ -311,7 +319,7 @@ def export_data(query: PlantingDataFilter):
     pagination = get_pagination()
 
     try:
-        rows = repo.get_filtered_data(query).limit(pagination.per_page).offset(pagination.offset)
+        rows = repo.get_page_query(query, pagination.per_page, pagination.offset)
 
         if fmt == 'json':
             def generate_json():

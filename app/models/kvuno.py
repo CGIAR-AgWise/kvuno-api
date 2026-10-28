@@ -211,8 +211,12 @@ class PlantingRecommendation(Base):
                          'crop_type', name='uq_planting_recommendation', postgresql_nulls_not_distinct=True),
         Index('idx_check_sum', 'check_sum'),
         Index('idx_coordinates', 'coordinates', postgresql_using='gist'),
-        Index('idx_country', 'country'),
-        Index('idx_crop_type', 'crop_type'),
+        # A page is `WHERE crop_type/variety [/country] … ORDER BY id`; these
+        # return it in id order and count it from the index (a7c9e1b3d5f2).
+        # They also replace idx_crop_type and idx_country. The radius search's
+        # geography index is Postgres-only and created in that migration.
+        Index('idx_crop_variety_id', 'crop_type', 'variety', 'id'),
+        Index('idx_country_crop_variety_id', 'country', 'crop_type', 'variety', 'id'),
         Index('idx_lat', 'lat'),
         Index('idx_lon', 'lon'),
         Index('idx_opt_date', 'opt_date'),

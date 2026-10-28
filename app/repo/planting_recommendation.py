@@ -1,8 +1,9 @@
+import math
+from dataclasses import dataclass
 from typing import Optional, Type
 
-from flask_sqlalchemy.pagination import QueryPagination
 from geoalchemy2 import Geography, WKTElement
-from sqlalchemy import cast, func
+from sqlalchemy import cast, func, select
 from sqlalchemy.orm import Query
 
 from app.dto.data_filters import PLANTING_SORT_COLUMNS, PlantingDataFilter
@@ -10,6 +11,19 @@ from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation
 from app.utils.logging import get_logger
 
+
+@dataclass
+class Page:
+    """One page of rows and the size of the whole set (the attributes of
+    flask-sqlalchemy's QueryPagination that callers use)."""
+    items: list
+    total: int
+    page: int
+    per_page: int
+
+    @property
+    def pages(self) -> int:
+        return math.ceil(self.total / self.per_page) if self.per_page else 0
 
 
 class PlantingRecommendationRepo:
@@ -57,8 +71,8 @@ class PlantingRecommendationRepo:
             self.logger.error(f"Failed to retrieve all PlantingRecommendation records: {e}")
             raise
 
-    def get_filtered_data(self, filters: PlantingDataFilter) -> Query:
-        query = self._apply_filters(filters)
+    @staticmethod
+    def _order(filters: PlantingDataFilter) -> list:
         sort_col = filters.sort_col or 'id'
         sort_dir = filters.sort_dir or 'asc'
         # The DTO already rejects unknown columns with a validation error; this
@@ -68,13 +82,43 @@ class PlantingRecommendationRepo:
         if sort_col not in PLANTING_SORT_COLUMNS:
             sort_col = 'id'
         col_attr = getattr(PlantingRecommendation, sort_col)
-        order = col_attr.asc() if sort_dir == 'asc' else col_attr.desc()
+        order = [col_attr.asc() if sort_dir == 'asc' else col_attr.desc()]
         # Tie-break on the primary key. A non-unique sort column leaves row
         # order ambiguous, and LIMIT/OFFSET over an ambiguous order silently
         # repeats and skips rows as the client pages through the result.
         if col_attr is not PlantingRecommendation.id:
-            order = (order, PlantingRecommendation.id.asc())
-        return query.order_by(*order) if isinstance(order, tuple) else query.order_by(order)
+            order.append(PlantingRecommendation.id.asc())
+        return order
+
+    def get_filtered_data(self, filters: PlantingDataFilter) -> Query:
+        return self._apply_filters(filters).order_by(*self._order(filters))
+
+    def get_page_query(self, filters: PlantingDataFilter, limit: int, offset: int = 0) -> Query:
+        """One page of rows: the page's ids first, then only those rows.
+
+        The plain ``WHERE … ORDER BY id LIMIT n`` let Postgres walk the
+        primary key and test every row, assuming matches are spread evenly
+        through the table. They are not — a file's rows are stored together —
+        so a page of Zambian soybean skipped 3.3 M rows (~380 ms). Selecting
+        only ids lets it read them in order straight from a composite index
+        (idx_crop_variety_id, idx_country_crop_variety_id) without touching
+        the table, ~0.4 ms; a deep OFFSET is skipped in the index too.
+        """
+        order = self._order(filters)
+        ids = (self._apply_filters(filters)
+               .with_entities(PlantingRecommendation.id)
+               .order_by(*order)
+               .limit(limit).offset(offset)
+               .subquery())
+        return (self._get_session().query(PlantingRecommendation)
+                .filter(PlantingRecommendation.id.in_(select(ids.c.id)))
+                .order_by(*order))
+
+    def count_filtered(self, filters: PlantingDataFilter) -> int:
+        # count(id), not count(*): with no filter there is no WHERE, and a bare
+        # func.count() then has no FROM at all — it counted one row, not the table.
+        return (self._apply_filters(filters).order_by(None)
+                .with_entities(func.count(PlantingRecommendation.id)).scalar() or 0)
 
     def _apply_filters(self, filters: PlantingDataFilter) -> Query:
         session = self._get_session()
@@ -110,9 +154,9 @@ class PlantingRecommendationRepo:
             query = query.filter(PlantingRecommendation.planting_option == filters.planting_option)
         return query
 
-    def get_paginated_data(self, filters: PlantingDataFilter, page: int, per_page: int) -> QueryPagination:
-        query = self.get_filtered_data(filters)
-        return query.paginate(page=page, per_page=per_page, error_out=False)
+    def get_paginated_data(self, filters: PlantingDataFilter, page: int, per_page: int) -> Page:
+        items = self.get_page_query(filters, per_page, (page - 1) * per_page).all()
+        return Page(items=items, total=self.count_filtered(filters), page=page, per_page=per_page)
 
     def get_coordinates(self, filters: PlantingDataFilter, limit: int, offset: int = 0,
                         sample: bool = False) -> list:

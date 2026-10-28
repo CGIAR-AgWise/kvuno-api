@@ -94,6 +94,11 @@ def include_object(object, name, type_, reflected, compare_to):
         "raster_overviews",
     }:
         return False
+    # Expression indexes created by hand in migrations, not declared on the
+    # model (SQLite, which the tests use, cannot build them). Without this,
+    # autogenerate proposes dropping them.
+    if type_ == "index" and name in {"idx_coordinates_geography"}:
+        return False
 
     return True
 

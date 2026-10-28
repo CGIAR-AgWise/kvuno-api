@@ -207,11 +207,9 @@ class TestExportZeros:
         row = SimpleNamespace(country="Kenya", province="X", lon=0.0, lat=0.0, variety="V",
                               season_type="Average", opt_date="20240101", planting_option=0, crop_type="maize")
         query = MagicMock()
-        query.limit.return_value = query
-        query.offset.return_value = query
         query.yield_per.return_value = [row]
         repo = MagicMock()
-        repo.get_filtered_data.return_value = query
+        repo.get_page_query.return_value = query
         with patch("app.api.planting_data.repo", repo):
             resp = client.get("/api/v1/planting-data/export")
         lines = resp.get_data(as_text=True).strip().splitlines()
@@ -221,11 +219,9 @@ class TestExportZeros:
         row = SimpleNamespace(country=None, province=None, lon=None, lat=None, variety=None,
                               season_type=None, opt_date=None, planting_option=None, crop_type=None)
         query = MagicMock()
-        query.limit.return_value = query
-        query.offset.return_value = query
         query.yield_per.return_value = [row]
         repo = MagicMock()
-        repo.get_filtered_data.return_value = query
+        repo.get_page_query.return_value = query
         with patch("app.api.planting_data.repo", repo):
             resp = client.get("/api/v1/planting-data/export")
         assert resp.get_data(as_text=True).strip().splitlines()[1] == ",,,,,,,,"
@@ -271,6 +267,7 @@ class TestErrorBodiesDoNotLeak:
         for attr in ("get_distinct_values", "count_coordinates", "get_clusters"):
             getattr(repo, attr).side_effect = RuntimeError(self.SECRET)
         repo.get_filtered_data.side_effect = RuntimeError(self.SECRET)
+        repo.get_page_query.side_effect = RuntimeError(self.SECRET)
         with patch("app.api.planting_data.repo", repo):
             for path in ("filters", "coordinates", "coordinates/all", "clusters", "export"):
                 resp = client.get(f"/api/v1/planting-data/{path}")
