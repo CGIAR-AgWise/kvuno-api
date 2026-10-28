@@ -1,15 +1,15 @@
 # KVuno API
 
-A Flask-based REST API for processing agricultural RDS (R Data Serialization) files containing crop planting data. It extracts optimized sowing dates, crop varieties, and geographic coordinates from RDS files, loads them into a database (SQLite/MySQL/PostgreSQL), and serves the data through a paginated, filterable API endpoint. Duplicate files are tracked via checksums to avoid re-imports.
+A Flask-based REST API for agricultural planting data delivered as R data files (`.RDS`) or Parquet. Every RDS is **converted to Parquet** before it is imported, because Parquet can be read a chunk at a time and an RDS cannot. The API extracts optimal sowing dates, crops, varieties and coordinates, loads them into PostgreSQL/PostGIS, and serves them through paginated, filterable endpoints. Files are tracked by checksum, so the same file is never imported twice.
 
 Built for the [AgWISE-EiA](https://agwise.cgiar.org) initiative (Alliance for a Green Revolution in Africa / Excellence in Agronomy).
 
 ## Features
 
-- **RDS File Ingestion** — Reads `.RDS` files using `pyreadr`, processes data in chunks with batch inserts
-- **Resumable Uploads** — The SPA uploads over the [tus](https://tus.io) protocol; an interrupted upload resumes from the last byte, and the file is inspected (RDS → Parquet, preview, checksum, suggested column mapping) in the background
+- **RDS → Parquet Conversion** — Every `.RDS` is converted to `.parquet` before import (see [What happens to an RDS file](#what-happens-to-an-rds-file)); Parquet is then streamed in chunks with batch inserts
+- **Resumable Uploads** — The SPA uploads over the [tus](https://tus.io) protocol; an interrupted upload resumes from the last byte, and the file is inspected (RDS → Parquet conversion, preview, checksum, suggested column mapping) in the background
 - **Deduplication** — SHA-256 checksums track processed files to prevent duplicate imports
-- **Background Processing** — SPA uploads and a data-folder scan are processed on background threads in the API (no Redis needed); a Celery + Redis worker is optional and separately deployable
+- **Background Processing** — A Celery + Redis worker reads, converts and imports files, off the API; without one, the API starts each import in a separate process and scans the data folder itself, so Redis is optional
 - **REST API** — OpenAPI 3.0 compliant, auto-generated docs at `/api-docs`
 - **Crop Types** — Every row records its crop (`crop_type`), from a mapped file column or the crop chosen when the file was mapped; the same place, variety, season and date for two crops are two rows
 - **Paginated & Filterable Queries** — Filter by coordinates + radius, crop type, country, province, variety, season type, optimal date, planting option; `page`/`per_page` are documented on every paginated endpoint in Swagger UI
@@ -110,6 +110,24 @@ The API will be available at `http://localhost:5000` (host) and the Swagger UI a
 The API container serves **no HTML** — the pages live in the `frontend/` SPA. Start the Vite dev server alongside it (see [Frontend Architecture](docs/DEVELOPMENT.md#frontend-architecture)); the Flask container still owns the JSON endpoints the SPA calls.
 
 Without Redis or Celery the app still processes files: Upload-page files are imported in a separate `ingest_runner` process the API starts, and the data folder (`HOUSEKEEPING_DATA_DIR`) is scanned at startup. With `HOUSEKEEPING_ENABLED=true` and a Celery worker running, the worker reads and imports every file instead, which is how production runs. See [How files get processed](docs/INGESTION.md#how-files-get-processed).
+
+## What happens to an RDS file
+
+Reading an RDS (`pyreadr`) loads the **whole** file into memory, about 150 times its size on disk, and it cannot be read in chunks. Parquet can. So every RDS is converted to Parquet first, and only the Parquet is imported:
+
+| How the RDS arrives | When it is converted | What is kept |
+|---|---|---|
+| Upload page | While the upload is inspected, before you map its columns. The page shows the progress ("Reading the file…", then rows written) | `<id>.parquet`; the RDS is deleted |
+| Copied into the data folder (`HOUSEKEEPING_DATA_DIR`) | Before every scan, and by the watcher as files arrive. The Jobs page shows it as a **Converting** job | `<name>.parquet` with the RDS's modified time; the RDS is deleted |
+| `POST /api/v1/data/upload` | By the worker, before importing (a **Converting** job); without a worker, in the request | The Parquet; the RDS is deleted |
+
+Conversion runs in a **child process**, on the worker when there is one. A file too big for the memory available stops only that process, and the upload fails with *"Reading this R file needs more memory than the server allows"*. An unreadable file fails with *"not a readable R data file"*. In either case, convert it on a machine with more memory and upload the Parquet instead:
+
+```bash
+python scripts/convert_rds.py path/to/field.RDS        # writes path/to/field.parquet, keeps the RDS
+```
+
+From R, `arrow::write_parquet(df, "field.parquet")` does the same. Details: [docs/INGESTION.md](docs/INGESTION.md#converting-large-rds-files-locally).
 
 ## Documentation
 
