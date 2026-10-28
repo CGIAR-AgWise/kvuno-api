@@ -212,8 +212,8 @@ def needs_mapping(file_path: str) -> bool:
         columns = set(pq.ParquetFile(file_path).schema_arrow.names)
     except Exception:
         return False  # unreadable: process_file reports it
-    targets = {target for source, target in load_column_map(file_path).items() if source in columns}
-    return not {'lat', 'lon'} <= targets
+    matched, _ = _match_case(load_column_map(file_path), columns)
+    return not {'lat', 'lon'} <= set(matched.values())
 
 
 def hold_unmapped(file_paths: list[str], dry_run: bool = False) -> list[str]:
@@ -421,20 +421,41 @@ def is_transient_db_error(exc: BaseException) -> bool:
     return False
 
 
+def _match_case(column_map: dict[str, str], available) -> tuple[dict[str, str], list[str]]:
+    """The default map keyed by the file's own column names, ignoring case; and the names it lacks.
+
+    The built-in map says 'country'/'province', but the AllCountries files
+    have 'Country'/'Province': scanned from the data folder, their rows were
+    stored with no country or province. (Upload inspection already matched
+    case-insensitively.) An exact name wins; the first key for a column wins.
+    """
+    by_lower = {}
+    for name in available:
+        by_lower.setdefault(name.lower(), name)
+    matched, missing = {}, []
+    for source, target in column_map.items():
+        actual = source if source in available else by_lower.get(source.lower())
+        if actual is None:
+            missing.append(source)
+        elif actual not in matched:
+            matched[actual] = target
+    return matched, missing
+
+
 def _select_columns(column_map: dict[str, str], available: list[str], file_name: str,
                     explicit: bool) -> tuple[dict[str, str], list[str]]:
     """The mapping restricted to the file's columns, and the columns to read.
 
     The default/sidecar map names columns a given file may not have, and
-    asking pyarrow for a missing column fails the whole read. An explicit
-    upload map was already validated against the file, so it is left alone.
-    'XY' (the coordinate presence check) is read whenever the file has it.
+    asking pyarrow for a missing column fails the whole read. Its names are
+    matched to the file's regardless of case. An explicit upload map was
+    already validated against the file, so it is left alone. 'XY' (the
+    coordinate presence check) is read whenever the file has it.
     """
     if not explicit:
-        missing = [c for c in column_map if c not in available]
+        column_map, missing = _match_case(column_map, available)
         if missing:
             logger.warning(f"{file_name}: mapped column(s) absent from the file, skipped: {missing}")
-            column_map = {k: v for k, v in column_map.items() if k in available}
     columns = list(column_map)
     if 'XY' in available and 'XY' not in columns:
         columns.append('XY')
