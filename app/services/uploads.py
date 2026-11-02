@@ -42,6 +42,7 @@ from sqlalchemy import or_, update
 from app.config import ALLOWED_EXTENSIONS, get_settings
 from app.models.database_conn import MyDb
 from app.models.kvuno import PlantingRecommendation, Upload
+from app.utils import crop_type as crops
 from app.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -75,10 +76,15 @@ ERROR_MAX = 2000
 _ID_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # Statuses that still accept a mapping and a submit. `failed` is excluded:
-# there is nothing to map when the file could not be read.
+# there is nothing to map when the file could not be read. `completed` is
+# excluded too: the import already ran.
 SUBMITTABLE = ('ready', 'submitted', 'processing')
-# Uploads that never reached a worker; cleaned up once abandoned.
+# Uploads still in the lifecycle, so the Upload page lists them. `completed`
+# is not here: the import is over and the file is only waiting for cleanup.
 UNFINISHED = ('receiving', 'received', 'inspecting', 'ready', 'failed', 'processing')
+# Everything cleanup may remove once idle: the open lifecycle and finished
+# imports (their file is still on disk until then).
+CLEANABLE = (*UNFINISHED, 'completed')
 
 _EXCLUDED = {'id', 'check_sum', 'coordinates', 'created_at', 'updated_at'}
 DB_TARGET_COLUMNS = {
@@ -88,6 +94,8 @@ DB_TARGET_COLUMNS = {
 
 COLUMN_ALIASES = {
     'cultivar': 'variety',
+    'crop': 'crop_type',
+    'croptype': 'crop_type',
     'season': 'season_type',
     'sowing_date': 'opt_date',
     'planting_date': 'opt_date',
@@ -154,7 +162,43 @@ def _session():
 
 # ── Lifecycle ──────────────────────────────────────────────────
 
-def create(owner_id: int | None, original_name: str, size: int, max_size: int) -> Upload:
+def parse_client_mtime(raw: str | None) -> datetime.datetime | None:
+    """The tus `lastModified` metadata (ms since the epoch) as naive UTC, or None.
+
+    It comes from the browser, so it is only trusted as far as it is
+    plausible: unparsable or before 1990 is ignored, a future time is now.
+    """
+    try:
+        stamp = datetime.datetime.fromtimestamp(int(raw) / 1000, datetime.timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    if stamp < datetime.datetime(1990, 1, 1):
+        return None
+    return min(stamp, _now())
+
+
+def parse_data_date(raw) -> datetime.date:
+    """The mapping form's "Data date" (YYYY-MM-DD). Raises UploadError if not plausible."""
+    try:
+        value = datetime.date.fromisoformat(str(raw))
+    except ValueError:
+        raise UploadError('Data date must be a date (YYYY-MM-DD)')
+    if value > _now().date():
+        raise UploadError('Data date cannot be in the future')
+    if value < datetime.date(1990, 1, 1):
+        raise UploadError('Data date is before 1990; check it')
+    return value
+
+
+def data_datetime(upload: Upload) -> datetime.datetime | None:
+    """The upload's confirmed data date as the rows' created_at (midnight), or None."""
+    if upload.data_date is None:
+        return None
+    return datetime.datetime.combine(upload.data_date, datetime.time())
+
+
+def create(owner_id: int | None, original_name: str, size: int, max_size: int,
+           file_modified_at: datetime.datetime | None = None) -> Upload:
     """Register a new upload and its empty part file. Validates before any bytes arrive."""
     name = os.path.basename(original_name or '').strip()
     if not name:
@@ -174,6 +218,7 @@ def create(owner_id: int | None, original_name: str, size: int, max_size: int) -
         original_name=_clip(name, 255),
         size=size,
         status='receiving',
+        file_modified_at=file_modified_at,
         created_at=_now(),
         updated_at=_now(),
     )
@@ -215,11 +260,63 @@ def get_owned(upload_id: str, owner_id: int | None) -> Upload:
     return upload
 
 
+def _completed_job_name(upload: Upload) -> str | None:
+    """The job name for an upload whose import has finished, else None.
+
+    Only `completed` is trusted: an `error` job may still be retried (a
+    transient DB error) and a `stale` one may be resumed, so closing the
+    upload on either would leave a later success unable to mark it (only a
+    `processing` row is updated).
+    """
+    from app.services import progress_store
+
+    if upload.status != 'processing' or not upload.stored_path:
+        return None
+    name = os.path.basename(upload.stored_path)
+    candidates = [name]
+    if os.path.splitext(name)[1].lower() == '.rds':
+        candidates.append(os.path.splitext(name)[0] + '.parquet')
+    for candidate in candidates:
+        try:
+            job = progress_store.get_job(candidate)
+        except Exception:
+            return None
+        if job is not None and job.get('status') == 'completed':
+            return candidate
+    return None
+
+
+def reconcile_processing(uploads: list[Upload]) -> list[Upload]:
+    """Drop uploads whose import finished but whose row was never updated.
+
+    `process_file` closes the row when it ends, but that write is best effort
+    by design (it logs a warning and carries on). Without this, a page load
+    showed "Processing" forever after a failed bookkeeping write.
+    """
+    kept = []
+    for upload in uploads:
+        job_name = _completed_job_name(upload)
+        if job_name is None:
+            kept.append(upload)
+            continue
+        try:
+            if mark_processed(job_name, 'completed'):
+                # mark_processed used its own Session; refresh this instance so
+                # the caller's response shows the new status.
+                MyDb.get_db().session.expire(upload)
+        except Exception:
+            kept.append(upload)
+    return kept
+
+
 def list_owned(owner_id: int | None, statuses=UNFINISHED) -> list[Upload]:
-    return (_session().query(Upload)
-            .filter(_visible_to(owner_id), Upload.status.in_(statuses))
-            .order_by(Upload.created_at.desc())
-            .all())
+    uploads = (_session().query(Upload)
+               .filter(_visible_to(owner_id), Upload.status.in_(statuses))
+               .order_by(Upload.created_at.desc())
+               .all())
+    if 'processing' in statuses:
+        uploads = reconcile_processing(uploads)
+    return uploads
 
 
 def count_awaiting_mapping(owner_id: int | None) -> int:
@@ -245,6 +342,9 @@ def hold_from_folder(file_path: str) -> Upload:
         original_name=_clip(name, 255),
         size=os.path.getsize(file_path),
         status='received',
+        # os.replace below keeps the file's time; recorded for the page.
+        file_modified_at=datetime.datetime.fromtimestamp(
+            os.path.getmtime(file_path), datetime.timezone.utc).replace(tzinfo=None),
         created_at=_now(),
         updated_at=_now(),
     )
@@ -451,17 +551,26 @@ def describe_duplicate(file_path: str, total_rows: int | None = None, checksum: 
         return None
 
 
-def _claim_inspection(upload_id: str) -> bool:
-    """Atomically take the inspection, so two pollers never run it twice."""
+def _claim_inspection(upload_id: str, take_over: bool = False) -> bool:
+    """Atomically take the inspection, so two pollers never run it twice.
+
+    ``take_over`` is for the worker task: a redelivered task means the previous
+    delivery ended (the process was killed), but the row's heartbeat can still
+    be inside the stale window. Waiting for it meant a killed reader was only
+    recovered by the next Upload-page poll, minutes later. The visibility
+    timeout is far longer than CONVERT_TIMEOUT_SECONDS, so a redelivery while
+    the original is still reading is not expected.
+    """
     stale_before = _now() - datetime.timedelta(seconds=get_settings().UPLOAD_INSPECT_STALE_SECONDS)
+    if take_over:
+        state = Upload.status.in_(('received', 'inspecting'))
+    else:
+        state = or_(Upload.status == 'received',
+                    (Upload.status == 'inspecting') & (Upload.updated_at < stale_before))
     session = _session()
     claimed = session.execute(
         update(Upload)
-        .where(
-            Upload.id == upload_id,
-            or_(Upload.status == 'received',
-                (Upload.status == 'inspecting') & (Upload.updated_at < stale_before)),
-        )
+        .where(Upload.id == upload_id, state)
         .values(status='inspecting', updated_at=_now(), error=None, progress=None)
     ).rowcount
     session.commit()
@@ -517,13 +626,17 @@ class _ProgressWriter:
             logger.warning('upload progress write failed', upload_id=self.upload_id, exc_info=True)
 
 
-def inspect(upload_id: str, app=None):
-    """Convert, preview and fingerprint a received upload. Runs off the request path."""
+def inspect(upload_id: str, app=None, take_over: bool = False):
+    """Convert, preview and fingerprint a received upload. Runs off the request path.
+
+    ``take_over`` lets the worker task reclaim an inspection whose process was
+    killed, even before its heartbeat looks stale (see `_claim_inspection`).
+    """
     from app.utils.preview import build_preview
     from app.utils.rds_to_parquet import convert_for_ingestion
     from app.utils import calculate_file_checksum
 
-    if not _claim_inspection(upload_id):
+    if not _claim_inspection(upload_id, take_over):
         return
 
     stop = threading.Event()
@@ -647,13 +760,41 @@ def ensure_inspection(app, upload: Upload) -> None:
 
 # ── Submission and removal ─────────────────────────────────────
 
-def submit(upload: Upload, column_map=None) -> Upload:
-    """Validate and store the mapping, ready to process. `None` re-uses the saved one (Retry)."""
+def parse_crop_type(raw) -> str | None:
+    """The mapping form's crop type, normalised. '' clears it; raises UploadError if unusable."""
+    try:
+        return crops.parse(raw)
+    except ValueError as e:
+        raise UploadError(str(e))
+
+
+def known_crop_types() -> list[str]:
+    """Crop types chosen on earlier uploads: suggestions for the mapping form.
+
+    From uploads, not planting_recommendations: a DISTINCT over millions of
+    rows is too slow for a form, and every crop chosen on the form is here.
+    """
+    rows = (_session().query(Upload.crop_type).filter(Upload.crop_type.isnot(None))
+            .distinct().order_by(Upload.crop_type).all())
+    return [r[0] for r in rows]
+
+
+def submit(upload: Upload, column_map=None, data_date=None, crop_type=None) -> Upload:
+    """Validate and store the mapping, data date and crop type, ready to process.
+
+    `None` re-uses the saved value (Retry sends none of them). An empty data
+    date clears it: the rows then take the file's first import time. An empty
+    crop type clears it too: rows then have one only from a mapped column.
+    """
     if upload.status not in SUBMITTABLE:
         raise UploadError(f'Upload is {upload.status}, not ready to process', 409)
     columns = (upload.preview or {}).get('columns', [])
-    upload.column_map = validate_column_map(
-        upload.column_map if column_map is None else column_map, columns)
+    mapping = validate_column_map(upload.column_map if column_map is None else column_map, columns)
+    if data_date is not None:
+        upload.data_date = parse_data_date(data_date) if str(data_date).strip() else None
+    if crop_type is not None:
+        upload.crop_type = parse_crop_type(crop_type)
+    upload.column_map = mapping
     # If already processing, keep that status; otherwise mark as submitted
     if upload.status != 'processing':
         upload.status = 'submitted'
@@ -672,14 +813,53 @@ def mark_ready(upload: Upload, message: str) -> None:
 
 
 def find_by_stored_name(file_name: str) -> Upload | None:
-    """The upload whose stored file is `file_name` (`<id>.parquet`), if any."""
+    """The upload whose stored file has this name's id (`<id>.<ext>`), if any.
+
+    The extension is not compared: an inspection whose Parquet write failed
+    keeps the RDS as `stored_path`, and the worker's later conversion is
+    `<id>.parquet` — the id is what identifies the upload.
+    """
     upload_id = os.path.splitext(os.path.basename(file_name))[0]
     if not valid_id(upload_id):
         return None
     upload = _session().get(Upload, upload_id)
-    if upload is None or os.path.basename(upload.stored_path or '') != os.path.basename(file_name):
+    if upload is None:
+        return None
+    if os.path.splitext(os.path.basename(upload.stored_path or ''))[0] != upload_id:
         return None
     return upload
+
+
+def mark_processed(file_name: str, status: str, error: str | None = None) -> bool:
+    """Finish an upload's lifecycle when its import ends.
+
+    `processing` was the last status an import ever left behind, so the Upload
+    page kept listing a finished file as Processing until the cleanup task
+    deleted it (CLEANUP_AGE, a day by default). Only a `processing` row is
+    changed: a folder file waiting for a mapping, or an upload already
+    discarded, must not move.
+
+    Uses its own short-lived Session, like progress_store, so it can never
+    commit rows the ingest session is holding between checkpoints.
+    """
+    upload_id = os.path.splitext(os.path.basename(file_name))[0]
+    if not valid_id(upload_id):
+        return False
+    from sqlalchemy.orm import Session
+
+    with Session(bind=MyDb.get_db().engine) as session:
+        upload = session.get(Upload, upload_id)
+        # The id is the identity; the extension may differ (an RDS converted
+        # by the worker is `<id>.parquet` while stored_path is `<id>.rds`).
+        if upload is None or os.path.splitext(os.path.basename(upload.stored_path or ''))[0] != upload_id:
+            return False
+        updated = session.execute(
+            update(Upload)
+            .where(Upload.id == upload_id, Upload.status == 'processing')
+            .values(status=status, error=_clip(error) if error else None, updated_at=_now())
+        ).rowcount
+        session.commit()
+        return bool(updated)
 
 
 def discard(upload: Upload) -> None:
@@ -697,7 +877,7 @@ def cleanup_abandoned(max_age_seconds: int) -> int:
     """
     cutoff = _now() - datetime.timedelta(seconds=max_age_seconds)
     stale = (_session().query(Upload)
-             .filter(Upload.status.in_(UNFINISHED), Upload.updated_at < cutoff,
+             .filter(Upload.status.in_(CLEANABLE), Upload.updated_at < cutoff,
                      Upload.source != 'folder')
              .all())
     for upload in stale:
@@ -722,6 +902,9 @@ def to_dict(upload: Upload) -> dict:
         'column_map': upload.column_map or {},
         'error': upload.error,
         'progress': upload.progress if upload.status in ('received', 'inspecting') else None,
+        'file_modified_at': upload.file_modified_at.isoformat() if upload.file_modified_at else None,
+        'data_date': upload.data_date.isoformat() if upload.data_date else None,
+        'crop_type': upload.crop_type,
         'created_at': upload.created_at.isoformat() if upload.created_at else None,
         'updated_at': upload.updated_at.isoformat() if upload.updated_at else None,
     }

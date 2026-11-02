@@ -10,11 +10,30 @@ holder must ``touch()`` it more often than that.
 The file records "<hostname> <pid>". The worker uses the hostname at startup
 to clear locks its previous run left behind (``release_dead_locks``), instead
 of waiting out ``stale_seconds`` — during which a resumed job would find the
-dead lock "held" and skip the file.
+dead lock "held" and skip the file. And while running, a lock whose holder is
+a dead process on this host is taken over at once (``_holder_is_dead``).
 """
 import os
 import socket
 import time
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether a process with this pid exists. Unknown counts as alive (the safe side).
+
+    POSIX only: on Windows os.kill(pid, 0) does not probe, it terminates the
+    process, so there every holder is assumed alive and only staleness counts
+    (production runs on Linux).
+    """
+    if os.name == 'nt':
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # e.g. PermissionError: it exists, owned by someone else
+    return True
 
 
 class FileLock:
@@ -37,22 +56,49 @@ class FileLock:
                 return True
             except FileExistsError:
                 try:
-                    if time.time() - os.path.getmtime(self.path) < self.stale_seconds:
+                    fresh = time.time() - os.path.getmtime(self.path) < self.stale_seconds
+                    if fresh and not self._holder_is_dead():
                         return False
                     os.remove(self.path)  # holder died; take it over
                 except OSError:
                     pass
         return False
 
+    def _holder_is_dead(self) -> bool:
+        """Whether the holder is a process on this host that no longer exists.
+
+        A process that dies mid-ingest (an out-of-memory kill of a Celery
+        child, a crash) leaves its lock behind, and the lock looked live for
+        stale_seconds (10 min). Celery requeues such a task at once, so the
+        new attempt found the lock "held", skipped the file silently, and the
+        job sat at "processing" until it went stale and someone pressed Retry.
+        On the same host the recorded pid answers the question at once.
+        Another host's holder cannot be checked, so only staleness counts.
+        """
+        host, pid = self.holder(self.path)
+        if host != socket.gethostname() or pid is None or pid == os.getpid():
+            return False
+        return not _pid_alive(pid)
+
     @staticmethod
-    def holder_host(path: str) -> str | None:
-        """The hostname recorded in a lock file; None if unreadable or old-format (pid only)."""
+    def holder(path: str) -> tuple[str | None, int | None]:
+        """(hostname, pid) recorded in a lock file; (None, None) if unreadable or old-format."""
         try:
             with open(path) as f:
                 parts = f.read().split()
         except OSError:
-            return None
-        return parts[0] if len(parts) == 2 else None
+            return None, None
+        if len(parts) != 2:
+            return None, None
+        try:
+            return parts[0], int(parts[1])
+        except ValueError:
+            return parts[0], None
+
+    @staticmethod
+    def holder_host(path: str) -> str | None:
+        """The hostname recorded in a lock file; None if unreadable or old-format (pid only)."""
+        return FileLock.holder(path)[0]
 
     def touch(self):
         if self.held:

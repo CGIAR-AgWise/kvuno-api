@@ -195,6 +195,7 @@ export default function Quality() {
                   <th>Variety</th>
                   <th>Season</th>
                   <th>Date</th>
+                  <th>Crop</th>
                   <th>Source</th>
                   <th className="d-none d-md-table-cell">Logged</th>
                 </tr>
@@ -202,7 +203,7 @@ export default function Quality() {
               <tbody>
                 {rows.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="text-center text-muted small py-4">
+                    <td colSpan={9} className="text-center text-muted small py-4">
                       No conflicts found.
                     </td>
                   </tr>
@@ -215,6 +216,7 @@ export default function Quality() {
                       <td>{r.variety}</td>
                       <td>{r.season_type}</td>
                       <td className="text-nowrap kvuno-status">{r.opt_date}</td>
+                      <td>{r.crop_type}</td>
                       <td>{r.source}</td>
                       <td className="d-none d-md-table-cell text-muted">{r.created_at?.slice(0, 10) ?? ''}</td>
                     </tr>
@@ -251,6 +253,7 @@ export default function Quality() {
                       <th>Variety</th>
                       <th>Season</th>
                       <th>Date</th>
+                      <th>Crop</th>
                       <th>Count</th>
                       <th>Sources</th>
                     </tr>
@@ -258,7 +261,7 @@ export default function Quality() {
                   <tbody>
                     {duplicates.map((g) => (
                       <tr
-                        key={[g.country, g.province, g.variety, g.season_type, g.opt_date]
+                        key={[g.country, g.province, g.variety, g.season_type, g.opt_date, g.crop_type]
                           .map((v) => v ?? '')
                           .join('|')}
                       >
@@ -267,6 +270,7 @@ export default function Quality() {
                         <td>{g.variety}</td>
                         <td>{g.season_type}</td>
                         <td className="text-nowrap kvuno-status">{g.opt_date}</td>
+                        <td>{g.crop_type}</td>
                         <td>
                           <span className="badge text-bg-warning">{g.count}x</span>
                         </td>

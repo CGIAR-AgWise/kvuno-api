@@ -9,7 +9,8 @@ _settings = get_settings()
 @celery_app.task(bind=True, max_retries=_settings.CELERY_TASK_MAX_RETRIES,
                  default_retry_delay=_settings.CELERY_TASK_RETRY_DELAY, autoretry_for=(Exception,))
 def process_file_task(self, file_path: str, column_map: dict | None = None,
-                      original_filename: str | None = None, run_id: int | None = None):
+                      original_filename: str | None = None, run_id: int | None = None,
+                      created_at: str | None = None, crop_type: str | None = None):
     # run_id is optional so tasks queued by an older API (without it) still run.
     # process_file only raises for transient DB errors — a bad file is recorded
     # as an error and returns — so autoretry_for retries exactly those, and the
@@ -25,8 +26,12 @@ def process_file_task(self, file_path: str, column_map: dict | None = None,
             file_path = _convert(file_path)
             if file_path is None:
                 return  # recorded on the job; it would not convert on a retry either
+        import datetime
         process_file(file_path, column_map=column_map, original_filename=original_filename,
-                     run_id=run_id, **housekeeping_settings())
+                     run_id=run_id, **housekeeping_settings(),
+                     # The upload's confirmed data date (ISO, as sent across the broker).
+                     created_at=datetime.datetime.fromisoformat(created_at) if created_at else None,
+                     crop_type=crop_type)
 
 
 def _convert(rds_path: str) -> str | None:
@@ -58,12 +63,14 @@ def inspect_upload_task(self, upload_id: str):
 
     Runs on the worker so the API never reads files: an RDS read needs ~150x
     the file size in memory, which the API's limit could not give. The claim
-    in inspect() makes a duplicate task (a re-queue by the status poll) a no-op.
+    in inspect() makes a duplicate task (a re-queue by the status poll) a no-op;
+    a redelivered task takes over, because its previous process is gone even
+    when the row's heartbeat is still fresh.
     """
     app = _get_worker_app()
     with app.app_context():
         from app.services import uploads
-        uploads.inspect(upload_id, app)
+        uploads.inspect(upload_id, app, take_over=True)
 
 
 @celery_app.task(bind=True, max_retries=_settings.CELERY_TASK_MAX_RETRIES,

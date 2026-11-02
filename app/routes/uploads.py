@@ -136,7 +136,9 @@ def enqueue_upload(upload):
 
     if celery_worker_available():
         if process_file_async(upload.stored_path, column_map=upload.column_map,
-                              original_filename=upload.original_name):
+                              original_filename=upload.original_name,
+                              created_at=service.data_datetime(upload),
+                              crop_type=upload.crop_type):
             logger.info("upload queued for the worker", upload_id=upload.id)
             return jsonify(id=upload.id, file=service.to_dict(upload)['file'],
                            message='Queued for the worker', queued=True)
@@ -165,7 +167,8 @@ def register_upload_routes(app):
             size = _int_header('Upload-Length')
             meta = _parse_metadata(request.headers.get('Upload-Metadata'))
             upload = service.create(_owner_id(), meta.get('filename', ''), size,
-                                    get_settings().max_file_size)
+                                    get_settings().max_file_size,
+                                    file_modified_at=service.parse_client_mtime(meta.get('lastModified')))
         except UploadError as e:
             return _tus_error(e)
         return '', 201, _tus_headers({'Location': f'{TUS_PATH}/{upload.id}', 'Upload-Offset': '0'})
@@ -225,6 +228,9 @@ def register_upload_routes(app):
             upload = service.get_owned(upload_id, _owner_id())
         except UploadError as e:
             return jsonify(error=str(e)), e.status
+        # A processing row whose job already finished: close it even if the
+        # ingest's own bookkeeping write failed.
+        service.reconcile_processing([upload])
         # Also the recovery path: an inspection whose worker died is restarted
         # here once its heartbeat goes stale.
         service.ensure_inspection(current_app._get_current_object(), upload)
@@ -236,7 +242,7 @@ def register_upload_routes(app):
         body = request.get_json(silent=True) or {}
         try:
             upload = service.get_owned(upload_id, _owner_id())
-            service.submit(upload, body.get('column_map'))
+            service.submit(upload, body.get('column_map'), body.get('data_date'), body.get('crop_type'))
         except UploadError as e:
             return jsonify(error=str(e)), e.status
         return enqueue_upload(upload)

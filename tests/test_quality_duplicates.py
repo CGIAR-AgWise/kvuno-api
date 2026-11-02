@@ -38,12 +38,13 @@ def env(monkeypatch):
         session.execute(text(
             'CREATE TABLE import_conflicts (id INTEGER PRIMARY KEY, record_data TEXT, country TEXT, '
             'province TEXT, lon REAL, lat REAL, variety TEXT, season_type TEXT, opt_date TEXT, '
-            'check_sum TEXT, source TEXT, created_at TIMESTAMP)'))
+            'crop_type TEXT, check_sum TEXT, source TEXT, created_at TIMESTAMP)'))
         for row in ROWS:
             session.execute(text(
                 "INSERT INTO import_conflicts (record_data, country, province, variety, season_type, "
-                "opt_date, source) VALUES ('{}', :c, :p, :v, :s, :d, :src)"),
-                dict(zip(('c', 'p', 'v', 's', 'd', 'src'), row)))
+                "opt_date, crop_type, source) VALUES ('{}', :c, :p, :v, :s, :d, :crop, :src)"),
+                {**dict(zip(('c', 'p', 'v', 's', 'd', 'src'), row)),
+                 'crop': 'sorghum' if row[0] == 'TZ' else 'maize'})
         session.commit()
         yield types.SimpleNamespace(client=app.test_client())
         session.remove()
@@ -74,6 +75,11 @@ def test_filters_apply_to_the_groups(env):
     assert body['total'] == 1
     body = env.client.get('/api/v1/quality/duplicates?source=c.parquet').get_json()
     assert [(g['count'], g['sources']) for g in body['data']] == [(1, {'c.parquet': 1})]
+
+
+def test_groups_carry_and_filter_by_crop(env):
+    body = env.client.get('/api/v1/quality/duplicates?crop_type=Sorghum').get_json()
+    assert [(g['country'], g['crop_type']) for g in body['data']] == [('TZ', 'sorghum')]
 
 
 def test_past_the_last_page_is_empty_not_an_error(env):

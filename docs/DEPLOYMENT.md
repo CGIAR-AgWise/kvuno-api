@@ -69,7 +69,7 @@ The compose file reads these variables from the host environment (or `.env` file
 
 `DB_HOST`, `DB_USER`, `DB_PASSWORD`, and `DB_NAME` use `${VAR:?message}` syntax, so Compose **fails fast** if they are missing. Values in the project `.env` count for interpolation too. `FLASK_DEBUG` only affects `python run.py` (`api-dev`); the production `api` runs gunicorn.
 
-Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the README's Configuration tables are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
+Every application setting, its default and its meaning is defined once in `app/config.py` (`Settings`); `.env.example` and the tables in [CONFIGURATION.md](CONFIGURATION.md) are generated from it (`make config-docs`, checked in CI). An invalid value stops the container at the preflight with every problem listed, rather than falling back to the default.
 
 ### Env loading per service
 
@@ -270,6 +270,8 @@ docker compose exec api alembic upgrade head
 
 > **Upgrading past revision `f3a9c2d4e5b6`** (`20261022130000_planting_unique_nulls_not_distinct.py`) changes data, not just schema. On PostgreSQL ≥ 15 it **deletes** rows of `planting_recommendations` that duplicate another row on the seven key columns (`country`, `province`, `lon`, `lat`, `variety`, `season_type`, `opt_date`) with NULLs compared as equal, keeping the lowest `id`, and prints the count; then it recreates `uq_planting_recommendation` as `UNIQUE NULLS NOT DISTINCT`, so rows with a NULL key column stop being re-inserted on every replay. The downgrade restores the plain constraint but **not** the deleted rows. On SQLite or PostgreSQL < 15 it is a no-op (logged). Because compose does not migrate by default, run it explicitly after pulling this release — and back up first if you need the duplicates.
 
+> **Upgrading past revision `f4b6d8a0c2e3`** (`20261028100000_add_crop_type.py`) adds `crop_type` to `planting_recommendations`, `import_conflicts` and `uploads`, and on PostgreSQL rebuilds `uq_planting_recommendation` with `crop_type` as an eighth key column. It deletes nothing (existing rows are all NULL there and still collide with each other as before), but rebuilding the constraint builds its index again: on a table of millions of rows that takes a while and **blocks inserts** meanwhile (reads continue). Deploy when no import is running — the API container applies it on start. Its downgrade fails once two rows differ only by `crop_type`; delete one of each pair first.
+
 > **Revisions `a8c4e2f1d9b3`** (`20261023100000_add_user_approval_status.py`, after `f3a9c2d4e5b6`: `users.status`, `reviewed_at`, `reviewed_by`, `ix_users_status`) **and `e16b8fad5988`** (`20261023142312_add_role_column_to_users_table.py`: `users.role`, default `user`). Existing accounts get the server default `approved`, so nobody is locked out; only new registrations start `pending`. It uses `batch_alter_table`, so it also runs on SQLite. Set `ADMIN_EMAILS` in the same deploy, or new accounts pile up with nobody able to approve them.
 
 **Set it to `false` when you run more than one API replica**, otherwise each replica races to migrate the same schema — concurrent `alembic upgrade head` calls can deadlock or fail. This is the reason startup migrations were originally removed in favour of a separate step.
@@ -447,7 +449,7 @@ There is no Postgres volume to back up here — the database is external (see §
 |---|---|---|
 | Compose exits immediately with `DB_USER is required` | Missing env var | Set `DB_USER`/`DB_PASSWORD`/`DB_NAME` in the shell or `.env` |
 | API returns 500 on `/health` | DB connection refused | Check `DB_HOST` resolves from inside the container — `db` is no longer a compose service |
-| `psycopg2.OperationalError` | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
+| `psycopg.OperationalError` (psycopg3) | Postgres unreachable or not ready | Verify host/port/credentials; there is no `depends_on` to wait for |
 | Migrations fail with "no such table" | Alembic has not run against this database | Check the api container logs for the `[entrypoint] applying database migrations` line |
 | Upload page files never finish processing | They run on a thread in the API process; a gunicorn worker recycled or killed mid-file (e.g. out of memory on a large file) ends it | The job goes *Stalled* after `JOB_STALE_AFTER_SECONDS`; Retry resumes from the stored offset. For very large files use the worker (`housekeeping.py`) or raise the API memory limit |
 | Files sent to `/api/v1/data/upload` never processed | `HOUSEKEEPING_ENABLED` unset/false: they are saved for the next startup scan | Restart the API after the cooldown (`STARTUP_SCAN_COOLDOWN_SECONDS`), run `housekeeping.py` in the worker, or set `HOUSEKEEPING_ENABLED=true` with the `worker` running |

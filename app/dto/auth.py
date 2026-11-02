@@ -2,6 +2,8 @@
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
+from app.dto.pagination import PaginationQuery
+
 # bcrypt only uses the first 72 bytes of a password. bcrypt < 5 silently
 # truncated; bcrypt 5.x raises ValueError instead, which turned an over-long
 # password into a 500 at registration. The limit is in BYTES of the UTF-8
@@ -59,7 +61,7 @@ class AdminUserList(BaseModel):
     per_page: int = 100
 
 
-class AdminUserQuery(BaseModel):
+class AdminUserQuery(PaginationQuery):
     status: Optional[str] = Field(None, pattern='^(pending|approved|rejected|disabled)$',
                                   description="Only accounts with this status")
     q: Optional[str] = Field(None, max_length=100, description="Search username or email")

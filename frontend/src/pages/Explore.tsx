@@ -23,7 +23,7 @@ import { createPointCloud } from '../lib/pointCloud'
 
 type LayerMode = 'points' | 'heatmap' | 'clusters'
 
-const EMPTY_FILTERS = { country: '', province: '', variety: '', season_type: '' }
+const EMPTY_FILTERS = { crop_type: '', country: '', province: '', variety: '', season_type: '' }
 
 /**
  * Point fill for both point layers. Magenta with a white outline reads against
@@ -33,7 +33,7 @@ const EMPTY_FILTERS = { country: '', province: '', variety: '', season_type: '' 
 const POINT_COLOR = '#d81b60'
 
 /** Columns dropped below the md breakpoint so the table fits without scrolling. */
-const NARROW_HIDDEN = new Set(['season_type', 'planting_option'])
+const NARROW_HIDDEN = new Set(['crop_type', 'season_type', 'planting_option'])
 
 export default function Explore() {
   const toast = useToast()
@@ -48,6 +48,7 @@ export default function Explore() {
     province: [],
     variety: [],
     season_type: [],
+    crop_type: [],
   })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -154,13 +155,14 @@ export default function Explore() {
         <div className="row g-2">
           {(
             [
+              ['crop_type', 'Crop'],
               ['country', 'Country'],
               ['province', 'Province'],
               ['variety', 'Variety'],
               ['season_type', 'Season'],
             ] as const
           ).map(([key, label]) => (
-            <div className="col-6 col-md-3" key={key}>
+            <div className="col-6 col-md-2" key={key}>
               <label className="form-label small text-muted mb-1" htmlFor={'f-' + key}>
                 {label}
               </label>
@@ -179,7 +181,7 @@ export default function Explore() {
               </select>
             </div>
           ))}
-          <div className="col-6 col-md-3 d-flex align-items-end">
+          <div className="col-6 col-md-2 d-flex align-items-end">
             <button
               className="btn btn-outline-secondary btn-sm w-100"
               onClick={() => {
@@ -255,6 +257,7 @@ export default function Explore() {
               <tr>
                 {(
                   [
+                    ['crop_type', 'Crop'],
                     ['country', 'Country'],
                     ['province', 'Province'],
                     ['variety', 'Variety'],
@@ -294,13 +297,14 @@ export default function Explore() {
             <tbody>
               {records.length === 0 && !loading ? (
                 <tr>
-                  <td colSpan={8} className="text-center text-muted small py-4">
+                  <td colSpan={9} className="text-center text-muted small py-4">
                     No records match your filters.
                   </td>
                 </tr>
               ) : (
                 records.map((r) => (
                   <tr key={r.id}>
+                    <td className="d-none d-md-table-cell">{r.crop_type}</td>
                     <td>{r.country}</td>
                     <td>{r.province}</td>
                     <td>{r.variety}</td>

@@ -48,7 +48,8 @@ class DuplicateGroup(BaseModel):
     variety: Optional[str] = None
     season_type: Optional[str] = None
     opt_date: Optional[str] = None
-    count: int = Field(..., description="Conflicts with this country/province/variety/season/date")
+    crop_type: Optional[str] = None
+    count: int = Field(..., description="Conflicts with this country/province/variety/season/date/crop")
     sources: dict[str, int] = Field(default={}, description="Conflicts per source file")
 
 
@@ -95,6 +96,7 @@ def get_conflicts(query: QualityFilter):
             variety=item.variety,
             season_type=item.season_type,
             opt_date=item.opt_date,
+            crop_type=item.crop_type,
             check_sum=item.check_sum,
             source=item.source,
             record_data=item.record_data,
@@ -117,9 +119,9 @@ def get_conflicts(query: QualityFilter):
 @api.get('/duplicates',
          responses={200: DuplicateListResponse, 401: Unauthorized},
          summary="List import conflicts grouped as duplicates",
-         description="Conflicts grouped by country, province, variety, season and date, most repeated first, "
-                     "with a count per source. Paginated by group (default 100, max 500); takes the same "
-                     "country/source/search filters as /conflicts.")
+         description="Conflicts grouped by country, province, variety, season, date and crop, most repeated "
+                     "first, with a count per source. Paginated by group (default 100, max 500); takes the "
+                     "same country/crop_type/source/search filters as /conflicts.")
 @require_auth
 def get_duplicates(query: QualityFilter):
     pagination = get_pagination()

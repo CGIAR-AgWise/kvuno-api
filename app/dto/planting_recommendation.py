@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import Field, BaseModel
+from pydantic import Field, BaseModel, field_validator
 
 from app.dto.pagination import PaginatedResponse
+from app.utils import crop_type as crops
 
 
 class Unauthorized(BaseModel):
@@ -20,10 +21,17 @@ class PlantingRecommendationBase(BaseModel):
     season_type: Optional[str] = Field(default=None, description="Season type", examples=["Average"])
     opt_date: Optional[str] = Field(default=None, description="Optimal sowing date as day-month, no year (as in the source data)", examples=["30-Nov"])
     planting_option: Optional[int] = Field(default=None, description="Planting option", examples=[1])
+    crop_type: Optional[str] = Field(default=None, description="Crop, lower-case; null for rows imported before crop types were recorded", examples=["maize"])
     check_sum: Optional[str] = Field(default=None, description="File checksum", examples=["a1b2c3d4e5f6..."])
     coordinates: Optional[str] = Field(default=None, description="WKT coordinate string", examples=["POINT(36.82 -1.29)"])
     created_at: Optional[datetime] = Field(default=None, description="Record creation timestamp", examples=["2023-08-20T12:34:56Z"])
     updated_at: Optional[datetime] = Field(default=None, description="Record update timestamp", examples=["2023-08-20T12:34:56Z"])
+
+    @field_validator('crop_type', mode='before')
+    @classmethod
+    def _one_spelling(cls, value):
+        # A file cell: 'Maize ' and 'maize' must be the same crop.
+        return crops.normalise(value)
 
 
 class PlantingRecommendationCreate(PlantingRecommendationBase):
